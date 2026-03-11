@@ -236,6 +236,35 @@ app.get('/api/ebay', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── eBay Orders endpoint ──────────────────────────────────────────────────────
+app.get('/api/orders', async (req, res) => {
+  try {
+    const { getValidToken } = require('./worker');
+    const token = await getValidToken();
+    if (!token) return res.status(401).json({ error: 'No valid eBay token' });
+
+    const fetch = require('node-fetch');
+    const limit = req.query.limit || 50;
+    const offset = req.query.offset || 0;
+    // Filter: last 90 days
+    const fromDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+
+    const r = await fetch(
+      `https://api.ebay.com/sell/fulfillment/v1/order?limit=${limit}&offset=${offset}&filter=lastmodifieddate:[${fromDate}..]`,
+      { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+    );
+    if (!r.ok) {
+      const err = await r.text();
+      return res.status(r.status).json({ error: err });
+    }
+    const d = await r.json();
+    res.json(d);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 // ── Import migration endpoint ─────────────────────────────────────────────────
 app.post('/api/migrate', async (req, res) => {
   try {
