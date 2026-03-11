@@ -265,7 +265,7 @@ async function start() {
     await db.initDB();
     console.log('[Server] DB initialized');
     startWorker();
-    app.listen(PORT, () => console.log(`[Server] Running on port ${PORT}`));
+    app.listen(PORT, '0.0.0.0', () => console.log(`[Server] Running on port ${PORT}`));
   } catch(e) {
     console.error('[Server] Failed to start:', e.message);
     process.exit(1);
