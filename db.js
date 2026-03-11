@@ -34,8 +34,11 @@ async function initDB() {
         condition_id TEXT DEFAULT 'NEW',
         last_synced TIMESTAMPTZ,
         created_at TIMESTAMPTZ DEFAULT NOW(),
-        updated_at TIMESTAMPTZ DEFAULT NOW()
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        data JSONB
       );
+      -- Add data column if upgrading from older schema
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS data JSONB;
 
       CREATE INDEX IF NOT EXISTS products_status_idx ON products(status);
       CREATE INDEX IF NOT EXISTS products_asin_idx ON products(asin);
@@ -87,19 +90,22 @@ async function getAllSettings() {
 
 // ── Products ──────────────────────────────────────────────────────────────────
 async function upsertProduct(p) {
+  // Store full product object in data column for complete round-trip
+  const fullData = JSON.stringify(p);
   await pool.query(
     `INSERT INTO products(
        id, asin, ebay_sku, ebay_item_id, title, source_url, my_price, amazon_price,
        cost, status, quantity, has_variations, variations, image_url, category,
-       condition_id, last_synced, updated_at
-     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW())
+       condition_id, last_synced, updated_at, data
+     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),$18)
      ON CONFLICT(id) DO UPDATE SET
        asin=EXCLUDED.asin, ebay_sku=EXCLUDED.ebay_sku, ebay_item_id=EXCLUDED.ebay_item_id,
        title=EXCLUDED.title, source_url=EXCLUDED.source_url, my_price=EXCLUDED.my_price,
        amazon_price=EXCLUDED.amazon_price, cost=EXCLUDED.cost, status=EXCLUDED.status,
        quantity=EXCLUDED.quantity, has_variations=EXCLUDED.has_variations,
        variations=EXCLUDED.variations, image_url=EXCLUDED.image_url, category=EXCLUDED.category,
-       condition_id=EXCLUDED.condition_id, last_synced=EXCLUDED.last_synced, updated_at=NOW()`,
+       condition_id=EXCLUDED.condition_id, last_synced=EXCLUDED.last_synced, updated_at=NOW(),
+       data=EXCLUDED.data`,
     [
       p.id, p.asin, p.ebaySku||p.ebay_sku, p.ebayItemId||p.ebay_item_id,
       p.title, p.sourceUrl||p.source_url,
@@ -107,9 +113,10 @@ async function upsertProduct(p) {
       p.status||'pending', p.quantity||1,
       p.hasVariations||p.has_variations||false,
       p.variations ? JSON.stringify(p.variations) : null,
-      p.imageUrl||p.image_url, p.category,
+      p.imageUrl||p.image_url||(p.images&&p.images[0])||null, p.category,
       p.conditionId||p.condition_id||'NEW',
-      p.lastSynced||p.last_synced||null
+      p.lastSynced||p.last_synced||null,
+      fullData
     ]
   );
 }
@@ -131,7 +138,15 @@ async function getProduct(id) {
 
 async function updateProductSync(id, { myPrice, amazonPrice, lastSynced, status, quantity }) {
   await pool.query(
-    `UPDATE products SET my_price=$2, amazon_price=$3, last_synced=$4, status=$5, quantity=$6, updated_at=NOW()
+    `UPDATE products SET
+       my_price=$2, amazon_price=$3, last_synced=$4, status=$5, quantity=$6, updated_at=NOW(),
+       data = CASE WHEN data IS NOT NULL THEN
+         jsonb_set(jsonb_set(jsonb_set(jsonb_set(data,
+           '{myPrice}', to_jsonb($2::numeric)),
+           '{lastSynced}', to_jsonb($4::text)),
+           '{status}', to_jsonb($5::text)),
+           '{quantity}', to_jsonb($6::int))
+         ELSE data END
      WHERE id=$1`,
     [id, myPrice, amazonPrice, lastSynced || new Date().toISOString(), status, quantity]
   );
@@ -182,11 +197,27 @@ async function countLogs() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function dbToProduct(row) {
+  // If full data blob stored, use it and overlay fresh sync fields
+  if (row.data) {
+    const d = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+    return {
+      ...d,
+      // Always use DB values for these (worker may have updated them)
+      status: row.status || d.status,
+      myPrice: row.my_price ? parseFloat(row.my_price) : d.myPrice,
+      amazonPrice: row.amazon_price ? parseFloat(row.amazon_price) : d.amazonPrice,
+      quantity: row.quantity != null ? row.quantity : d.quantity,
+      lastSynced: row.last_synced || d.lastSynced,
+      ebaySku: row.ebay_sku || d.ebaySku,
+      ebayListingId: d.ebayListingId || row.ebay_item_id,
+    };
+  }
+  // Fallback for old rows without data column
   return {
     id: row.id,
     asin: row.asin,
     ebaySku: row.ebay_sku,
-    ebayItemId: row.ebay_item_id,
+    ebayListingId: row.ebay_item_id,
     title: row.title,
     sourceUrl: row.source_url,
     myPrice: row.my_price ? parseFloat(row.my_price) : null,
@@ -196,7 +227,7 @@ function dbToProduct(row) {
     quantity: row.quantity,
     hasVariations: row.has_variations,
     variations: row.variations,
-    imageUrl: row.image_url,
+    images: row.image_url ? [row.image_url] : [],
     category: row.category,
     conditionId: row.condition_id,
     lastSynced: row.last_synced,
