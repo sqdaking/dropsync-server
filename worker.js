@@ -46,60 +46,25 @@ async function getValidToken() {
   }
 }
 
-// ── Amazon scrape ─────────────────────────────────────────────────────────────
+// ── Amazon scrape via Vercel ─────────────────────────────────────────────────
 async function scrapeAmazonPrice(sourceUrl) {
   const fetch = require('node-fetch');
-  const UA_LIST = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0',
-  ];
-  const ua = UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
-
-  // Try proxy list
-  const proxies = (process.env.PROXY_LIST || '').split(',').filter(Boolean);
-  const urls = [sourceUrl];
-
-  // Also try scraperapi if configured
-  if (process.env.SCRAPER_API_KEY) {
-    urls.push(`http://api.scraperapi.com?api_key=${process.env.SCRAPER_API_KEY}&url=${encodeURIComponent(sourceUrl)}`);
+  const vercelUrl = process.env.VERCEL_BACKEND_URL || 'https://dropsync-one.vercel.app';
+  try {
+    const r = await fetch(`${vercelUrl}/api/ebay?action=scrape`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: sourceUrl }),
+      timeout: 25000,
+    });
+    if (!r.ok) return null;
+    const d = await r.json();
+    if (d.price && d.price > 0) return d.price;
+    return null;
+  } catch(e) {
+    console.error('[Worker] scrape error:', e.message);
+    return null;
   }
-
-  for (const url of urls) {
-    try {
-      const r = await fetch(url, {
-        headers: {
-          'User-Agent': ua,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-          'Accept-Encoding': 'gzip, deflate, br',
-          'Cache-Control': 'no-cache',
-        },
-        timeout: 15000,
-      });
-      const html = await r.text();
-
-      // Price patterns
-      const patterns = [
-        /class="a-price-whole"[^>]*>(\d+[\d,]*)</,
-        /"priceAmount":(\d+\.?\d*)/,
-        /id="priceblock_ourprice"[^>]*>\s*\$?([\d,]+\.?\d*)/,
-        /class="a-offscreen"[^>]*>\$?([\d,]+\.?\d*)</,
-        /"price":\s*"?\$?([\d,]+\.?\d*)"?/,
-      ];
-
-      for (const pat of patterns) {
-        const m = html.match(pat);
-        if (m) {
-          const price = parseFloat(m[1].replace(/,/g, ''));
-          if (price > 0.5 && price < 10000) return price;
-        }
-      }
-    } catch(e) {
-      // try next url
-    }
-  }
-  return null;
 }
 
 // ── eBay price/stock update ───────────────────────────────────────────────────
