@@ -99,7 +99,8 @@ async function upsertProduct(p) {
        condition_id, last_synced, updated_at, data
      ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),$18)
      ON CONFLICT(id) DO UPDATE SET
-       asin=EXCLUDED.asin, ebay_sku=EXCLUDED.ebay_sku, ebay_item_id=EXCLUDED.ebay_item_id,
+       asin=EXCLUDED.asin, ebay_sku=EXCLUDED.ebay_sku,
+       ebay_item_id=COALESCE(EXCLUDED.ebay_item_id, products.ebay_item_id),
        title=EXCLUDED.title, source_url=EXCLUDED.source_url, my_price=EXCLUDED.my_price,
        amazon_price=EXCLUDED.amazon_price, cost=EXCLUDED.cost, status=EXCLUDED.status,
        quantity=EXCLUDED.quantity, has_variations=EXCLUDED.has_variations,
@@ -107,7 +108,7 @@ async function upsertProduct(p) {
        condition_id=EXCLUDED.condition_id, last_synced=EXCLUDED.last_synced, updated_at=NOW(),
        data=EXCLUDED.data`,
     [
-      p.id, p.asin, p.ebaySku||p.ebay_sku, p.ebayItemId||p.ebay_item_id,
+      p.id, p.asin, p.ebaySku||p.ebay_sku, p.ebayListingId||p.ebayItemId||p.ebay_item_id,
       p.title, p.sourceUrl||p.source_url,
       p.myPrice||p.my_price, p.amazonPrice||p.amazon_price, p.cost,
       p.status||'pending', p.quantity||1,
@@ -209,7 +210,7 @@ function dbToProduct(row) {
       quantity: row.quantity != null ? row.quantity : d.quantity,
       lastSynced: row.last_synced || d.lastSynced,
       ebaySku: row.ebay_sku || d.ebaySku,
-      ebayListingId: d.ebayListingId || row.ebay_item_id,
+      ebayListingId: row.ebay_item_id || d.ebayListingId || '',
     };
   }
   // Fallback for old rows without data column
