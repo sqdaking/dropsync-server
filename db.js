@@ -107,7 +107,7 @@ async function upsertProduct(p) {
        condition_id=EXCLUDED.condition_id, last_synced=EXCLUDED.last_synced, updated_at=NOW(),
        data=EXCLUDED.data`,
     [
-      p.id, p.asin, p.ebaySku||p.ebay_sku, p.ebayItemId||p.ebay_item_id,
+      p.id, p.asin, p.ebaySku||p.ebay_sku, p.ebayListingId||p.ebayItemId||p.ebay_item_id,
       p.title, p.sourceUrl||p.source_url,
       p.myPrice||p.my_price, p.amazonPrice||p.amazon_price, p.cost,
       p.status||'pending', p.quantity||1,
