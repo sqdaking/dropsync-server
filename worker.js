@@ -13,7 +13,7 @@ async function getValidToken() {
   const tokenExpiry  = await db.getSetting('token_expiry');
   const refreshToken = await db.getSetting('refresh_token');
 
-  if (accessToken && tokenExpiry && Date.now() < tokenExpiry - 60000) return accessToken;
+  if (accessToken && tokenExpiry && Date.now() < parseInt(tokenExpiry) - 60000) return accessToken;
   if (!refreshToken) return null;
 
   const clientId     = process.env.EBAY_CLIENT_ID;
@@ -37,7 +37,7 @@ async function getValidToken() {
     const d = await r.json();
     if (d.access_token) {
       await db.setSetting('access_token', d.access_token);
-      await db.setSetting('token_expiry', Date.now() + d.expires_in * 1000);
+      await db.setSetting('token_expiry', String(Date.now() + d.expires_in * 1000));
       console.log('[Worker] Token refreshed');
       return d.access_token;
     }
@@ -106,6 +106,7 @@ async function syncProduct(product, token, markup, webhookUrl) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action:        'revise',
+        sandbox:       false,
         access_token:  token,
         ebaySku:       groupSku,
         sourceUrl:     product.sourceUrl,
