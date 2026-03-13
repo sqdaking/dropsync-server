@@ -126,6 +126,12 @@ async function syncProduct(product, token, markup, webhookUrl) {
     const data = r.ok ? await r.json().catch(() => null) : null;
 
     if (!r.ok || !data?.success) {
+      // 503 = Amazon blocked with no cache — skip silently, retry next cycle
+      if (r.status === 503 || data?.skippable) {
+        console.log(`[Worker]   skipped (Amazon blocked, no cache): ${(product.title||'').slice(0,40)}`);
+        result.status = 'skipped_blocked';
+        return result;
+      }
       const errText = data?.error || `HTTP ${r.status}`;
       console.warn(`[Worker]   revise failed: ${errText}`);
       result.status = 'revise_failed';
@@ -152,11 +158,12 @@ async function syncProduct(product, token, markup, webhookUrl) {
 
     // Update DB with fresh values
     await db.updateProductSync(product.id, {
-      myPrice:     data.price || product.myPrice,
-      amazonPrice: product.amazonPrice,
-      lastSynced:  new Date().toISOString(),
-      status:      product.status,
-      quantity:    data.inStock ? (product.quantity || 1) : 0,
+      myPrice:       data.price || product.myPrice,
+      amazonPrice:   product.amazonPrice,
+      lastSynced:    new Date().toISOString(),
+      status:        product.status,
+      quantity:      data.inStock ? (product.quantity || 1) : 0,
+      ebayListingId: product.ebayListingId || product.ebay_item_id || null,
     });
 
     // Log
