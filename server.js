@@ -44,7 +44,7 @@ app.get('/api/callback', async (req, res) => {
     if (d.access_token) {
       await db.setSetting('access_token', d.access_token);
       await db.setSetting('refresh_token', d.refresh_token);
-      await db.setSetting('token_expiry', Date.now() + (d.expires_in * 1000));
+      await db.setSetting('token_expiry', String(Date.now() + (d.expires_in * 1000)));
       res.send(`<script>window.opener?.postMessage({type:'ebay_auth',success:true,access_token:'${d.access_token}',refresh_token:'${d.refresh_token}',expires_in:${d.expires_in}},'*');window.close();</script>`);
     } else {
       res.send(`<script>window.opener?.postMessage({type:'ebay_auth',error:'${d.error_description||'Token exchange failed'}'},'*');window.close();</script>`);
@@ -202,7 +202,13 @@ app.post('/api/ebay', async (req, res) => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),
     });
-    const d = await r.json();
+    const text = await r.text();
+    let d;
+    try { d = JSON.parse(text); }
+    catch(parseErr) {
+      console.error('[proxy] Vercel returned non-JSON:', text.slice(0, 300));
+      return res.status(502).json({ success: false, error: 'Backend error: ' + text.slice(0, 200) });
+    }
 
     // If a product was pushed successfully, save it to DB
     if (d.success && req.body.action === 'push' && d.ebaySku) {
@@ -238,7 +244,13 @@ app.get('/api/ebay', async (req, res) => {
     const vercelUrl = process.env.VERCEL_BACKEND_URL || 'https://dropsync-one.vercel.app';
     const qs = new URLSearchParams(req.query).toString();
     const r = await fetch(`${vercelUrl}/api/ebay?${qs}`);
-    const d = await r.json();
+    const text = await r.text();
+    let d;
+    try { d = JSON.parse(text); }
+    catch(parseErr) {
+      console.error('[proxy] Vercel GET returned non-JSON:', text.slice(0, 300));
+      return res.status(502).json({ success: false, error: 'Backend error: ' + text.slice(0, 200) });
+    }
     res.json(d);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
