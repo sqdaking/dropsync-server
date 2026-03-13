@@ -295,6 +295,23 @@ app.post('/api/migrate', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Backfill ebay_item_id from data blob ─────────────────────────────────────
+app.post('/api/backfill-listing-ids', async (req, res) => {
+  try {
+    const r = await db.pool.query("SELECT id, data FROM products WHERE ebay_item_id IS NULL AND data IS NOT NULL");
+    let fixed = 0;
+    for (const row of r.rows) {
+      const d = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+      const id = d?.ebayListingId || d?.ebayItemId || d?.ebay_item_id;
+      if (id) {
+        await db.pool.query('UPDATE products SET ebay_item_id=$1 WHERE id=$2', [id, row.id]);
+        fixed++;
+      }
+    }
+    res.json({ success: true, fixed, total: r.rows.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function start() {
   try {
