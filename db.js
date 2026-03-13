@@ -136,19 +136,22 @@ async function getProduct(id) {
   return r.rows[0] ? dbToProduct(r.rows[0]) : null;
 }
 
-async function updateProductSync(id, { myPrice, amazonPrice, lastSynced, status, quantity }) {
+async function updateProductSync(id, { myPrice, amazonPrice, lastSynced, status, quantity, ebayListingId }) {
   await pool.query(
     `UPDATE products SET
        my_price=$2, amazon_price=$3, last_synced=$4, status=$5, quantity=$6, updated_at=NOW(),
+       ebay_item_id = COALESCE($7, ebay_item_id),
        data = CASE WHEN data IS NOT NULL THEN
-         jsonb_set(jsonb_set(jsonb_set(jsonb_set(data,
+         jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(data,
            '{myPrice}', to_jsonb($2::numeric)),
            '{lastSynced}', to_jsonb($4::text)),
            '{status}', to_jsonb($5::text)),
-           '{quantity}', to_jsonb($6::int))
+           '{quantity}', to_jsonb($6::int)),
+           '{ebayListingId}', to_jsonb(COALESCE($7, data->>'ebayListingId')))
          ELSE data END
      WHERE id=$1`,
-    [id, myPrice, amazonPrice, lastSynced || new Date().toISOString(), status, quantity]
+    [id, myPrice, amazonPrice, lastSynced || new Date().toISOString(), status, quantity,
+     ebayListingId || null]
   );
 }
 
