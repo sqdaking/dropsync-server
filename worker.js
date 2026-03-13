@@ -227,7 +227,12 @@ async function runSync() {
       return;
     }
 
-    const markup     = parseFloat(await db.getSetting('markup')     || 23);
+    const markupRaw  = await db.getSetting('markup');
+    const markup     = (markupRaw !== null && markupRaw !== undefined) ? parseFloat(markupRaw) : 0;
+    if (!markup) {
+      console.warn('[Worker] markup not set in DB — run Settings → Save Pricing to sync it from the app');
+    }
+    console.log(`[Worker] markup=${markup}%`);
     const webhookUrl = await db.getSetting('webhookUrl') || null;
     const products   = await db.getProductsForSync(30); // 30 at a time (variation syncs are heavy)
 
