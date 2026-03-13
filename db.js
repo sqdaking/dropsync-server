@@ -14,7 +14,6 @@ async function initDB() {
         value TEXT,
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
-
       CREATE TABLE IF NOT EXISTS products (
         id TEXT PRIMARY KEY,
         asin TEXT,
@@ -37,13 +36,10 @@ async function initDB() {
         updated_at TIMESTAMPTZ DEFAULT NOW(),
         data JSONB
       );
-      -- Add data column if upgrading from older schema
       ALTER TABLE products ADD COLUMN IF NOT EXISTS data JSONB;
-
       CREATE INDEX IF NOT EXISTS products_status_idx ON products(status);
       CREATE INDEX IF NOT EXISTS products_asin_idx ON products(asin);
       CREATE INDEX IF NOT EXISTS products_last_synced_idx ON products(last_synced);
-
       CREATE TABLE IF NOT EXISTS logs (
         id SERIAL PRIMARY KEY,
         type TEXT,
@@ -53,7 +49,6 @@ async function initDB() {
         meta JSONB,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
-
       CREATE INDEX IF NOT EXISTS logs_created_idx ON logs(created_at DESC);
       CREATE INDEX IF NOT EXISTS logs_type_idx ON logs(type);
     `);
@@ -90,7 +85,6 @@ async function getAllSettings() {
 
 // ── Products ──────────────────────────────────────────────────────────────────
 async function upsertProduct(p) {
-  // Store full product object in data column for complete round-trip
   const fullData = JSON.stringify(p);
   await pool.query(
     `INSERT INTO products(
@@ -107,16 +101,23 @@ async function upsertProduct(p) {
        condition_id=EXCLUDED.condition_id, last_synced=EXCLUDED.last_synced, updated_at=NOW(),
        data=EXCLUDED.data`,
     [
-      p.id, p.asin, p.ebaySku||p.ebay_sku, p.ebayListingId||p.ebayItemId||p.ebay_item_id,
-      p.title, p.sourceUrl||p.source_url,
-      p.myPrice||p.my_price, p.amazonPrice||p.amazon_price, p.cost,
-      p.status||'pending', p.quantity||1,
-      p.hasVariations||p.has_variations||false,
+      p.id, p.asin,
+      p.ebaySku || p.ebay_sku,
+      p.ebayListingId || p.ebayItemId || p.ebay_item_id || null,
+      p.title,
+      p.sourceUrl || p.source_url,
+      p.myPrice || p.my_price || null,
+      p.amazonPrice || p.amazon_price || null,
+      p.cost || null,
+      p.status || 'pending',
+      p.quantity || 1,
+      p.hasVariations || p.has_variations || false,
       p.variations ? JSON.stringify(p.variations) : null,
-      p.imageUrl||p.image_url||(p.images&&p.images[0])||null, p.category,
-      p.conditionId||p.condition_id||'NEW',
-      p.lastSynced||p.last_synced||null,
-      fullData
+      p.imageUrl || p.image_url || (p.images && p.images[0]) || null,
+      p.category || null,
+      p.conditionId || p.condition_id || 'NEW',
+      p.lastSynced || p.last_synced || null,
+      fullData,
     ]
   );
 }
@@ -125,7 +126,7 @@ async function getProducts({ status, limit = 500, offset = 0 } = {}) {
   let q = 'SELECT * FROM products';
   const params = [];
   if (status) { q += ' WHERE status=$1'; params.push(status); }
-  q += ' ORDER BY created_at DESC LIMIT $' + (params.length+1) + ' OFFSET $' + (params.length+2);
+  q += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
   params.push(limit, offset);
   const r = await pool.query(q, params);
   return r.rows.map(dbToProduct);
@@ -136,30 +137,38 @@ async function getProduct(id) {
   return r.rows[0] ? dbToProduct(r.rows[0]) : null;
 }
 
+// FIX: explicit ::text casts on all params to avoid PostgreSQL type-inference errors
 async function updateProductSync(id, { myPrice, amazonPrice, lastSynced, status, quantity, ebayListingId }) {
+  const listingId = ebayListingId ? String(ebayListingId) : null;
   await pool.query(
     `UPDATE products SET
-       my_price=$2, amazon_price=$3, last_synced=$4, status=$5, quantity=$6, updated_at=NOW(),
-       ebay_item_id = COALESCE($7, ebay_item_id),
+       my_price    = $2::numeric,
+       amazon_price= $3::numeric,
+       last_synced = $4::timestamptz,
+       status      = $5::text,
+       quantity    = $6::int,
+       updated_at  = NOW(),
+       ebay_item_id = COALESCE($7::text, ebay_item_id),
        data = CASE WHEN data IS NOT NULL THEN
-         jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(data,
-           '{myPrice}', to_jsonb($2::numeric)),
-           '{lastSynced}', to_jsonb($4::text)),
-           '{status}', to_jsonb($5::text)),
-           '{quantity}', to_jsonb($6::int)),
-           '{ebayListingId}', to_jsonb(COALESCE($7, data->>'ebayListingId')))
+         data
+           || jsonb_build_object('myPrice',       $2::numeric)
+           || jsonb_build_object('lastSynced',     $4::text)
+           || jsonb_build_object('status',         $5::text)
+           || jsonb_build_object('quantity',       $6::int)
+           || jsonb_build_object('ebayListingId',  COALESCE($7::text, data->>'ebayListingId'))
          ELSE data END
-     WHERE id=$1`,
-    [id, myPrice, amazonPrice, lastSynced || new Date().toISOString(), status, quantity,
-     ebayListingId || null]
+     WHERE id = $1::text`,
+    [id, myPrice || 0, amazonPrice || 0, lastSynced || new Date().toISOString(),
+     status || 'listed', quantity ?? 1, listingId]
   );
 }
 
-async function getProductsForSync(batchSize = 100) {
-  // Get listed products with sourceUrl, oldest-synced first
+async function getProductsForSync(batchSize = 30) {
   const r = await pool.query(
     `SELECT * FROM products
-     WHERE status='listed' AND source_url IS NOT NULL AND source_url != ''
+     WHERE status='listed'
+       AND source_url IS NOT NULL AND source_url != ''
+       AND (ebay_sku NOT LIKE 'DS-RECOVERED%' AND ebay_sku NOT LIKE 'DS-EXISTING%')
      ORDER BY last_synced ASC NULLS FIRST
      LIMIT $1`,
     [batchSize]
@@ -179,7 +188,7 @@ async function countProducts(status) {
 async function addLog(type, title, detail, meta = {}) {
   await pool.query(
     'INSERT INTO logs(type,title,detail,product_id,meta) VALUES($1,$2,$3,$4,$5)',
-    [type, title, detail, meta.productId || null, JSON.stringify(meta)]
+    [type, title, detail || '', meta.productId || null, JSON.stringify(meta)]
   );
 }
 
@@ -187,7 +196,7 @@ async function getLogs({ limit = 200, offset = 0, type } = {}) {
   let q = 'SELECT * FROM logs';
   const params = [];
   if (type) { q += ' WHERE type=$1'; params.push(type); }
-  q += ' ORDER BY created_at DESC LIMIT $' + (params.length+1) + ' OFFSET $' + (params.length+2);
+  q += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
   params.push(limit, offset);
   const r = await pool.query(q, params);
   return r.rows;
@@ -200,48 +209,46 @@ async function countLogs() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function dbToProduct(row) {
-  // If full data blob stored, use it and overlay fresh sync fields
   if (row.data) {
     const d = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
     return {
       ...d,
-      // Always use DB values for these (worker may have updated them)
-      status: row.status || d.status,
-      myPrice: row.my_price ? parseFloat(row.my_price) : d.myPrice,
-      amazonPrice: row.amazon_price ? parseFloat(row.amazon_price) : d.amazonPrice,
-      quantity: row.quantity != null ? row.quantity : d.quantity,
-      lastSynced: row.last_synced || d.lastSynced,
-      ebaySku: row.ebay_sku || d.ebaySku,
-      ebayListingId: d.ebayListingId || row.ebay_item_id,
+      status:       row.status        || d.status,
+      myPrice:      row.my_price      ? parseFloat(row.my_price)      : d.myPrice,
+      amazonPrice:  row.amazon_price  ? parseFloat(row.amazon_price)  : d.amazonPrice,
+      quantity:     row.quantity      != null ? row.quantity           : d.quantity,
+      lastSynced:   row.last_synced   || d.lastSynced,
+      ebaySku:      row.ebay_sku      || d.ebaySku,
+      ebayListingId: d.ebayListingId  || row.ebay_item_id || null,
     };
   }
-  // Fallback for old rows without data column
   return {
-    id: row.id,
-    asin: row.asin,
-    ebaySku: row.ebay_sku,
+    id:           row.id,
+    asin:         row.asin,
+    ebaySku:      row.ebay_sku,
     ebayListingId: row.ebay_item_id,
-    title: row.title,
-    sourceUrl: row.source_url,
-    myPrice: row.my_price ? parseFloat(row.my_price) : null,
-    amazonPrice: row.amazon_price ? parseFloat(row.amazon_price) : null,
-    cost: row.cost ? parseFloat(row.cost) : null,
-    status: row.status,
-    quantity: row.quantity,
+    title:        row.title,
+    sourceUrl:    row.source_url,
+    myPrice:      row.my_price      ? parseFloat(row.my_price)      : null,
+    amazonPrice:  row.amazon_price  ? parseFloat(row.amazon_price)  : null,
+    cost:         row.cost          ? parseFloat(row.cost)          : null,
+    status:       row.status,
+    quantity:     row.quantity,
     hasVariations: row.has_variations,
-    variations: row.variations,
-    images: row.image_url ? [row.image_url] : [],
-    category: row.category,
-    conditionId: row.condition_id,
-    lastSynced: row.last_synced,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
+    variations:   row.variations,
+    images:       row.image_url ? [row.image_url] : [],
+    category:     row.category,
+    conditionId:  row.condition_id,
+    lastSynced:   row.last_synced,
+    createdAt:    row.created_at,
+    updatedAt:    row.updated_at,
   };
 }
 
 module.exports = {
   pool, initDB,
   getSetting, setSetting, getAllSettings,
-  upsertProduct, getProducts, getProduct, updateProductSync, getProductsForSync, countProducts,
+  upsertProduct, getProducts, getProduct, updateProductSync,
+  getProductsForSync, countProducts,
   addLog, getLogs, countLogs,
 };
