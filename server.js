@@ -131,6 +131,13 @@ app.put('/api/products/:id', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+app.delete('/api/products/:id', async (req, res) => {
+  try {
+    await db.pool.query('DELETE FROM products WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/products/count', async (req, res) => {
   try {
     const { status } = req.query;
