@@ -76,13 +76,9 @@ async function sendWebhook(webhookUrl, type, product, changes) {
   } catch(e) { console.warn('[Worker] Webhook failed:', e.message); }
 }
 
-// ── Sync one product via Vercel sync action ───────────────────────────────────
-// Delegates to ebay.js action=sync which mirrors the push/revise strategy:
-//   1. Full Amazon scrape → comboPrices/sizePrices/comboAsin/images
-//   2. AI category + aspects
-//   3. Full inventory item PUT per variant (title+desc+images+aspects+qty)
-//   4. Group PUT with fresh images
-//   5. Update offer prices per variant using correct Color|Size price lookup
+// ── Revise one product via Vercel revise action ──────────────────────────────
+// Full in-place replacement: scrape Amazon → wipe+replace title, images, qty, price
+// Keeps the same eBay listing ID — listing stays live throughout
 async function syncProduct(product, token, markup, webhookUrl) {
   const result = {
     productId:    product.id,
@@ -101,7 +97,7 @@ async function syncProduct(product, token, markup, webhookUrl) {
       return result;
     }
 
-    console.log(`[Worker] Syncing: "${(product.title||'').slice(0,50)}"`);
+    console.log(`[Worker] Revising: "${(product.title||'').slice(0,50)}"`);
     console.log(`[Worker]   sku=${groupSku.slice(0,35)} url=${product.sourceUrl.slice(0,50)}`);
 
     // Call Vercel sync action — it does everything (scrape + full inventory PUT + price update)
@@ -109,13 +105,14 @@ async function syncProduct(product, token, markup, webhookUrl) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        action:       'sync',
-        access_token: token,
-        ebaySku:      groupSku,
-        sourceUrl:    product.sourceUrl,
-        markup:       markup,
-        handlingCost: parseFloat(await db.getSetting('handlingCost') || 2),
-        quantity:     product.quantity || 1,
+        action:        'revise',
+        access_token:  token,
+        ebaySku:       groupSku,
+        sourceUrl:     product.sourceUrl,
+        ebayListingId: product.ebayListingId || product.ebay_item_id || '',
+        markup:        markup,
+        handlingCost:  parseFloat(await db.getSetting('handlingCost') || 2),
+        quantity:      product.quantity || 1,
         // Cached fallback data in case Amazon blocks the scrape
         fallbackImages:  product.images || [],
         fallbackTitle:   product.title  || '',
@@ -129,11 +126,11 @@ async function syncProduct(product, token, markup, webhookUrl) {
 
     if (!r.ok || !data?.success) {
       const errText = data?.error || `HTTP ${r.status}`;
-      console.warn(`[Worker]   sync failed: ${errText}`);
-      result.status = 'sync_failed';
+      console.warn(`[Worker]   revise failed: ${errText}`);
+      result.status = 'revise_failed';
       result.error  = errText;
       await db.addLog('error',
-        `Sync failed: ${(product.title||'').slice(0,50)}`,
+        `Revise failed: ${(product.title||'').slice(0,50)}`,
         errText,
         { productId: product.id }
       );
