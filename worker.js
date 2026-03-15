@@ -122,7 +122,6 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         action:         'revise',
-        sandbox:        false,
         access_token:   token,
         ebaySku:        sku,
         sourceUrl:      product.sourceUrl,
@@ -130,21 +129,20 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         markup,
         handlingCost,
         quantity:       product.quantity || 1,
-        fallbackImages:  product.images        || [],
-        fallbackTitle:   product.title         || '',
-        // FIX: use Amazon cost (not eBay price) — myPrice is already marked up
-        // applyMk() will add markup on top, so passing myPrice causes double-markup
-        fallbackPrice:   product.cost || product.amazonPrice || 0,
-        fallbackInStock: (product.quantity || 1) > 0,
-        // FIX: pass full variation combo data so revise works without re-scraping
-        // Without these, all variants get defaultQty regardless of actual Amazon stock
+        // Cached fallback data — used when Amazon scrape is blocked
+        fallbackImages:           product.images        || [],
+        fallbackTitle:            product.title         || '',
+        // IMPORTANT: pass Amazon cost only (not myPrice which is already marked-up)
+        fallbackPrice:            product.cost || product.amazonPrice || 0,
+        fallbackInStock:          product.hasVariations ? true : (product.inStock !== false && (product.quantity || 1) > 0),
+        // Per-variant combo data — critical for correct per-SKU price/stock
         fallbackComboAsin:        product.comboAsin        || null,
         fallbackComboInStock:     product.comboInStock     || null,
         fallbackComboPrices:      product.comboPrices      || null,
         fallbackVariations:       product.variations       || null,
         fallbackVariationImages:  product.variationImages  || null,
         fallbackPrimaryDimName:   product._primaryDimName  || null,
-        fallbackSecondaryDimName: product._secondaryDimName || null,
+        fallbackSecondaryDimName: product._secondaryDimName|| null,
       }),
       timeout: 180000, // 3 min max
     });
