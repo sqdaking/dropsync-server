@@ -221,39 +221,27 @@ app.post('/api/ebay', async (req, res) => {
     }
 
     // If a product was pushed successfully, save it to DB
-    // FIX: handlePush returns { sku, listingId } — not { ebaySku, ebayItemId }
-    // FIX: product data lives at req.body.product, not req.body
-    if (d.success && req.body.action === 'push' && d.sku) {
-      const p = req.body.product || req.body;
-      const productId = p.id || d.sku;
+    if (d.success && req.body.action === 'push' && d.ebaySku) {
+      // Save the pushed product
+      const p = req.body;
       await db.upsertProduct({
-        id:            productId,
-        asin:          p.asin          || null,
-        ebaySku:       d.sku,                        // was d.ebaySku (undefined)
-        ebayListingId: d.listingId     || null,       // was d.ebayItemId (undefined)
-        title:         p.title         || '',
-        sourceUrl:     p.url           || p.sourceUrl || null,
-        myPrice:       p.myPrice       || null,
-        cost:          p.cost          || p.price     || null,
-        amazonPrice:   p.price         || p.cost      || null,
-        status:        'listed',
-        quantity:      p.quantity      || 1,
+        id: p.id || d.ebaySku,
+        asin: p.asin,
+        ebaySku: d.ebaySku,
+        ebayItemId: d.ebayItemId,
+        title: p.title,
+        sourceUrl: p.sourceUrl,
+        myPrice: p.myPrice,
+        cost: p.cost,
+        status: 'listed',
+        quantity: p.quantity || 1,
         hasVariations: p.hasVariations || false,
-        variations:    p.variations    || null,
-        imageUrl:      p.imageUrl      || (p.images && p.images[0]) || null,
-        images:        p.images        || [],
-        category:      p.category      || null,
-        // Store full product blob so worker can access comboAsin/comboPrices for revise
-        comboAsin:          p.comboAsin          || null,
-        comboInStock:       p.comboInStock        || null,
-        comboPrices:        p.comboPrices         || null,
-        sizePrices:         p.sizePrices          || null,
-        variationImages:    p.variationImages     || null,
-        _primaryDimName:    p._primaryDimName     || null,
-        _secondaryDimName:  p._secondaryDimName   || null,
-        lastSynced:    null,
+        variations: p.variations,
+        imageUrl: p.imageUrl,
+        category: p.category,
+        lastSynced: null,
       });
-      await db.addLog('import', `Listed: ${p.title?.slice(0,50)}`, `eBay SKU: ${d.sku} · listingId: ${d.listingId || 'n/a'}`, { productId });
+      await db.addLog('import', `Listed: ${p.title?.slice(0,50)}`, `eBay SKU: ${d.ebaySku}`, { productId: p.id || d.ebaySku });
     }
 
     res.json(d);
@@ -344,6 +332,62 @@ app.post('/api/backfill-listing-ids', async (req, res) => {
     }
     res.json({ success: true, fixed, total: r.rows.length });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Amazon proxy — browser fetches Amazon HTML through Railway (different IP, no Vercel block) ───
+// This endpoint allows the browser to fetch Amazon pages without CORS issues.
+// Railway's IPs are not blocked like Vercel's IPs, so Amazon scraping succeeds.
+app.get('/api/amazon', async (req, res) => {
+  const url = (req.query.url || '').trim();
+  if (!url || !url.includes('amazon.')) {
+    return res.status(400).json({ error: 'Invalid Amazon URL' });
+  }
+  // Allow any origin so the dropsync frontend can read the response
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+
+  const fetch = require('node-fetch');
+  try {
+    const r = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Cache-Control': 'max-age=0',
+      },
+      compress: true,
+      timeout: 18000,
+      redirect: 'follow',
+    });
+
+    if (!r.ok) {
+      return res.status(r.status).json({ error: `Amazon returned HTTP ${r.status}` });
+    }
+
+    const html = await r.text();
+
+    // Detect bot challenge pages
+    if (
+      html.includes('Type the characters you see in this image') ||
+      html.includes('robot check') ||
+      html.includes('Enter the characters you see below') ||
+      html.length < 5000
+    ) {
+      return res.status(429).json({ error: 'Amazon bot detection triggered — try again in a moment' });
+    }
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  } catch(e) {
+    console.error('[amazon-proxy] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
