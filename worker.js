@@ -130,10 +130,21 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         markup,
         handlingCost,
         quantity:       product.quantity || 1,
-        fallbackImages:  product.images     || [],
-        fallbackTitle:   product.title      || '',
-        fallbackPrice:   product.amazonPrice || product.cost || product.myPrice || 0,
+        fallbackImages:  product.images        || [],
+        fallbackTitle:   product.title         || '',
+        // FIX: use Amazon cost (not eBay price) — myPrice is already marked up
+        // applyMk() will add markup on top, so passing myPrice causes double-markup
+        fallbackPrice:   product.cost || product.amazonPrice || 0,
         fallbackInStock: (product.quantity || 1) > 0,
+        // FIX: pass full variation combo data so revise works without re-scraping
+        // Without these, all variants get defaultQty regardless of actual Amazon stock
+        fallbackComboAsin:        product.comboAsin        || null,
+        fallbackComboInStock:     product.comboInStock     || null,
+        fallbackComboPrices:      product.comboPrices      || null,
+        fallbackVariations:       product.variations       || null,
+        fallbackVariationImages:  product.variationImages  || null,
+        fallbackPrimaryDimName:   product._primaryDimName  || null,
+        fallbackSecondaryDimName: product._secondaryDimName || null,
       }),
       timeout: 180000, // 3 min max
     });
