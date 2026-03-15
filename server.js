@@ -221,27 +221,39 @@ app.post('/api/ebay', async (req, res) => {
     }
 
     // If a product was pushed successfully, save it to DB
-    if (d.success && req.body.action === 'push' && d.ebaySku) {
-      // Save the pushed product
-      const p = req.body;
+    // FIX: handlePush returns { sku, listingId } — not { ebaySku, ebayItemId }
+    // FIX: product data lives at req.body.product, not req.body
+    if (d.success && req.body.action === 'push' && d.sku) {
+      const p = req.body.product || req.body;
+      const productId = p.id || d.sku;
       await db.upsertProduct({
-        id: p.id || d.ebaySku,
-        asin: p.asin,
-        ebaySku: d.ebaySku,
-        ebayItemId: d.ebayItemId,
-        title: p.title,
-        sourceUrl: p.sourceUrl,
-        myPrice: p.myPrice,
-        cost: p.cost,
-        status: 'listed',
-        quantity: p.quantity || 1,
+        id:            productId,
+        asin:          p.asin          || null,
+        ebaySku:       d.sku,                        // was d.ebaySku (undefined)
+        ebayListingId: d.listingId     || null,       // was d.ebayItemId (undefined)
+        title:         p.title         || '',
+        sourceUrl:     p.url           || p.sourceUrl || null,
+        myPrice:       p.myPrice       || null,
+        cost:          p.cost          || p.price     || null,
+        amazonPrice:   p.price         || p.cost      || null,
+        status:        'listed',
+        quantity:      p.quantity      || 1,
         hasVariations: p.hasVariations || false,
-        variations: p.variations,
-        imageUrl: p.imageUrl,
-        category: p.category,
-        lastSynced: null,
+        variations:    p.variations    || null,
+        imageUrl:      p.imageUrl      || (p.images && p.images[0]) || null,
+        images:        p.images        || [],
+        category:      p.category      || null,
+        // Store full product blob so worker can access comboAsin/comboPrices for revise
+        comboAsin:          p.comboAsin          || null,
+        comboInStock:       p.comboInStock        || null,
+        comboPrices:        p.comboPrices         || null,
+        sizePrices:         p.sizePrices          || null,
+        variationImages:    p.variationImages     || null,
+        _primaryDimName:    p._primaryDimName     || null,
+        _secondaryDimName:  p._secondaryDimName   || null,
+        lastSynced:    null,
       });
-      await db.addLog('import', `Listed: ${p.title?.slice(0,50)}`, `eBay SKU: ${d.ebaySku}`, { productId: p.id || d.ebaySku });
+      await db.addLog('import', `Listed: ${p.title?.slice(0,50)}`, `eBay SKU: ${d.sku} · listingId: ${d.listingId || 'n/a'}`, { productId });
     }
 
     res.json(d);
