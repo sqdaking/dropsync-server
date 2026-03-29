@@ -119,7 +119,12 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
 
     const r = await fetch(`${VERCEL_URL}/api/ebay`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        // Send product's last-synced time so ebay.js can enforce the 25hr cooldown
+        // even across Vercel cold starts (global._reviseLastRun is reset on cold start)
+        'X-Last-Revised': String(product.lastSynced ? new Date(product.lastSynced).getTime() : 0),
+      },
       body: JSON.stringify({
         action:         'revise',
         access_token:   token,
