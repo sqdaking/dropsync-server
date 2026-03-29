@@ -115,7 +115,7 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       return result;
     }
 
-    console.log(`[Worker] Revising: "${(product.title||'').slice(0,50)}"`);
+    console.log(`[Worker] Revising: "${(product.title||'').slice(0,50)}" markup=${markup}% handling=$${handlingCost}`);
 
     const r = await fetch(`${VERCEL_URL}/api/ebay`, {
       method: 'POST',
@@ -242,18 +242,21 @@ async function runSync() {
     }
 
     const markupRaw     = await db.getSetting('markup');
-    const markup        = markupRaw != null ? parseFloat(markupRaw) : 0;
+    const globalMarkup  = markupRaw != null ? parseFloat(markupRaw) : 0;
     const handlingCost  = parseFloat(await db.getSetting('handlingCost') || 2);
     const webhookUrl    = await db.getSetting('webhookUrl') || null;
     const products      = await db.getProductsForSync(30);
 
     if (!products.length) { console.log('[Worker] No products to sync'); return; }
-    console.log(`[Worker] ${products.length} products · markup=${markup}% · handling=$${handlingCost}`);
+    console.log(`[Worker] ${products.length} products · globalMarkup=${globalMarkup}% · handling=$${handlingCost}`);
 
     const totals = { ok: 0, errors: 0, skipped: 0, oos: 0 };
 
     for (const p of products) {
-      const r = await reviseProduct(p, token, markup, handlingCost, webhookUrl);
+      // FIX: use per-product markup if set, otherwise global DB markup setting
+    // Product.markup is set at import time from the user's settings slider
+    const effectiveMarkup = (p.markup != null && p.markup > 0) ? p.markup : globalMarkup;
+    const r = await reviseProduct(p, token, effectiveMarkup, handlingCost, webhookUrl);
       if (r.status === 'ok')                    { totals.ok++;      if (r.wentOos) totals.oos++; }
       else if (r.status.startsWith('skipped'))  totals.skipped++;
       else                                       totals.errors++;
