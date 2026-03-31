@@ -110,6 +110,12 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
 
   try {
     const sku = product.ebaySku;
+    // Skip non-Amazon products — AliExpress/other sources use the sync flow instead
+    if (product.sourceUrl && /aliexpress\.com/i.test(product.sourceUrl)) {
+      console.log(`[Worker]   skipping AliExpress product (use sync flow): "${(product.title||'').slice(0,40)}"`);
+      result.status = 'skipped_ae';
+      return result;
+    }
     if (!sku || !product.sourceUrl) {
       result.status = 'skipped_no_sku';
       return result;
@@ -121,7 +127,7 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        // Send product's last-synced time so ebay.js can enforce the 25hr cooldown
+        // Send product's last-synced time so ebay.js can enforce the 12hr cooldown
         // even across Vercel cold starts (global._reviseLastRun is reset on cold start)
         'X-Last-Revised': String(product.lastSynced ? new Date(product.lastSynced).getTime() : 0),
       },
@@ -253,10 +259,16 @@ async function runSync() {
     const totals = { ok: 0, errors: 0, skipped: 0, oos: 0 };
 
     for (const p of products) {
-      // FIX: use per-product markup if set, otherwise global DB markup setting
-    // Product.markup is set at import time from the user's settings slider
-    const effectiveMarkup = (p.markup != null && p.markup > 0) ? p.markup : globalMarkup;
-    const r = await reviseProduct(p, token, effectiveMarkup, handlingCost, webhookUrl);
+      // Skip products the user has manually marked OOS
+      // markedOos is set by the frontend when user clicks "Mark OOS" and synced to Railway DB
+      if (p.markedOos === true) {
+        console.log(`[Worker]   skipping OOS-locked: "${(p.title||'').slice(0,40)}"`);
+        totals.skipped++;
+        continue;
+      }
+      // Use per-product markup if set, otherwise global DB markup setting
+      const effectiveMarkup = (p.markup != null && p.markup > 0) ? p.markup : globalMarkup;
+      const r = await reviseProduct(p, token, effectiveMarkup, handlingCost, webhookUrl);
       if (r.status === 'ok')                    { totals.ok++;      if (r.wentOos) totals.oos++; }
       else if (r.status.startsWith('skipped'))  totals.skipped++;
       else                                       totals.errors++;
