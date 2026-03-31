@@ -1,11 +1,8 @@
-const cron  = require('node-cron');
 const fetch = require('node-fetch');
 const db    = require('./db');
 
-let isSyncing = false;
-
 const VERCEL_URL = process.env.VERCEL_BACKEND_URL || 'https://dropsync-one.vercel.app';
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── Token management ──────────────────────────────────────────────────────────
 async function getValidToken() {
@@ -38,7 +35,7 @@ async function getValidToken() {
     if (d.access_token) {
       await db.setSetting('access_token', d.access_token);
       await db.setSetting('token_expiry', String(Date.now() + d.expires_in * 1000));
-      console.log('[Worker] Token refreshed successfully');
+      console.log('[Worker] Token refreshed');
       return d.access_token;
     }
     console.error('[Worker] Token refresh failed:', d.error_description || d.error);
@@ -50,87 +47,49 @@ async function getValidToken() {
 }
 
 // ── Webhook ───────────────────────────────────────────────────────────────────
-// type: 'revise' | 'price' | 'stock' | 'oos' | 'error'
 async function sendWebhook(webhookUrl, type, product, details = []) {
   if (!webhookUrl) return;
   const ebayUrl = product.ebayListingId ? `https://www.ebay.com/itm/${product.ebayListingId}` : '';
   const title   = (product.title || '').slice(0, 60);
-
-  const icons  = { revise: '✅', price: '💰', stock: '📦', oos: '🚫', error: '❌' };
-  const labels = { revise: 'Revised', price: 'Price Change', stock: 'Stock Change', oos: 'Out of Stock', error: 'Error' };
-  const colors = { revise: 0x10b981, price: 0xf59e0b, stock: 0x8b5cf6, oos: 0xef4444, error: 0xef4444 };
-
-  const icon  = icons[type]  || '🔄';
-  const label = labels[type] || type;
-  const color = colors[type] || 0x6b7280;
-
-  const body = details.length ? details.join('\n') : label;
-  const text = `${icon} *DropSync ${label}*\n*${title}*\n${body}${ebayUrl ? '\n' + ebayUrl : ''}`;
-
+  const icons   = { revise: '✅', price: '💰', stock: '📦', oos: '🚫', error: '❌' };
+  const labels  = { revise: 'Revised', price: 'Price Change', stock: 'Stock Change', oos: 'Out of Stock', error: 'Error' };
+  const colors  = { revise: 0x10b981, price: 0xf59e0b, stock: 0x8b5cf6, oos: 0xef4444, error: 0xef4444 };
+  const icon    = icons[type] || '🔄';
+  const label   = labels[type] || type;
+  const color   = colors[type] || 0x6b7280;
+  const body    = details.length ? details.join('\n') : label;
+  const text    = `${icon} *DropSync ${label}*\n*${title}*\n${body}${ebayUrl ? '\n' + ebayUrl : ''}`;
   const payload = {
-    // Slack format
-    text,
-    // Discord format
-    content: text.replace(/\*/g, '**'),
-    embeds: [{
-      title:       `${icon} ${label}: ${title}`,
-      description: body,
-      color,
-      url:         ebayUrl || undefined,
-      timestamp:   new Date().toISOString(),
-      footer:      { text: 'DropSync' },
-    }],
-    // Generic
-    type, product_title: product.title, details, ebay_url: ebayUrl,
-    timestamp: new Date().toISOString(),
+    text, content: text.replace(/\*/g, '**'),
+    embeds: [{ title: `${icon} ${label}: ${title}`, description: body, color, url: ebayUrl || undefined, timestamp: new Date().toISOString(), footer: { text: 'DropSync' } }],
+    type, product_title: product.title, details, ebay_url: ebayUrl, timestamp: new Date().toISOString(),
   };
-
   try {
-    const r = await fetch(webhookUrl, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload), timeout: 8000,
-    });
-    console.log(`[Worker] Webhook sent (${type}): ${r.status}`);
-  } catch(e) {
-    console.warn('[Worker] Webhook failed:', e.message);
-  }
+    await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), timeout: 8000 });
+  } catch(e) { console.warn('[Worker] Webhook failed:', e.message); }
 }
 
 // ── Revise one product ────────────────────────────────────────────────────────
 async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
-  const result = {
-    productId:    product.id,
-    title:        product.title,
-    status:       'ok',
-    priceChanges: [],
-    stockChanges: [],
-    imageChanges: [],
-    wentOos:      false,
-  };
+  const result = { productId: product.id, title: product.title, status: 'ok', priceChanges: [], stockChanges: [], wentOos: false };
 
   try {
     const sku = product.ebaySku;
-    // Skip non-Amazon products — AliExpress/other sources use the sync flow instead
     if (product.sourceUrl && /aliexpress\.com/i.test(product.sourceUrl)) {
-      console.log(`[Worker]   skipping AliExpress product (use sync flow): "${(product.title||'').slice(0,40)}"`);
-      result.status = 'skipped_ae';
-      return result;
+      result.status = 'skipped_ae'; return result;
     }
-    if (!sku || !product.sourceUrl) {
-      result.status = 'skipped_no_sku';
-      return result;
+    if (!sku || !product.sourceUrl) { result.status = 'skipped_no_sku'; return result; }
+    if (product.markedOos === true) {
+      console.log(`[Worker]   skipping OOS-locked: "${(product.title||'').slice(0,40)}"`);
+      result.status = 'skipped_oos'; return result;
     }
 
-    console.log(`[Worker] Revising: "${(product.title||'').slice(0,50)}" markup=${markup}% handling=$${handlingCost}`);
+    console.log(`[Worker] → "${(product.title||'').slice(0,50)}"`);
 
     const r = await fetch(`${VERCEL_URL}/api/ebay`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        // Send product's last-synced time so ebay.js can enforce the 12hr cooldown
-        // even across Vercel cold starts (global._reviseLastRun is reset on cold start)
-        'X-Last-Revised': String(product.lastSynced ? new Date(product.lastSynced).getTime() : 0),
-      },
+      headers: { 'Content-Type': 'application/json' },
+      // No X-Last-Revised — no cooldown, revise every time it comes up in rotation
       body: JSON.stringify({
         action:         'revise',
         access_token:   token,
@@ -140,13 +99,10 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         markup,
         handlingCost,
         quantity:       product.quantity || 1,
-        // Cached fallback data — used when Amazon scrape is blocked
         fallbackImages:           product.images        || [],
         fallbackTitle:            product.title         || '',
-        // IMPORTANT: pass Amazon cost only (not myPrice which is already marked-up)
         fallbackPrice:            product.cost || product.amazonPrice || 0,
         fallbackInStock:          product.hasVariations ? true : (product.inStock !== false && (product.quantity || 1) > 0),
-        // Per-variant combo data — critical for correct per-SKU price/stock
         fallbackComboAsin:        product.comboAsin        || null,
         fallbackComboInStock:     product.comboInStock     || null,
         fallbackComboPrices:      product.comboPrices      || null,
@@ -155,146 +111,129 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         fallbackPrimaryDimName:   product._primaryDimName  || null,
         fallbackSecondaryDimName: product._secondaryDimName|| null,
       }),
-      timeout: 180000, // 3 min max
+      timeout: 290000, // just under Vercel's 300s limit
     });
 
-    // Handle non-JSON or network errors
     let data = null;
-    try { data = r.ok ? await r.json() : await r.json().catch(() => null); } catch {}
+    try { data = await r.json(); } catch {}
 
-    // 503 = Amazon blocked, no cached images — skip silently
     if (r.status === 503 || data?.skippable) {
-      console.log(`[Worker]   skipped (blocked/no-cache): "${(product.title||'').slice(0,40)}"`);
-      result.status = 'skipped_blocked';
-      return result;
+      console.log(`[Worker]   skipped (blocked/no-cache)`);
+      result.status = 'skipped_blocked'; return result;
     }
 
     if (!r.ok || !data?.success) {
       const errText = data?.error || `HTTP ${r.status}`;
       console.warn(`[Worker]   FAILED: ${errText}`);
-      result.status = 'revise_failed';
-      result.error  = errText;
-      await db.addLog('error',
-        `Revise failed: ${(product.title||'').slice(0,50)}`,
-        errText, { productId: product.id }
-      );
+      result.status = 'revise_failed'; result.error = errText;
+      await db.addLog('error', `Revise failed: ${(product.title||'').slice(0,50)}`, errText, { productId: product.id });
       if (webhookUrl) await sendWebhook(webhookUrl, 'error', product, [errText]);
       return result;
     }
 
-    // Success
     result.priceChanges = data.priceChanges || [];
     result.stockChanges = data.stockChanges || [];
-    result.imageChanges = data.imageChanges || [];
     result.wentOos      = data.inStock === false;
 
-    console.log(`[Worker]   ✓ ${data.type} · ${data.updatedVariants||1} variants · $${data.price?.toFixed(2)} · inStock=${data.inStock}`);
+    const inStockStr = data.inStock ? 'In Stock' : 'OOS';
+    console.log(`[Worker]   ✓ ${data.updatedVariants||1} variants · $${(data.price||0).toFixed(2)} · ${inStockStr} · priceChanges=${result.priceChanges.length}`);
 
-    // Update DB
     await db.updateProductSync(product.id, {
       myPrice:       data.price || product.myPrice,
-      amazonPrice:   product.amazonPrice || 0,
       lastSynced:    new Date().toISOString(),
       status:        'listed',
       quantity:      data.inStock ? (product.quantity || 1) : 0,
       ebayListingId: product.ebayListingId || null,
     });
 
-    // Log
-    const logDetail = `${data.type==='variant'?`${data.updatedVariants} variants`:'1 item'} · ${data.images} imgs · $${data.price?.toFixed(2)} · ${data.inStock?'In Stock':'OOS'}`;
-    await db.addLog('sync',
-      `Revised: ${(product.title||'').slice(0,50)}`,
-      logDetail, { productId: product.id }
-    );
+    const logDetail = `${data.updatedVariants||1} variants · $${(data.price||0).toFixed(2)} · ${inStockStr}`;
+    await db.addLog('sync', `Revised: ${(product.title||'').slice(0,50)}`, logDetail, { productId: product.id });
 
-    // Webhook on every successful revise
     if (webhookUrl) {
-      const details = [logDetail];
-      if (result.priceChanges.length) details.push(...result.priceChanges.slice(0,5));
-      if (result.stockChanges.length) details.push(...result.stockChanges.slice(0,5));
-      const wType = result.wentOos ? 'oos'
-        : result.priceChanges.length ? 'price'
-        : result.stockChanges.length ? 'stock'
-        : 'revise';
+      const wType = result.wentOos ? 'oos' : result.priceChanges.length ? 'price' : result.stockChanges.length ? 'stock' : 'revise';
+      const details = [logDetail, ...result.priceChanges.slice(0,5), ...result.stockChanges.slice(0,5)];
       await sendWebhook(webhookUrl, wType, product, details);
     }
 
   } catch(e) {
-    result.status = 'error';
-    result.error  = e.message;
-    console.error(`[Worker] Exception for ${product.id}:`, e.message);
-    await db.addLog('error',
-      `Sync error: ${(product.title||'').slice(0,50)}`,
-      e.message, { productId: product.id }
-    );
+    result.status = 'error'; result.error = e.message;
+    console.error(`[Worker] Exception:`, e.message);
+    await db.addLog('error', `Sync error: ${(product.title||'').slice(0,50)}`, e.message, { productId: product.id });
   }
 
   return result;
 }
 
-// ── Main sync job ─────────────────────────────────────────────────────────────
-async function runSync() {
-  if (isSyncing) { console.log('[Worker] Already running, skipping'); return; }
-  isSyncing = true;
-  const cycleStart = Date.now();
-  console.log('[Worker] ════ Sync cycle starting ════');
+// ── Continuous rotation loop ──────────────────────────────────────────────────
+// Revises one listing at a time, forever, from index 0 → N → 0 → ...
+// No cooldown, no batch size, no cron. One at a time, always moving forward.
+async function runForever() {
+  console.log('[Worker] ════ Continuous rotation started ════');
 
-  try {
-    const token = await getValidToken();
-    if (!token) {
-      console.log('[Worker] No valid eBay token — skipping');
-      await db.addLog('error', 'Sync skipped', 'No valid eBay token — reconnect in Settings', {});
-      return;
-    }
+  // Restore cursor from DB (survives restarts)
+  let cursor = parseInt(await db.getSetting('revise_cursor') || '0') || 0;
 
-    const markupRaw     = await db.getSetting('markup');
-    const globalMarkup  = markupRaw != null ? parseFloat(markupRaw) : 0;
-    const handlingCost  = parseFloat(await db.getSetting('handlingCost') || 2);
-    const webhookUrl    = await db.getSetting('webhookUrl') || null;
-    const products      = await db.getProductsForSync(30);
-
-    if (!products.length) { console.log('[Worker] No products to sync'); return; }
-    console.log(`[Worker] ${products.length} products · globalMarkup=${globalMarkup}% · handling=$${handlingCost}`);
-
-    const totals = { ok: 0, errors: 0, skipped: 0, oos: 0 };
-
-    for (const p of products) {
-      // Skip products the user has manually marked OOS
-      // markedOos is set by the frontend when user clicks "Mark OOS" and synced to Railway DB
-      if (p.markedOos === true) {
-        console.log(`[Worker]   skipping OOS-locked: "${(p.title||'').slice(0,40)}"`);
-        totals.skipped++;
+  while (true) {
+    try {
+      // Refresh token if needed
+      const token = await getValidToken();
+      if (!token) {
+        console.log('[Worker] No valid eBay token — waiting 60s');
+        await db.addLog('error', 'Sync paused', 'No valid eBay token — reconnect in Settings', {});
+        await sleep(60000);
         continue;
       }
-      // Use per-product markup if set, otherwise global DB markup setting
-      const effectiveMarkup = (p.markup != null && p.markup > 0) ? p.markup : globalMarkup;
-      const r = await reviseProduct(p, token, effectiveMarkup, handlingCost, webhookUrl);
-      if (r.status === 'ok')                    { totals.ok++;      if (r.wentOos) totals.oos++; }
-      else if (r.status.startsWith('skipped'))  totals.skipped++;
-      else                                       totals.errors++;
-      await sleep(3000);
+
+      // Get ALL listed products (stable order by id)
+      const allProducts = await db.getProductsForSync(9999);
+      const listed = allProducts.filter(p =>
+        p.status === 'listed' && p.ebaySku && p.sourceUrl &&
+        !/aliexpress\.com/i.test(p.sourceUrl) &&
+        p.markedOos !== true
+      );
+
+      if (!listed.length) {
+        console.log('[Worker] No listed products — waiting 30s');
+        await sleep(30000);
+        continue;
+      }
+
+      // Wrap cursor
+      if (cursor >= listed.length) {
+        cursor = 0;
+        console.log(`[Worker] ── Rotation complete — restarting from 0 (${listed.length} listings) ──`);
+        await db.setSetting('last_sync_run', new Date().toISOString());
+      }
+
+      const product = listed[cursor];
+      const markupRaw    = await db.getSetting('markup');
+      const globalMarkup = markupRaw != null ? parseFloat(markupRaw) : 0;
+      const handlingCost = parseFloat(await db.getSetting('handlingCost') || 2);
+      const webhookUrl   = await db.getSetting('webhookUrl') || null;
+      const effectiveMarkup = (product.markup != null && product.markup > 0) ? product.markup : globalMarkup;
+
+      console.log(`[Worker] [${cursor + 1}/${listed.length}] Revising: "${(product.title||'').slice(0,45)}"`);
+      await reviseProduct(product, token, effectiveMarkup, handlingCost, webhookUrl);
+
+      cursor++;
+      await db.setSetting('revise_cursor', String(cursor));
+
+    } catch(e) {
+      console.error('[Worker] Loop error:', e.message);
+      await db.addLog('error', 'Worker loop error', e.message, {}).catch(() => {});
+      await sleep(10000); // brief pause on unexpected errors
     }
 
-    const elapsed = ((Date.now() - cycleStart) / 1000).toFixed(0);
-    const summary = `ok:${totals.ok} oos:${totals.oos} errors:${totals.errors} skipped:${totals.skipped} (${elapsed}s)`;
-    console.log(`[Worker] ════ Done — ${summary} ════`);
-    await db.setSetting('last_sync_run', new Date().toISOString());
-    await db.setSetting('last_sync_summary', totals);
-    await db.addLog('sync', 'Auto-sync complete', summary, {});
-
-  } catch(e) {
-    console.error('[Worker] Fatal error:', e.message);
-    await db.addLog('error', 'Auto-sync fatal', e.message, {}).catch(() => {});
-  } finally {
-    isSyncing = false;
+    // Small gap between revises — lets Vercel breathe, avoids eBay rate limits
+    await sleep(3000);
   }
 }
 
-// ── Start scheduler ───────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 function startWorker() {
-  console.log('[Worker] Starting — cycles every 20 minutes');
-  setTimeout(runSync, 30000);              // first run 30s after startup
-  cron.schedule('*/20 * * * *', runSync); // then every 20 min
+  console.log('[Worker] Starting continuous rotation (no cooldown, one at a time)');
+  // Brief startup delay so DB/server can initialize
+  setTimeout(runForever, 5000);
 }
 
-module.exports = { startWorker, runSync, getValidToken };
+module.exports = { startWorker, runForever, getValidToken };
