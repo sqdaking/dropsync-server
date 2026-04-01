@@ -176,6 +176,7 @@ async function runForever() {
   let _cacheLoadedAt = 0;
 
   while (true) {
+    let _reviseStart = Date.now(); // declared here so spacing code always has it
     try {
       // Refresh token if needed
       const token = await getValidToken();
@@ -217,7 +218,7 @@ async function runForever() {
       }
 
       const product = listed[cursor];
-      const _reviseStart = Date.now();
+      _reviseStart = Date.now(); // reset to actual revise start (after cache/cursor setup)
       const markupRaw    = await db.getSetting('markup');
       const globalMarkup = markupRaw != null ? parseFloat(markupRaw) : 0;
       const handlingCost = parseFloat(await db.getSetting('handlingCost') || 2);
