@@ -99,17 +99,14 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         markup,
         handlingCost,
         quantity:       product.quantity || 1,
-        fallbackImages:           product.images        || [],
-        fallbackTitle:            product.title         || '',
+        // Stripped large objects (comboAsin/comboPrices/variations/variationImages)
+        // Each was 10-100KB × 3000 products = OOM. Vercel re-scrapes Amazon fresh anyway.
+        fallbackImages:           (product.images || []).slice(0, 2),
+        fallbackTitle:            product.title  || '',
         fallbackPrice:            product.cost || product.amazonPrice || 0,
         fallbackInStock:          product.hasVariations ? true : (product.inStock !== false && (product.quantity || 1) > 0),
-        fallbackComboAsin:        product.comboAsin        || null,
-        fallbackComboInStock:     product.comboInStock     || null,
-        fallbackComboPrices:      product.comboPrices      || null,
-        fallbackVariations:       product.variations       || null,
-        fallbackVariationImages:  product.variationImages  || null,
-        fallbackPrimaryDimName:   product._primaryDimName  || null,
-        fallbackSecondaryDimName: product._secondaryDimName|| null,
+        fallbackPrimaryDimName:   product._primaryDimName   || null,
+        fallbackSecondaryDimName: product._secondaryDimName || null,
       }),
       timeout: 290000, // just under Vercel's 300s limit
     });
@@ -147,7 +144,10 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
     });
 
     const logDetail = `${data.updatedVariants||1} variants · $${(data.price||0).toFixed(2)} · ${inStockStr}`;
-    await db.addLog('sync', `Revised: ${(product.title||'').slice(0,50)}`, logDetail, { productId: product.id });
+    // Only log OOS transitions and errors — logging every successful revise fills the DB
+    if (result.wentOos) {
+      await db.addLog('sync', `OOS: ${(product.title||'').slice(0,50)}`, logDetail, { productId: product.id });
+    }
 
     if (webhookUrl) {
       const wType = result.wentOos ? 'oos' : result.priceChanges.length ? 'price' : result.stockChanges.length ? 'stock' : 'revise';
@@ -172,6 +172,8 @@ async function runForever() {
 
   // Restore cursor from DB (survives restarts)
   let cursor = parseInt(await db.getSetting('revise_cursor') || '0') || 0;
+  let _cachedListed = null;   // cached product list — only reloaded on wrap
+  let _cacheLoadedAt = 0;
 
   while (true) {
     try {
@@ -179,21 +181,28 @@ async function runForever() {
       const token = await getValidToken();
       if (!token) {
         console.log('[Worker] No valid eBay token — waiting 60s');
-        await db.addLog('error', 'Sync paused', 'No valid eBay token — reconnect in Settings', {});
         await sleep(60000);
         continue;
       }
 
-      // Get ALL listed products (stable order by id)
-      const allProducts = await db.getProductsForSync(9999);
-      const listed = allProducts.filter(p =>
-        p.status === 'listed' && p.ebaySku && p.sourceUrl &&
-        !/aliexpress\.com/i.test(p.sourceUrl) &&
-        p.markedOos !== true
-      );
+      // Reload product list only when cursor wraps or cache is stale (>10min)
+      // Loading 3000 products every 30s was the main memory leak
+      const _cacheStale = Date.now() - _cacheLoadedAt > 600000; // 10min
+      if (!_cachedListed || cursor === 0 || _cacheStale) {
+        const allProducts = await db.getProductsForSync(9999);
+        _cachedListed = allProducts.filter(p =>
+          p.status === 'listed' && p.ebaySku && p.sourceUrl &&
+          !/aliexpress\.com/i.test(p.sourceUrl) &&
+          p.markedOos !== true
+        );
+        _cacheLoadedAt = Date.now();
+        if (cursor === 0) console.log(`[Worker] Product list loaded: ${_cachedListed.length} listed`);
+      }
+      const listed = _cachedListed;
 
       if (!listed.length) {
         console.log('[Worker] No listed products — waiting 30s');
+        _cachedListed = null; // force reload next time
         await sleep(30000);
         continue;
       }
@@ -201,11 +210,14 @@ async function runForever() {
       // Wrap cursor
       if (cursor >= listed.length) {
         cursor = 0;
+        _cachedListed = null; // force fresh reload on next wrap
         console.log(`[Worker] ── Rotation complete — restarting from 0 (${listed.length} listings) ──`);
         await db.setSetting('last_sync_run', new Date().toISOString());
+        continue;
       }
 
       const product = listed[cursor];
+      const _reviseStart = Date.now();
       const markupRaw    = await db.getSetting('markup');
       const globalMarkup = markupRaw != null ? parseFloat(markupRaw) : 0;
       const handlingCost = parseFloat(await db.getSetting('handlingCost') || 2);
@@ -224,8 +236,18 @@ async function runForever() {
       await sleep(10000); // brief pause on unexpected errors
     }
 
-    // Small gap between revises — lets Vercel breathe, avoids eBay rate limits
-    await sleep(3000);
+    // Adaptive spacing between revises to avoid Amazon rate limiting.
+    // Each revise hits Amazon from a fresh Vercel IP, but back-to-back calls
+    // on the same product range can still trigger blocks.
+    // Target: ~30s between revises (most listings take 20-60s to complete,
+    // so the natural revise time already provides most of the gap).
+    const _reviseDuration = Date.now() - _reviseStart;
+    const _minGap = 30000; // 30s minimum between revise starts
+    const _remaining = _minGap - _reviseDuration;
+    if (_remaining > 0) {
+      console.log(`[Worker] Spacing: waiting ${(_remaining/1000).toFixed(0)}s (revise took ${(_reviseDuration/1000).toFixed(0)}s)`);
+      await sleep(_remaining);
+    }
   }
 }
 
