@@ -202,11 +202,18 @@ async function runForever() {
       const listed = _cachedListed;
 
       if (!listed.length) {
-        console.log('[Worker] No listed products — waiting 30s');
-        _cachedListed = null; // force reload next time
-        await sleep(30000);
+        // Back off: 30s → 60s → 120s → ... → 600s max
+        // Avoids hammering Railway DB when catalog is empty
+        if (typeof _emptyCount === 'undefined') _emptyCount = 0;
+        _emptyCount++;
+        const _backoff = Math.min(30000 * Math.pow(2, _emptyCount - 1), 600000);
+        console.log(`[Worker] No listed products — waiting ${Math.round(_backoff/1000)}s (check #${_emptyCount})`);
+        _cachedListed = null;
+        await sleep(_backoff);
         continue;
       }
+      // Reset empty counter when products found
+      if (typeof _emptyCount !== 'undefined') _emptyCount = 0;
 
       // Wrap cursor
       if (cursor >= listed.length) {
