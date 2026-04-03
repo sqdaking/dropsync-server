@@ -111,6 +111,7 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
     let data = await _call(3, {
       offerMap: s1.offerMap, listingId: s1.listingId,
       skuToAsin: s2.skuToAsin, asinPrice: s2.asinPrice, asinInStock: s2.asinInStock,
+      asinImages: s2.asinImages || {},
     });
 
     if (data?.skippable) {
