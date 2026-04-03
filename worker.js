@@ -91,22 +91,15 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       headers: { 'Content-Type': 'application/json' },
       // No X-Last-Revised — no cooldown, revise every time it comes up in rotation
       body: JSON.stringify({
-        action:         'revise',
-        access_token:   token,
-        ebaySku:        sku,
-        sourceUrl:      product.sourceUrl,
-        ebayListingId:  product.ebayListingId || '',
+        action:       'revise',
+        access_token: token,
+        ebaySku:      sku,
+        sourceUrl:    product.sourceUrl,
         markup,
         handlingCost,
-        quantity:       product.quantity || 1,
-        fallbackImages:           (product.images || []).slice(0, 2),
-        fallbackTitle:            product.title  || '',
-        fallbackPrice:            product.cost || product.amazonPrice || 0,
-        fallbackInStock:          product.hasVariations ? true : (product.inStock !== false && (product.quantity || 1) > 0),
-        fallbackPrimaryDimName:   product._primaryDimName   || null,
-        fallbackSecondaryDimName: product._secondaryDimName || null,
-        // comboAsin passed so revise can pre-read eBay ASINs for locked fetch
-        comboAsin: product.comboAsin && Object.keys(product.comboAsin).length <= 200
+        quantity:     product.quantity || 1,
+        // comboAsin locks which ASINs to fetch from Amazon (no random re-trimming)
+        comboAsin: product.comboAsin && Object.keys(product.comboAsin).length <= 500
           ? product.comboAsin : null,
       }),
       timeout: 290000, // just under Vercel's 300s limit
