@@ -99,14 +99,15 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         markup,
         handlingCost,
         quantity:       product.quantity || 1,
-        // Stripped large objects (comboAsin/comboPrices/variations/variationImages)
-        // Each was 10-100KB × 3000 products = OOM. Vercel re-scrapes Amazon fresh anyway.
         fallbackImages:           (product.images || []).slice(0, 2),
         fallbackTitle:            product.title  || '',
         fallbackPrice:            product.cost || product.amazonPrice || 0,
         fallbackInStock:          product.hasVariations ? true : (product.inStock !== false && (product.quantity || 1) > 0),
         fallbackPrimaryDimName:   product._primaryDimName   || null,
         fallbackSecondaryDimName: product._secondaryDimName || null,
+        // comboAsin passed so revise can pre-read eBay ASINs for locked fetch
+        comboAsin: product.comboAsin && Object.keys(product.comboAsin).length <= 200
+          ? product.comboAsin : null,
       }),
       timeout: 290000, // just under Vercel's 300s limit
     });
