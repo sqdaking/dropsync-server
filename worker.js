@@ -99,8 +99,9 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         handlingCost,
         quantity:     product.quantity || 1,
         // comboAsin locks which ASINs to fetch from Amazon (no random re-trimming)
-        comboAsin: product.comboAsin && Object.keys(product.comboAsin).length <= 500
-          ? product.comboAsin : null,
+        ebayListingId: product.ebayListingId || '',
+        comboAsin:  product.comboAsin  && Object.keys(product.comboAsin).length  <= 500 ? product.comboAsin  : null,
+        skuToAsin:  product.skuToAsin  && Object.keys(product.skuToAsin).length  <= 500 ? product.skuToAsin  : null,
       }),
       timeout: 290000, // just under Vercel's 300s limit
     });
