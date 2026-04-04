@@ -186,6 +186,14 @@ async function runForever() {
         continue;
       }
 
+      // ── Pause check — user can pause from Settings ──────────────────────────
+      const _paused = (await db.getSetting('worker_paused')) === 'true';
+      if (_paused) {
+        console.log('[Worker] Paused — waiting 15s before checking again');
+        await sleep(15000);
+        continue;
+      }
+
       // Reload product list only when cursor wraps or cache is stale (>10min)
       // Loading 3000 products every 30s was the main memory leak
       const _cacheStale = Date.now() - _cacheLoadedAt > 600000; // 10min
