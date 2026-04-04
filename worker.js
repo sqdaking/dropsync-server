@@ -87,12 +87,15 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
     console.log(`[Worker] → "${(product.title||'').slice(0,50)}"`);
 
     // 3-step revise — each step < 300s
+    const _scraperKey = await db.getSetting('scraperApiKey').catch(() => '');
     const _rb = {
       action: 'revise', access_token: token, ebaySku: sku,
+      scraperApiKey: _scraperKey || '',
       sourceUrl: product.sourceUrl, markup, handlingCost,
       quantity: product.quantity || 1,
       ebayListingId: product.ebayListingId || '',
       fallbackTitle: product.title || '',
+      parentAsin: product.parentAsin || null,
       comboAsin: product.comboAsin && Object.keys(product.comboAsin).length <= 500 ? product.comboAsin : null,
       skuToAsin: product.skuToAsin && Object.keys(product.skuToAsin).length <= 500 ? product.skuToAsin : null,
     };
