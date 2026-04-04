@@ -119,8 +119,8 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       result.status = 'skipped_blocked'; return result;
     }
 
-    if (!r.ok || !data?.success) {
-      const errText = data?.error || `HTTP ${r.status}`;
+    if (!data?.success) {
+      const errText = data?.error || 'Revise step3 failed';
       console.warn(`[Worker]   FAILED: ${errText}`);
       result.status = 'revise_failed'; result.error = errText;
       await db.addLog('error', `Revise failed: ${(product.title||'').slice(0,50)}`, errText, { productId: product.id });
