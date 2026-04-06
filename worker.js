@@ -69,7 +69,7 @@ async function sendWebhook(webhookUrl, type, product, details = []) {
   } catch(e) { console.warn('[Worker] Webhook failed:', e.message); }
 }
 
-// ── Revise one product ────────────────────────────────────────────────────────
+// ── Sync one product via smartSync (Amazon → eBay) ───────────────────────────
 async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
   const result = { productId: product.id, title: product.title, status: 'ok', priceChanges: [], stockChanges: [], wentOos: false };
 
@@ -86,76 +86,56 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
 
     console.log(`[Worker] → "${(product.title||'').slice(0,50)}"`);
 
-    // 3-step revise — each step < 300s
-    const _scraperKey = await db.getSetting('scraperApiKey').catch(() => '');
-    const _rb = {
-      action: 'revise', access_token: token, ebaySku: sku,
-      scraperApiKey: _scraperKey || '',
-      sourceUrl: product.sourceUrl, markup, handlingCost,
-      quantity: product.quantity || 1,
-      ebayListingId: product.ebayListingId || '',
-      fallbackTitle: product.title || '',
-      parentAsin: product.parentAsin || null,
-      comboAsin: product.comboAsin && Object.keys(product.comboAsin).length <= 500 ? product.comboAsin : null,
-      skuToAsin: product.skuToAsin && Object.keys(product.skuToAsin).length <= 500 ? product.skuToAsin : null,
-    };
-    const _call = async (step, extra = {}) => {
-      const resp = await fetch(`${VERCEL_URL}/api/ebay`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ..._rb, ...extra, reviseStep: step }),
-      });
-      return resp.json().catch(() => ({}));
-    };
-
-    const s1 = await _call(1);
-    if (!s1.success) { if (s1.skippable) { result.status = 'skipped_blocked'; return result; } throw new Error(s1.error || 'step1 failed'); }
-    const s2 = await _call(2, { offerMap: s1.offerMap, listingId: s1.listingId });
-    if (!s2.success) { if (s2.skippable) { result.status = 'skipped_blocked'; return result; } throw new Error(s2.error || 'step2 failed'); }
-    let data = await _call(3, {
-      offerMap: s1.offerMap, listingId: s1.listingId,
-      skuToAsin: s2.skuToAsin, asinPrice: s2.asinPrice, asinInStock: s2.asinInStock,
-      asinImages: s2.asinImages || {},
+    // smartSync: scrape Amazon ASIN prices one by one → overwrite eBay
+    const resp = await fetch(`${VERCEL_URL}/api/ebay`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action:        'smartSync',
+        access_token:  token,
+        ebaySku:       sku,
+        ebayListingId: product.ebayListingId || '',
+        sourceUrl:     product.sourceUrl,
+        markup,
+        handlingCost,
+        quantity:      product.quantity || 1,
+        skuToAsin:     product.skuToAsin && Object.keys(product.skuToAsin).length <= 500 ? product.skuToAsin : null,
+        cachedOfferIds: product._offerIdCache && Object.keys(product._offerIdCache).length <= 500 ? product._offerIdCache : null,
+      }),
     });
+    const data = await resp.json().catch(() => ({}));
 
-    if (data?.skippable) {
-      console.log(`[Worker]   skipped (blocked/no-cache)`);
-      result.status = 'skipped_blocked'; return result;
-    }
-
-    if (!data?.success) {
-      const errText = data?.error || 'Revise step3 failed';
+    if (!data.success) {
+      if (data.skippable) { result.status = 'skipped_blocked'; return result; }
+      const errText = data.error || 'smartSync failed';
       console.warn(`[Worker]   FAILED: ${errText}`);
       result.status = 'revise_failed'; result.error = errText;
-      await db.addLog('error', `Revise failed: ${(product.title||'').slice(0,50)}`, errText, { productId: product.id });
+      await db.addLog('error', `Sync failed: ${(product.title||'').slice(0,50)}`, errText, { productId: product.id });
       if (webhookUrl) await sendWebhook(webhookUrl, 'error', product, [errText]);
       return result;
     }
 
-    result.priceChanges = data.priceChanges || [];
-    result.stockChanges = data.stockChanges || [];
-    result.wentOos      = data.inStock === false;
+    const synced  = data.synced  || 0;
+    const prices  = data.prices  || {};
+    const inStock = Object.values(data.inStock || {}).some(Boolean);
+    result.wentOos = !inStock;
 
-    const inStockStr = data.inStock ? 'In Stock' : 'OOS';
-    console.log(`[Worker]   ✓ ${data.updatedVariants||1} variants · $${(data.price||0).toFixed(2)} · ${inStockStr} · priceChanges=${result.priceChanges.length}`);
+    const priceList = Object.values(prices).filter(Boolean);
+    const avgPrice  = priceList.length ? priceList.reduce((a, b) => a + b, 0) / priceList.length : 0;
+    console.log(`[Worker]   ✓ ${synced} offers updated · avg Amazon $${avgPrice.toFixed(2)} · ${inStock ? 'In Stock' : 'OOS'}`);
 
     await db.updateProductSync(product.id, {
-      myPrice:       data.price || product.myPrice,
       lastSynced:    new Date().toISOString(),
       status:        'listed',
-      quantity:      data.inStock ? (product.quantity || 1) : 0,
       ebayListingId: product.ebayListingId || null,
     });
 
-    const logDetail = `${data.updatedVariants||1} variants · $${(data.price||0).toFixed(2)} · ${inStockStr}`;
-    // Only log OOS transitions and errors — logging every successful revise fills the DB
     if (result.wentOos) {
-      await db.addLog('sync', `OOS: ${(product.title||'').slice(0,50)}`, logDetail, { productId: product.id });
+      await db.addLog('sync', `OOS: ${(product.title||'').slice(0,50)}`, `${synced} offers updated`, { productId: product.id });
     }
 
     if (webhookUrl) {
-      const wType = result.wentOos ? 'oos' : result.priceChanges.length ? 'price' : result.stockChanges.length ? 'stock' : 'revise';
-      const details = [logDetail, ...result.priceChanges.slice(0,5), ...result.stockChanges.slice(0,5)];
-      await sendWebhook(webhookUrl, wType, product, details);
+      const wType = result.wentOos ? 'oos' : 'revise';
+      await sendWebhook(webhookUrl, wType, product, [`${synced} offers synced · avg $${avgPrice.toFixed(2)}`]);
     }
 
   } catch(e) {
@@ -197,6 +177,14 @@ async function runForever() {
         continue;
       }
 
+      // ── Push lock — frontend is pushing a listing, hold off ──────────────────
+      const _pushLock = (await db.getSetting('push_lock')) === 'true';
+      if (_pushLock) {
+        console.log('[Worker] Push in progress — waiting 10s');
+        await sleep(10000);
+        continue;
+      }
+
       // Reload product list only when cursor wraps or cache is stale (>10min)
       // Loading 3000 products every 30s was the main memory leak
       const _cacheStale = Date.now() - _cacheLoadedAt > 600000; // 10min
@@ -235,18 +223,28 @@ async function runForever() {
         continue;
       }
 
-      const product = listed[cursor];
-      _reviseStart = Date.now(); // reset to actual revise start (after cache/cursor setup)
+      _reviseStart = Date.now();
       const markupRaw    = await db.getSetting('markup');
       const globalMarkup = markupRaw != null ? parseFloat(markupRaw) : 0;
       const handlingCost = parseFloat(await db.getSetting('handlingCost') || 2);
       const webhookUrl   = await db.getSetting('webhookUrl') || null;
-      const effectiveMarkup = (product.markup != null && product.markup > 0) ? product.markup : globalMarkup;
 
-      console.log(`[Worker] [${cursor + 1}/${listed.length}] Revising: "${(product.title||'').slice(0,45)}"`);
-      await reviseProduct(product, token, effectiveMarkup, handlingCost, webhookUrl);
+      // ── Concurrency: revise N products in parallel ──────────────────────────
+      const concurrency = Math.min(Math.max(parseInt(await db.getSetting('worker_concurrency') || '1') || 1, 1), 10);
+      const batch = listed.slice(cursor, cursor + concurrency);
 
-      cursor++;
+      if (concurrency > 1) {
+        console.log(`[Worker] [${cursor + 1}-${cursor + batch.length}/${listed.length}] Revising ${batch.length} in parallel (concurrency=${concurrency})`);
+      } else {
+        console.log(`[Worker] [${cursor + 1}/${listed.length}] Revising: "${(batch[0]?.title||'').slice(0,45)}"`);
+      }
+
+      await Promise.all(batch.map(product => {
+        const effectiveMarkup = (product.markup != null && product.markup > 0) ? product.markup : globalMarkup;
+        return reviseProduct(product, token, effectiveMarkup, handlingCost, webhookUrl);
+      }));
+
+      cursor += batch.length;
       await db.setSetting('revise_cursor', String(cursor));
 
     } catch(e) {
@@ -256,12 +254,10 @@ async function runForever() {
     }
 
     // Adaptive spacing between revises to avoid Amazon rate limiting.
-    // Each revise hits Amazon from a fresh Vercel IP, but back-to-back calls
-    // on the same product range can still trigger blocks.
-    // Target: ~30s between revises (most listings take 20-60s to complete,
-    // so the natural revise time already provides most of the gap).
+    // Target: ~60s between revise starts — gives Amazon IP cooldown time.
+    // Also check for push lock: if frontend is pushing, wait it out.
     const _reviseDuration = Date.now() - _reviseStart;
-    const _minGap = 30000; // 30s minimum between revise starts
+    const _minGap = 60000; // 60s minimum between revise starts
     const _remaining = _minGap - _reviseDuration;
     if (_remaining > 0) {
       console.log(`[Worker] Spacing: waiting ${(_remaining/1000).toFixed(0)}s (revise took ${(_reviseDuration/1000).toFixed(0)}s)`);
