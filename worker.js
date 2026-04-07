@@ -187,6 +187,13 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
     const data = await resp.json().catch(() => ({}));
 
     if (!data.success) {
+      // Stale offer ID cache — clear it so next cycle does fresh discovery
+      if (data.offersCacheStale) {
+        await db.upsertProduct({ ...product, offerIdCache: null, offerIdCacheAt: null });
+        console.log(`[Worker]   stale offer cache cleared — will rediscover next cycle`);
+        result.status = 'cache_cleared';
+        return result;
+      }
       if (data.skippable) { result.status = 'skipped_blocked'; return result; }
       const errText = data.error || 'smartSync failed';
       console.warn(`[Worker]   FAILED: ${errText}`);
