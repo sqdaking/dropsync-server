@@ -86,6 +86,29 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
 
     console.log(`[Worker] → "${(product.title||'').slice(0,50)}"`);
 
+    // Rebuild skuToAsin from comboAsin if missing (old listings pushed before skuToAsin was tracked)
+    let skuToAsin = product.skuToAsin && Object.keys(product.skuToAsin).length > 0 ? product.skuToAsin : null;
+    if (!skuToAsin && product.comboAsin && Object.keys(product.comboAsin).length > 0) {
+      const _normSku = sku.replace(/-[A-Z0-9_]+$/, '') === sku ? sku : sku; // group SKU
+      const _pfx = _normSku + '-';
+      const _SKU_MAX = 50;
+      const _slug = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
+      const _mkSku = parts => {
+        const raw = parts.map(_slug).filter(Boolean).join('_');
+        const maxSfx = _SKU_MAX - _pfx.length;
+        if (raw.length <= maxSfx) return _pfx + raw;
+        const hash = raw.split('').reduce((h,c) => ((h<<5)-h+c.charCodeAt(0))|0, 0);
+        return _pfx + raw.slice(0, maxSfx-9) + '_' + (hash>>>0).toString(16).toUpperCase().padStart(8,'0');
+      };
+      skuToAsin = {};
+      for (const [key, asin] of Object.entries(product.comboAsin)) {
+        const [pv, sv] = key.split('|');
+        const parts = [pv, sv].filter(Boolean);
+        if (parts.length) skuToAsin[_mkSku(parts)] = asin;
+      }
+      console.log(`[Worker]   rebuilt skuToAsin: ${Object.keys(skuToAsin).length} entries`);
+    }
+
     // smartSync: scrape Amazon ASIN prices one by one → overwrite eBay
     const resp = await fetch(`${VERCEL_URL}/api/ebay`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -98,8 +121,8 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         markup,
         handlingCost,
         quantity:      product.quantity || 1,
-        skuToAsin:     product.skuToAsin && Object.keys(product.skuToAsin).length <= 500 ? product.skuToAsin : null,
-        cachedOfferIds: product._offerIdCache && Object.keys(product._offerIdCache).length <= 500 ? product._offerIdCache : null,
+        skuToAsin:     skuToAsin && Object.keys(skuToAsin).length <= 500 ? skuToAsin : null,
+        cachedOfferIds: product.offerIdCache && Object.keys(product.offerIdCache).length <= 500 ? product.offerIdCache : null,
       }),
     });
     const data = await resp.json().catch(() => ({}));
