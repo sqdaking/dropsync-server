@@ -174,6 +174,8 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
         quantity:      product.quantity || 1,
         skuToAsin:          skuToAsin && Object.keys(skuToAsin).length <= 500 ? skuToAsin : null,
         cachedOfferIds:     product.offerIdCache && Object.keys(product.offerIdCache).length <= 500 ? product.offerIdCache : null,
+        images:             product.images?.length ? product.images.slice(0, 12) : null,
+        variationImages:    product.variationImages && Object.keys(product.variationImages).length ? product.variationImages : null,
         comboAsin:                  (_scraped?.comboAsin         || product.comboAsin)         || null,
         fallbackComboPrices:        (_scraped?.comboPrices       || product.comboPrices)       || null,
         fallbackComboInStock:       (_scraped?.comboInStock      || product.comboInStock)      || null,
