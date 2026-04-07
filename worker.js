@@ -143,9 +143,10 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
           skuToAsin = _fS2A;
           console.log(`[Worker]   refreshed skuToAsin: ${Object.keys(skuToAsin).length} entries`);
         }
-        // Save fresh data back to DB
+        // Save fresh data back to DB — sync_pending: false must be explicit to avoid re-queuing
         await db.upsertProduct({
           ...product,
+          sync_pending:      false,
           comboAsin:         _scraped.comboAsin         || product.comboAsin,
           comboPrices:       _scraped.comboPrices       || product.comboPrices,
           comboInStock:      _scraped.comboInStock      || product.comboInStock,
