@@ -208,6 +208,30 @@ async function runForever() {
         continue;
       }
 
+      // ── Priority: process frontend edit+sync requests immediately ─────────────
+      try {
+        const _pq = await db.pool.query(
+          "SELECT id, data FROM products WHERE data->>'sync_pending' = 'true' LIMIT 5"
+        );
+        if (_pq.rows.length > 0) {
+          const _pMarkup   = parseFloat(await db.getSetting('markup') || '0') || 0;
+          const _pHandling = parseFloat(await db.getSetting('handlingCost') || '2') || 2;
+          const _pWebhook  = await db.getSetting('webhookUrl') || null;
+          for (const row of _pq.rows) {
+            const prod = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+            if (!prod.id) prod.id = row.id;
+            console.log(`[Worker] ⚡ Priority sync (edit): "${(prod.title||'').slice(0,45)}"`);
+            await db.upsertProduct({ ...prod, sync_pending: false }); // clear flag first
+            _cachedListed = null; // force fresh rotation cache
+            const effMarkup = (prod.markup != null && prod.markup >= 0) ? prod.markup : _pMarkup;
+            await reviseProduct(prod, token, effMarkup, _pHandling, _pWebhook);
+          }
+          continue; // restart loop — don't advance normal cursor
+        }
+      } catch (_pqErr) {
+        console.warn('[Worker] Priority sync check error:', _pqErr.message);
+      }
+
       // Reload product list only when cursor wraps or cache is stale (>10min)
       // Loading 3000 products every 30s was the main memory leak
       const _cacheStale = Date.now() - _cacheLoadedAt > 600000; // 10min
