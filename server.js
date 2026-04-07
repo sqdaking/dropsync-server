@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const db = require('./db');
-const { startWorker, runSync, getValidToken } = require('./worker');
+const { startWorker, runForever, getValidToken } = require('./worker');
 
 const app = express();
 
@@ -141,6 +141,19 @@ app.put('/api/products/:id', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Queue product for immediate worker sync (called by frontend Edit modal) ──
+app.post('/api/products/:id/sync', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const r = await db.pool.query('SELECT data FROM products WHERE id=$1', [id]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Product not found' });
+    const current = typeof r.rows[0].data === 'string' ? JSON.parse(r.rows[0].data) : r.rows[0].data;
+    const updated = { ...current, ...req.body, id, sync_pending: true };
+    await db.upsertProduct(updated);
+    res.json({ success: true, queued: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.delete('/api/products/:id', async (req, res) => {
   try {
     await db.pool.query('DELETE FROM products WHERE id=$1', [req.params.id]);
@@ -197,7 +210,7 @@ app.get('/api/worker/status', async (req, res) => {
 
 app.post('/api/worker/run', async (req, res) => {
   // Manual trigger
-  runSync().catch(console.error);
+  runForever().catch(console.error);
   res.json({ success: true, message: 'Sync started' });
 });
 
