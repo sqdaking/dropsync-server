@@ -18,10 +18,18 @@ app.options('*', cors(corsOptions)); // handle preflight for all routes
 
 app.use(express.json({ limit: '10mb' }));
 
+// ── Static file serving for frontend ─────────────────────────────────────────
+app.use(express.static(__dirname)); // Serve static files from server directory
+
 const PORT = process.env.PORT || 3000;
 
-// ── Health check ──────────────────────────────────────────────────────────────
+// ── Health check & Frontend ──────────────────────────────────────────────────
 app.get('/', (req, res) => {
+  // Serve the DropSync frontend HTML
+  res.sendFile(__dirname + '/dropsync.html');
+});
+
+app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'DropSync v2', time: new Date().toISOString() });
 });
 
@@ -214,69 +222,7 @@ app.post('/api/worker/run', async (req, res) => {
   res.json({ success: true, message: 'Sync started' });
 });
 
-// ── Forward to existing eBay backend (scrape, push, etc.) ────────────────────
-// These actions still use the Vercel ebay.js since we're not rewriting them
-app.post('/api/ebay', async (req, res) => {
-  try {
-    const fetch = require('node-fetch');
-    const vercelUrl = process.env.VERCEL_BACKEND_URL || 'https://dropsync-one.vercel.app';
-    const r = await fetch(`${vercelUrl}/api/ebay`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req.body),
-    });
-    const text = await r.text();
-    let d;
-    try { d = JSON.parse(text); }
-    catch(parseErr) {
-      console.error('[proxy] Vercel returned non-JSON:', text.slice(0, 300));
-      return res.status(502).json({ success: false, error: 'Backend error: ' + text.slice(0, 200) });
-    }
-
-    // If a product was pushed successfully, save it to DB
-    if (d.success && req.body.action === 'push' && d.ebaySku) {
-      // Save the pushed product
-      const p = req.body;
-      await db.upsertProduct({
-        id: p.id || d.ebaySku,
-        asin: p.asin,
-        ebaySku: d.ebaySku,
-        ebayItemId: d.ebayItemId,
-        title: p.title,
-        sourceUrl: p.sourceUrl,
-        myPrice: p.myPrice,
-        cost: p.cost,
-        status: 'listed',
-        quantity: p.quantity || 1,
-        hasVariations: p.hasVariations || false,
-        variations: p.variations,
-        imageUrl: p.imageUrl,
-        category: p.category,
-        lastSynced: null,
-      });
-      await db.addLog('import', `Listed: ${p.title?.slice(0,50)}`, `eBay SKU: ${d.ebaySku}`, { productId: p.id || d.ebaySku });
-    }
-
-    res.json(d);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/ebay', async (req, res) => {
-  try {
-    const fetch = require('node-fetch');
-    const vercelUrl = process.env.VERCEL_BACKEND_URL || 'https://dropsync-one.vercel.app';
-    const qs = new URLSearchParams(req.query).toString();
-    const r = await fetch(`${vercelUrl}/api/ebay?${qs}`);
-    const text = await r.text();
-    let d;
-    try { d = JSON.parse(text); }
-    catch(parseErr) {
-      console.error('[proxy] Vercel GET returned non-JSON:', text.slice(0, 300));
-      return res.status(502).json({ success: false, error: 'Backend error: ' + text.slice(0, 200) });
-    }
-    res.json(d);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+// Old Vercel proxy removed — now handled by ebay.js directly below
 
 // ── eBay Orders endpoint ──────────────────────────────────────────────────────
 app.get('/api/orders', async (req, res) => {
