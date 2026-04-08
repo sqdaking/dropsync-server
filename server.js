@@ -403,6 +403,10 @@ app.get('/api/amazon', async (req, res) => {
   }
 });
 
+// ── eBay API handler — all actions from Vercel migrated here ─────────────────
+const handleEbay = require('./ebay');
+app.all('/api/ebay', handleEbay);
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function start() {
   try {
