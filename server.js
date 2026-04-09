@@ -222,7 +222,7 @@ app.post('/api/worker/run', async (req, res) => {
   res.json({ success: true, message: 'Sync started' });
 });
 
-// Old Vercel proxy removed — now handled by ebay.js directly below
+// Old external proxy removed — now handled by ebay.js directly below
 
 // ── eBay Orders endpoint ──────────────────────────────────────────────────────
 app.get('/api/orders', async (req, res) => {
@@ -293,9 +293,9 @@ app.post('/api/backfill-listing-ids', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Amazon proxy — browser fetches Amazon HTML through Railway (different IP, no Vercel block) ───
-// This endpoint allows the browser to fetch Amazon pages without CORS issues.
-// Railway's IPs are not blocked like Vercel's IPs, so Amazon scraping succeeds.
+// ── Amazon proxy — lets the browser fetch Amazon HTML through Railway ──────
+// Railway IPs are not blocked by Amazon like datacenter CDN IPs, so Amazon
+// scraping succeeds. Browser calls this to bypass CORS.
 app.get('/api/amazon', async (req, res) => {
   const url = (req.query.url || '').trim();
   if (!url || !url.includes('amazon.')) {
@@ -349,7 +349,7 @@ app.get('/api/amazon', async (req, res) => {
   }
 });
 
-// ── eBay API handler — all actions from Vercel migrated here ─────────────────
+// ── eBay API handler — all actions run in-process on Railway ────────────────
 const handleEbay = require('./ebay');
 app.all('/api/ebay', handleEbay);
 

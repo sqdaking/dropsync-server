@@ -162,7 +162,7 @@ function $(id) { return document.getElementById(id); }
 const KEY     = 'ds_settings'; // Only stores settings+token, never products
 const KEY_V2  = 'ds_v2';       // Legacy key (migrated on load)
 const DEFAULT_STATE = {
-  backendUrl: '', serverUrl: '', token: '', refreshToken: '', tokenExpiry: 0,
+  serverUrl: '', token: '', refreshToken: '', tokenExpiry: 0,
   markup: 35, minMarkup: 5, handlingCost: 2, quantity: 1,
   fulfillmentPolicyId: '', paymentPolicyId: '', returnPolicyId: '',
   // AliExpress-specific settings (completely separate from Amazon)
@@ -210,7 +210,7 @@ function markDirty(id) { if (id) _dirtyProducts.add(id); }
 function save() {
   // Save SETTINGS ONLY to localStorage — products live in Railway, never localStorage
   const settings = {
-    backendUrl: S.backendUrl, serverUrl: S.serverUrl,
+    serverUrl: S.serverUrl,
     token: S.token, refreshToken: S.refreshToken, tokenExpiry: S.tokenExpiry,
     markup: S.markup, minMarkup: S.minMarkup, handlingCost: S.handlingCost,
     ae_markup: S.ae_markup, ae_handlingCost: S.ae_handlingCost, ae_quantity: S.ae_quantity,
@@ -285,8 +285,8 @@ async function deleteProductFromRailway(id) {
       localStorage.setItem('_dropsync_deleted_ids', JSON.stringify(_deletedIds));
     }
   } catch(e) {}
-  // Try Railway directly, fallback to Vercel backend proxy
-  const _delUrl = S.serverUrl || S.backendUrl;
+  // Hit the Railway server directly
+  const _delUrl = S.serverUrl;
   if (!_delUrl) return;
   try {
     const r = await fetch(_delUrl + '/api/products/' + id, { method: 'DELETE' });
@@ -394,7 +394,7 @@ async function loadProductsFromRailway() {
     // Writing all of S caused quota exceeded errors with large product catalogs
     try {
       const settingsOnly = {
-        backendUrl: S.backendUrl, serverUrl: S.serverUrl,
+        serverUrl: S.serverUrl,
         token: S.token, refreshToken: S.refreshToken, tokenExpiry: S.tokenExpiry,
         markup: S.markup, minMarkup: S.minMarkup, handlingCost: S.handlingCost,
         ae_markup: S.ae_markup, ae_handlingCost: S.ae_handlingCost, ae_quantity: S.ae_quantity,
@@ -456,11 +456,13 @@ try {
   // Load from new settings-only key
   let saved = JSON.parse(localStorage.getItem(KEY)||'{}');
   // One-time migration from old ds_v2 key (had products mixed in)
-  if (!saved.backendUrl && !saved.token) {
+  if (!saved.serverUrl && !saved.token) {
     const old = JSON.parse(localStorage.getItem(KEY_V2)||'{}');
-    if (old.backendUrl || old.token) {
+    if (old.serverUrl || old.backendUrl || old.token) {
       saved = {};
-      for (const k of ['backendUrl','serverUrl','token','refreshToken','tokenExpiry','markup','minMarkup','handlingCost','quantity','view','autoSync','fulfillmentPolicyId','paymentPolicyId','returnPolicyId','webhookUrl',
+      // Migrate old backendUrl → serverUrl
+      if (old.backendUrl && !old.serverUrl) old.serverUrl = old.backendUrl;
+      for (const k of ['serverUrl','token','refreshToken','tokenExpiry','markup','minMarkup','handlingCost','quantity','view','autoSync','fulfillmentPolicyId','paymentPolicyId','returnPolicyId','webhookUrl',
       'ae_markup','ae_handlingCost','ae_quantity','ae_fulfillmentPolicyId','ae_paymentPolicyId','ae_returnPolicyId','ae_maxDeliveryDays','ae_minRating','ae_minOrders',
       'scraperApiKey']) {
         if (old[k] !== undefined) saved[k] = old[k];
@@ -472,6 +474,16 @@ try {
   delete saved.products;
   delete saved.logs;
   S = { ...S, ...saved };
+  // Migrate legacy backendUrl → serverUrl (single URL model now)
+  if (!S.serverUrl && S.backendUrl) S.serverUrl = S.backendUrl;
+  delete S.backendUrl;
+  // Zero-config: default to current page origin — frontend is served from the same
+  // Railway process that hosts the API, so relative URLs always work.
+  if (!S.serverUrl && typeof window !== 'undefined' && window.location?.origin
+      && !/^(file|about):/i.test(window.location.protocol)) {
+    S.serverUrl = window.location.origin.replace(/\/+$/, '');
+    console.log('[init] serverUrl defaulted to window.location.origin:', S.serverUrl);
+  }
   // FIX: one-time cleanup — if ds_settings is bloated with products, rewrite it clean
   // This resolves "exceeded quota" for existing users who have old data in localStorage
   try {
@@ -524,7 +536,7 @@ async function ensureToken() {
   if (Date.now() > S.tokenExpiry - 60000) {
     if (S.refreshToken) {
       try {
-        const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=refresh`, {
+        const r = await fetch(`${S.serverUrl}/api/ebay?action=refresh`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ refresh_token: S.refreshToken }),
         });
@@ -547,11 +559,11 @@ async function ensureToken() {
 
 // ── API Call Helper ────────────────────────────────────
 async function api(action, body = {}) {
-  if (!S.serverUrl && !S.backendUrl) throw new Error('Railway URL not set. Go to Settings.');
+  if (!S.serverUrl) throw new Error('Railway URL not set. Go to Settings.');
   const token = await ensureToken();
   // Always include scraperApiKey so Railway stores it for Amazon fetching
   const extras = S.scraperApiKey ? { scraperApiKey: S.scraperApiKey } : {};
-  const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=${action}`, {
+  const r = await fetch(`${S.serverUrl}/api/ebay?action=${action}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ ...body, ...extras, access_token: token }),
   });
@@ -702,7 +714,7 @@ function setStatus(msg, type='info') {
 // ── fetchAmazonInBrowser: placeholder — returns null so caller uses server-side ─
 // True browser-fetch (reads Amazon HTML from user's real browser session) requires
 // a Chrome extension content script to bridge cross-origin content.
-// For now, all callers gracefully fall back to server-side Vercel scrape.
+// For now, all callers gracefully fall back to server-side scrape.
 // ── normaliseGroupSku: strip variant suffix from eBay SKU to get group SKU ─
 // DS-1773366148579-TFEKT-WHITE_2_BIG_KID → DS-1773366148579-TFEKT
 function normaliseGroupSku(sku) {
@@ -826,7 +838,7 @@ async function fetchAmazonInBrowser(url) {
     } catch(e) { console.warn(`[browserFetch] proxy ${i+1} failed: ${e.message}`); }
   }
 
-  console.warn('[browserFetch] all methods failed — Vercel will handle');
+  console.warn('[browserFetch] all methods failed — server will handle');
   return null;
 }
 
@@ -859,7 +871,7 @@ function _browserExtractAsinData(html) {
 }
 
 // ── Prefetch per-ASIN price+stock from browser — sends exact data to server ──────
-// Fetches main page + every ASIN page from browser (your IP, not Vercel's).
+// Fetches main page + every ASIN page from browser (your IP, not the server's).
 // Returns { [asin]: { price, inStock } } — server uses this, skips its own Amazon fetches.
 async function prefetchAsinPrices(mainHtml) {
   if (!mainHtml) return {};
@@ -1014,16 +1026,16 @@ async function doScrape() {
   // Update input with normalized URL
   const urlInput = $('imp-url');
   if (urlInput && urlInput.value !== url) urlInput.value = url;
-  if (!S.serverUrl && !S.backendUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
+  if (!S.serverUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
   _scraping = true; IMP = null;
   renderImport();
   setStatus('<div class="spinner" style="width:14px;height:14px;flex-shrink:0"></div> <span>Importing from Amazon… fetching via browser (avoids bot detection)</span>');
   try {
-    // Fetch Amazon page via browser (bypasses Vercel IP blocking)
+    // Fetch Amazon page via browser (bypasses datacenter-IP blocking)
     const pageHtml = await fetchAmazonInBrowser(url);
     if (!pageHtml) setStatus('<div class="spinner" style="width:14px;height:14px;flex-shrink:0"></div> <span>Browser fetch unavailable — server will try its own proxies…</span>');
 
-    // Prefetch per-ASIN prices from browser (your real IP, not Vercel's blocked IP).
+    // Prefetch per-ASIN prices from browser (your real IP, not the server's).
     // Server uses this directly and skips its own Amazon fetches entirely.
     let clientAsinData = {};
     if (pageHtml) {
@@ -1043,7 +1055,7 @@ async function doScrape() {
           wsSettings: { wsShippingFlat: S.wsShippingFlat, wsShippingPerLb: S.wsShippingPerLb, wsFreightEstimate: S.wsFreightEstimate } }
       : { url, pageHtml: (pageHtml && pageHtml !== '__EXTENSION__') ? pageHtml : null,
           clientAsinData, primeOnly: S.primeOnly || false, scraperApiKey: S.scraperApiKey || '' };
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=${_scrapeAction}`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=${_scrapeAction}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(_scrapeBody),
     });
@@ -1349,7 +1361,7 @@ async function doPush() {
   try {
     const prod = buildProd();
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=push`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token: token, product: prod,
@@ -1889,7 +1901,7 @@ async function fetchDealsAsins(dept) {
     }
   }
 
-  const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=dealsScrape`, {
+  const r = await fetch(`${S.serverUrl}/api/ebay?action=dealsScrape`, {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ exclude: [...usedSet], count: 50, dept: _deptParam, customUrls: _customUrls, primeOnly: S.primeOnly || false })
   });
@@ -1927,7 +1939,7 @@ async function bulkFetchDeals(dept) {
   // Always use the currently selected dept from global if not explicitly passed
   dept = dept || window.BULK_SELECTED_DEPT || 'all';
   console.log('[bulk] fetching dept:', dept);
-  if (!S.serverUrl && !S.backendUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
+  if (!S.serverUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
   // Ensure BULK is initialized before checking scraping state
   if (!window.BULK) { bulkLoadState?.(); }
   if (typeof BULK === 'undefined' || BULK.scraping) return;
@@ -1957,7 +1969,7 @@ async function bulkFetchDeals(dept) {
       if (btnEl) btnEl.innerHTML = `<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> ${i+1}/${products.length}: ${asin}…</span>`;
 
       try {
-        const sr = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=scrape`, {
+        const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
           method: 'POST', headers: {'Content-Type':'application/json'},
           body: JSON.stringify({ url: `https://www.amazon.com/dp/${asin}?th=1`, primeOnly: S.primeOnly || false })
         });
@@ -2050,7 +2062,7 @@ async function bulkPushAll() {
 
     try {
       const token = await ensureToken();
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=push`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
           access_token: token, product: p,
@@ -2332,7 +2344,7 @@ async function eiFetch() {
     const token = await ensureToken();
     let page = 1, totalPages = 1;
     do {
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=fetchMyListings`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=fetchMyListings`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ access_token: token, page })
       });
@@ -2931,7 +2943,7 @@ async function bulkReviseSelected() {
   const listed = ids.filter(id => (S.products||[]).find(p => p.id===id && p.status==='listed'));
   if (!listed.length) { toast('No listed products selected', 'warn'); return; }
   if (!S.token) { toast('Connect eBay first', 'error'); return; }
-  if (!S.serverUrl && !S.backendUrl) { toast('Set Railway URL in Settings', 'error'); return; }
+  if (!S.serverUrl) { toast('Set Railway URL in Settings', 'error'); return; }
 
   const btn = $('revise-selected-btn');
   const orig = btn?.innerHTML;
@@ -2951,7 +2963,7 @@ async function bulkReviseSelected() {
       const clientHtml = await fetchAmazonInBrowser(p.sourceUrl);
       const clientAsinData = clientHtml ? await prefetchAsinPrices(clientHtml) : {};
 
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=revise`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=revise`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
           access_token: token,
@@ -3027,7 +3039,7 @@ async function bulkDelete() {
     const p = (S.products||[]).find(x => x.id === pid);
     // End eBay listing first
     if (p?.ebaySku && token) {
-      await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=endListing`, {
+      await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           access_token: token,
@@ -3075,7 +3087,7 @@ Confirm?`);
     try {
       // End the eBay listing first
       if (p.ebaySku) {
-        await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=endListing`, {
+        await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             access_token: token,
@@ -3547,7 +3559,7 @@ async function rescrapeAllDrafts() {
     if (stopped) break;
     if (btn) btn.innerHTML = `⏹ Stop  ${done}/${drafts.length}`;
     try {
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=scrape`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ url: p.sourceUrl }),
       });
@@ -3598,7 +3610,7 @@ async function draftEditScrape(pid) {
   const statusEl = document.getElementById('de-scrape-status');
   if (statusEl) { statusEl.textContent = '⏳ Scraping Amazon…'; statusEl.style.color = 'var(--text3)'; }
   try {
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=scrape`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ url: p.sourceUrl }),
     });
@@ -3763,7 +3775,7 @@ async function pushExisting(pid, _overrides = {}) {
     if (productToPost.sourceUrl) {
       toast('🔍 Fetching product from Amazon…', 'info', 3000);
       try {
-        // Browser fetch first — scraper uses clientHtml so Vercel never touches Amazon
+        // Browser fetch first — scraper uses clientHtml so the server never touches Amazon
         let clientHtml = null;
         const _bFetch = await fetchAmazonInBrowser(productToPost.sourceUrl).catch(() => null);
         if (_bFetch === '__EXTENSION__') {
@@ -3772,7 +3784,7 @@ async function pushExisting(pid, _overrides = {}) {
           clientHtml = _bFetch;
         }
 
-        const sr = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=scrape`, {
+        const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: productToPost.sourceUrl, clientHtml })
         });
@@ -3829,7 +3841,7 @@ async function pushExisting(pid, _overrides = {}) {
       } catch(e) { console.warn('[pushExisting] scrape failed, proceeding with cached data:', e.message); }
     }
 
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=push`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token: token,
@@ -4093,7 +4105,7 @@ async function doRebuildPhotos(pid, dimIndex) {
     toast(`📸 Applying images to ${Object.keys(p.skuToAsin || {}).length} variants…`, 'info', 8000);
 
     // ── Step 2: Send to backend with fresh asinImages ────────────────────────────
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=rebuild-photos`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=rebuild-photos`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:    token,
@@ -4103,7 +4115,7 @@ async function doRebuildPhotos(pid, dimIndex) {
         variationImages: p.variationImages || {},
         variations:      p.variations || [],
         skuToAsin:       p.skuToAsin   || {},
-        asinImages:      freshAsinImages,  // browser-fetched, not Vercel-fetched
+        asinImages:      freshAsinImages,  // browser-fetched, not server-fetched
         comboAsin:       p.comboAsin   || {},
         product: {
           _primaryDimName:   p._primaryDimName,
@@ -4177,9 +4189,9 @@ async function toggleWorkerPause() {
   }
 }
 
-// ── Browser Relay — auto-revise using browser IP instead of Vercel ───────────
+// ── Browser Relay — auto-revise using browser IP instead of the server ──────
 // When enabled: browser loops through listed products, fetches Amazon pages
-// from your residential IP, sends prices to Vercel. Worker on Railway is paused.
+// from your residential IP, sends prices to the server. Worker on Railway is paused.
 let _relayTimer = null;
 let _relayCursor = parseInt(localStorage.getItem('_relayCursor') || '0') || 0;
 let _relayRunning = false;
@@ -4255,18 +4267,18 @@ async function toggleBrowserRelay() {
   // Relay is always on — this just pauses/resumes the tick cycle
   if (_relayTimer) {
     stopBrowserRelay();
-    toast('⏸ Browser Relay paused — Amazon fetches will fall back to Vercel (may get blocked)', 'warn', 5000);
+    toast('⏸ Browser Relay paused — Amazon fetches will fall back to the server (may get blocked)', 'warn', 5000);
   } else {
     S.browserRelay = true; save();
     startBrowserRelay();
-    toast('▶️ Browser Relay resumed — browser fetches Amazon, Vercel only updates eBay', 'success', 4000);
+    toast('▶️ Browser Relay resumed — browser fetches Amazon, server only updates eBay', 'success', 4000);
   }
   renderSettings();
 }
 
 // Auto-start relay on page load if it was enabled
 function _maybeStartRelay() {
-  if (S.browserRelay && S.token && (S.serverUrl||S.backendUrl)) {
+  if (S.browserRelay && S.token && S.serverUrl) {
     console.log('[relay] Auto-starting browser relay (was enabled)');
     startBrowserRelay();
   }
@@ -4275,7 +4287,7 @@ function _maybeStartRelay() {
 
 async function promoteListingAtRate(token, listingId) {
   if (!token || !listingId) return;
-  const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=promote`, {
+  const r = await fetch(`${S.serverUrl}/api/ebay?action=promote`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ access_token: token, listingId }),
   });
@@ -4318,7 +4330,7 @@ async function pushAll() {
       let productToPost = { ...p };
       if (!productToPost.images?.length && productToPost.sourceUrl) {
         try {
-          const sr = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=scrape`, {
+          const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: productToPost.sourceUrl })
           });
@@ -4350,7 +4362,7 @@ async function pushAll() {
         return;
       }
 
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=push`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           access_token: token,
@@ -4421,7 +4433,7 @@ async function syncOne(pid) {
   toast('Revising listing from Amazon…', 'info');
 
   try {
-    // Always browser first — residential IP, never blocked. Vercel is fallback.
+    // Always browser first — residential IP, never blocked. Server is fallback.
     const _allAsins = p.comboAsin ? [...new Set(Object.values(p.comboAsin))] : [];
     const _cached = _getCachedAsinPrices(_allAsins);
     const _cacheHits = Object.keys(_cached).length;
@@ -4436,7 +4448,7 @@ async function syncOne(pid) {
         Object.assign(clientAsinData, fresh);
         console.log(`[syncOne] browser: ${Object.keys(fresh).length} prices fetched (${_cacheHits} from cache)`);
       } else {
-        console.log(`[syncOne] browser blocked/failed — Vercel will handle Amazon (${_cacheHits} from cache)`);
+        console.log(`[syncOne] browser blocked/failed — server will handle Amazon (${_cacheHits} from cache)`);
       }
     } else {
       console.log(`[syncOne] all ${_cacheHits} ASINs from cache — no Amazon fetch needed`);
@@ -4444,7 +4456,7 @@ async function syncOne(pid) {
     if (btn) btn.textContent = '⏳ Revising…';
     const token = await ensureToken();
 
-    // 3-step split to avoid Vercel 300s timeout
+    // 3-step split to stay under a 300s request budget
     // Load cached offerIds — avoids 30 individual GET /offer calls in step1
     const _cachedOfferIds = p.offerIdCache || {};
     const _hasCachedOffers = Object.keys(_cachedOfferIds).length > 0;
@@ -4464,7 +4476,7 @@ async function syncOne(pid) {
       cachedOfferIds:  _cachedOfferIds,
     };
     const _call = async (step, extra = {}) => {
-      const resp = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=revise`, {
+      const resp = await fetch(`${S.serverUrl}/api/ebay?action=revise`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ..._rb, ...extra, reviseStep: step }),
       });
@@ -4484,12 +4496,12 @@ async function syncOne(pid) {
     }
 
     if (btn) btn.textContent = '⏳ Fetching Amazon…';
-    // If browser sent prices, merge step2+3 — saves one Vercel round trip
+    // If browser sent prices, merge step2+3 — saves one round trip
     const _hasBrowserPrices = Object.keys(clientAsinData).length > 0;
     const s2 = await _call(2, {
       offerMap:    s1.offerMap,
       listingId:   s1.listingId,
-      mergeStep3:  _hasBrowserPrices, // merged = 2 Vercel calls instead of 3
+      mergeStep3:  _hasBrowserPrices, // merged = 2 round trips instead of 3
     });
     if (!s2.success) throw new Error(s2.error || 'Step 2 failed');
 
@@ -4514,7 +4526,7 @@ async function syncOne(pid) {
         toast('⚠️ Amazon blocked — using eBay fallback or retrying next cycle', 'warn', 4000);
         return;
       }
-      // 400 = scrape returned empty (Amazon blocked Vercel too) — show clear msg, don't crash
+      // 400 = scrape returned empty (Amazon blocked the server too) — show clear msg, don't crash
       if (/no price|insufficient data|scrape succeeded but/i.test(d.error||'')) {
         p.lastReviseError = d.error; markDirty(p.id); save();
         toast('⚠️ Amazon blocked all fetches — listing unchanged, will retry automatically', 'warn', 5000);
@@ -4621,7 +4633,7 @@ async function markListingOos(pid) {
   const origText = btn?.textContent;
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Marking OOS…'; }
   try {
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=markOos`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=markOos`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ access_token: S.token, ebaySku: sku, ebayListingId: p.ebayListingId }),
     });
@@ -4667,7 +4679,7 @@ async function fixAndRevise(pid) {
     if (btn) btn.textContent = '⏳ Rebuilding eBay listing…';
 
     // Step 2: revise = end + push fresh under same SKU
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=revise`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=revise`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
           access_token: token,
@@ -4790,7 +4802,7 @@ async function markAllOos() {
   let ok = 0, fail = 0;
   for (const p of listed) {
     try {
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=markOos`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=markOos`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ access_token: S.token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
       });
@@ -4834,7 +4846,7 @@ async function doRepush(pid) {
     if (p.ebayListingId && p.ebaySku) {
       try {
         const token = await ensureToken();
-        await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=endListing`, {
+        await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
         });
@@ -4866,7 +4878,7 @@ async function linkOffers(pid) {
   const token = await ensureToken();
   toast('🔗 Scanning eBay for offer IDs…', 'info', 15000);
   try {
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=linkOffers`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=linkOffers`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId || '', skuToAsin: p.skuToAsin || {} }),
     });
@@ -4911,7 +4923,7 @@ async function fixAllOffers() {
       toast(`🔗 Fix Offers: ${idx}/${total} — ${ok} ok, ${failed} failed`, 'info', 8000);
     }
     try {
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=linkOffers`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=linkOffers`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId || '', skuToAsin: p.skuToAsin || {} }),
       });
@@ -4964,7 +4976,7 @@ async function repushListing(pid) {
     if (oldEbayListingId && oldEbaySku) {
       try {
         const token = await ensureToken();
-        await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=endListing`, {
+        await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ access_token: token, ebaySku: oldEbaySku, ebayListingId: oldEbayListingId }),
         });
@@ -5276,9 +5288,9 @@ async function openRevisePreview(pid) {
     const [ebayResult, tradingResult, scrapeResult] = await Promise.allSettled([
       // Fetch live eBay inventory (qty + pricingSummary per variant)
       (async () => {
-        if (!(S.serverUrl||S.backendUrl) || !S.token) return null;
+        if (!S.serverUrl || !S.token) return null;
         const token = await ensureToken();
-        const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=debugInventory`, {
+        const r = await fetch(`${S.serverUrl}/api/ebay?action=debugInventory`, {
           method: 'POST', headers: {'Content-Type':'application/json'},
           body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId || '', ebayOfferId: p.ebayOfferId || '' })
         });
@@ -5286,16 +5298,16 @@ async function openRevisePreview(pid) {
       })(),
       // Fetch ACTUAL listing prices via Trading API GetItem
       (async () => {
-        if (!p.ebayListingId || !(S.serverUrl||S.backendUrl)) return null;
+        if (!p.ebayListingId || !S.serverUrl) return null;
         const token = await ensureToken();
-        const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=getTradingItem`, {
+        const r = await fetch(`${S.serverUrl}/api/ebay?action=getTradingItem`, {
           method: 'POST', headers: {'Content-Type':'application/json'},
           body: JSON.stringify({ access_token: token, itemId: p.ebayListingId })
         });
         return r.ok ? r.json() : null;
       })(),
       // Scrape Amazon
-      fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=scrape`, {
+      fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ url: p.sourceUrl })
       }).then(r => r.json()).catch(() => null)
@@ -5868,7 +5880,7 @@ async function rpRefetchImages() {
     const token = await ensureToken();
     if (!token) { toast('eBay token expired — reconnect in Settings', 'error'); return; }
 
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=revise`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=revise`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:  token,
@@ -5929,7 +5941,7 @@ async function bulkRescrapeAll() {
     `⚠️ RESCRAPE ALL ${listedProds.length} LISTINGS\n\n` +
     `This will process each listing one by one:\n` +
     `  1. Wipe all eBay inventory\n` +
-    `  2. Re-scrape Amazon fresh (Vercel IP)\n` +
+    `  2. Re-scrape Amazon fresh (server IP)\n` +
     `  3. Rebuild with correct dimensions\n\n` +
     `Estimated time: ${Math.round(listedProds.length * 2.5 / 60)} minutes.\n` +
     `Each listing is briefly OOS (~30s) during rebuild.\n\nContinue?`
@@ -5960,7 +5972,7 @@ async function bulkRescrapeAll() {
       if (!token) { toast('eBay token expired — stopping', 'error'); break; }
 
       // Step 1: Wipe eBay inventory
-      await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=endListing`, {
+      await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           access_token: token,
@@ -5969,8 +5981,8 @@ async function bulkRescrapeAll() {
         }),
       }).catch(() => {});
 
-      // Step 2+3: Push fresh — Vercel scrapes Amazon and rebuilds
-      const rebuildR = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=revise`, {
+      // Step 2+3: Push fresh — server scrapes Amazon and rebuilds
+      const rebuildR = await fetch(`${S.serverUrl}/api/ebay?action=revise`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
           access_token: token,
@@ -6188,7 +6200,7 @@ async function rpPushImagesToEbay() {
 
   try {
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=updateImages`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=updateImages`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:     token,
@@ -6220,7 +6232,7 @@ async function rpPushImagesToEbay() {
 // ── Queue product sync via worker (called from Edit modal Apply Changes) ────────
 async function queueWorkerSync(p) {
   if (!S.serverUrl) {
-    // No Railway URL — fall back to direct Vercel sync
+    // No Railway URL — cannot queue worker sync
     return await smartSyncProduct(p);
   }
   // Mark product as pending in local state
@@ -6308,7 +6320,7 @@ async function smartSyncProduct(p) {
 
   try {
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=smartSync`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=smartSync`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:    token,
@@ -6461,7 +6473,7 @@ async function syncAll() {
     const clientAsinData = clientHtml ? await prefetchAsinPrices(clientHtml) : {};
 
       const token = await ensureToken();
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=revise`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=revise`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
           access_token: token,
@@ -6556,7 +6568,7 @@ async function endListing(pid, deleteAfter = false) {
   if (!S.token) { toast('eBay token expired — go to Settings and reconnect eBay first', 'error', 5000); return; }
   try {
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=endListing`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
     });
@@ -6611,13 +6623,13 @@ async function renderOrders() {
     $('content').innerHTML = `<div class="empty"><div class="eico">🔑</div><h3>Not connected to eBay</h3><p>Go to Settings and click Connect eBay first</p><button class="btn btn-primary" onclick="nav('settings')" style="margin-top:12px">Go to Settings</button></div>`;
     return;
   }
-  if (!S.serverUrl && !S.backendUrl) {
+  if (!S.serverUrl) {
     $('content').innerHTML = `<div class="empty"><div class="eico">🔗</div><h3>Railway URL not set</h3><p>Set your Railway Backend URL in Settings</p><button class="btn btn-primary" onclick="nav('settings')" style="margin-top:12px">Go to Settings</button></div>`;
     return;
   }
   try {
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=getOrders`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=getOrders`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ access_token: token, limit: 50 })
@@ -6638,7 +6650,7 @@ async function renderOrders() {
 if (!window._autoReplenishedOrders) window._autoReplenishedOrders = new Set();
 
 async function autoReplenishNewOrders(orders, token) {
-  if (!(S.serverUrl||S.backendUrl) || !token) return;
+  if (!S.serverUrl || !token) return;
   
   // Build lookup maps
   const productByListing = {};
@@ -6678,7 +6690,7 @@ async function autoReplenishNewOrders(orders, token) {
   console.log(`[autoReplenish] ${toReplenish.length} variants to replenish from ${new Set(toReplenish.map(x=>x.orderId)).size} orders`);
 
   try {
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=autoReplenish`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=autoReplenish`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
         access_token: token,
@@ -7005,12 +7017,6 @@ function renderSettings() {
             </div>
             <p style="font-size:11px;color:var(--text3);margin:4px 0 16px">Install the DropSync Chrome extension, then click Auto-detect. <a href="chrome://extensions" style="color:#818cf8">chrome://extensions</a></p>
 
-            <label>eBay API Backend URL <span style="color:var(--text3);font-weight:400">(Railway URL — replaces Vercel)</span></label>
-            <div style="display:flex;gap:8px">
-              <input class="input" id="burl" placeholder="https://dropsync-server-production.up.railway.app" value="${S.backendUrl||S.serverUrl}" style="flex:1">
-              <button class="btn btn-primary" onclick="saveBackendUrl()">Save</button>
-            </div>
-            <div style="font-size:11px;color:var(--text3);margin-top:4px">From your Vercel deployment dashboard</div>
           </div>
           <div>
             <label>ScraperAPI Key <span style="color:var(--text3);font-weight:400">(optional — solves Amazon blocking)</span></label>
@@ -7135,34 +7141,6 @@ function renderSettings() {
         <div class="card-header"><span class="card-title">🔄 Monitoring &amp; Auto Sync</span></div>
         <div class="card-body" style="display:flex;flex-direction:column;gap:14px">
 
-          <!-- 24/7 Server Monitor -->
-          <div style="padding:14px;background:var(--bg);border-radius:10px;border:1px solid ${S.monitor24h ? 'var(--green)' : 'var(--border)'}">
-            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
-              <div>
-                <div style="font-size:13px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px">
-                  🌐 24/7 Server Monitoring
-                  <span style="font-size:10px;font-weight:700;background:var(--green);color:#000;padding:1px 6px;border-radius:4px">RECOMMENDED</span>
-                </div>
-                <div style="font-size:12px;color:var(--text3);margin-top:3px">Runs every hour on Vercel servers — works even when you're offline</div>
-              </div>
-              <button class="btn ${S.monitor24h ? 'btn-outline' : 'btn-success'} btn-sm" onclick="toggleMonitor24h()" id="monitor-btn" style="min-width:120px">
-                ${S.monitor24h ? '✅ Enabled' : '🚀 Enable Now'}
-              </button>
-            </div>
-            ${S.monitor24h ? `
-            <div style="margin-top:10px;padding:8px 10px;background:rgba(34,197,94,.08);border-radius:6px;font-size:11px;color:var(--green)">
-              ✅ Active · ${(S.products||[]).filter(p=>p.status==='listed'&&p.sourceUrl).length} listings monitored hourly
-              ${S.monitorLastReg ? ` · last synced: ${timeAgo(S.monitorLastReg)}` : ''}
-            </div>
-            <div style="margin-top:6px;display:flex;gap:8px">
-              <button class="btn btn-ghost btn-sm" style="font-size:11px" onclick="checkMonitorStatus()">📊 Check Status</button>
-              <button class="btn btn-ghost btn-sm" style="font-size:11px;color:var(--red)" onclick="disableMonitor24h()">Disable</button>
-            </div>` : `
-            <div style="margin-top:8px;font-size:11px;color:var(--text3)">
-              ⚠️ Without this, monitoring only runs while DropSync is open in your browser
-            </div>`}
-          </div>
-
           <!-- Browser auto-sync fallback -->
           <div>
             <label style="margin:0;cursor:pointer;display:flex;align-items:center;gap:8px">
@@ -7190,7 +7168,7 @@ function renderSettings() {
             </div>` : ''}
             <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
               <span id="relay-status" style="font-size:12px;font-weight:600;color:${_relayTimer ? 'var(--green)' : 'var(--red)'}">
-                ${_relayTimer ? '🟢 Browser Relay ON — your browser fetches Amazon, Vercel only updates eBay' : '🔴 Browser Relay OFF — keep this tab open to avoid blocking'}
+                ${_relayTimer ? '🟢 Browser Relay ON — your browser fetches Amazon, server only updates eBay' : '🔴 Browser Relay OFF — keep this tab open to avoid blocking'}
               </span>
               <button onclick="toggleBrowserRelay()" style="padding:4px 12px;border-radius:6px;font-size:11px;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text3)">
                 ${_relayTimer ? 'Pause' : 'Resume'}
@@ -7200,7 +7178,7 @@ function renderSettings() {
             <div style="margin-top:14px;padding:12px 14px;background:rgba(99,102,241,.08);border:1px solid rgba(99,102,241,.25);border-radius:10px">
               <div style="font-size:13px;font-weight:700;color:var(--text1);margin-bottom:6px">🌐 Browser Relay</div>
               <div style="font-size:11px;color:var(--text3);margin-bottom:10px;line-height:1.5">
-                Uses your browser's residential IP to fetch Amazon prices instead of Vercel's blocked server IP.<br>
+                Uses your browser's residential IP to fetch Amazon prices instead of the blocked datacenter IP.<br>
                 <b>Railway worker will be paused.</b> Keep this tab open while relay is running.
               </div>
               <div style="display:flex;align-items:center;gap:10px">
@@ -7353,14 +7331,14 @@ function renderSettings() {
     </div>`;
 
   if (S.serverUrl) syncWorkerPauseState();
-  // Browser relay is always on — browser IP first, Vercel as fallback
+  // Browser relay is always on — browser IP first, server as fallback
   if (!_relayTimer) {
     S.browserRelay = true; save();
     startBrowserRelay();
-    console.log('[relay] auto-started — browser fetches Amazon, Vercel is fallback only');
+    console.log('[relay] auto-started — browser fetches Amazon, server is fallback only');
   }
   _maybeStartRelay();
-  if (S.token && (S.serverUrl||S.backendUrl)) loadPolicies();
+  if (S.token && S.serverUrl) loadPolicies();
   if (S.serverUrl) {
     fetch(S.serverUrl + '/').then(r=>r.json()).then(d => {
       const el = $('server-status');
@@ -7430,18 +7408,6 @@ function testWebhook() {
   toast('Test notification sent!', 'success');
 }
 
-function saveBackendUrl() {
-  S.backendUrl = ($('burl')?.value || '').trim().replace(/\/+$/, '');
-  // Mirror to serverUrl so Railway URL works for both old+new code
-  if (S.backendUrl && !S.serverUrl) S.serverUrl = S.backendUrl;
-  // Save extension ID
-  const _extIdVal = ($('ext-id')?.value || '').trim();
-  if (_extIdVal) { localStorage.setItem('ds_ext_id', _extIdVal); _extId = _extIdVal; }
-  else { localStorage.removeItem('ds_ext_id'); _extId = null; }
-  save(); toast('Backend URL saved', 'success');
-  updateStatus();
-}
-
 async function saveServerUrl() {
   const url = ($('surl')?.value || '').trim().replace(/\/+$/, '');
   S.serverUrl = url; save();
@@ -7497,9 +7463,9 @@ async function savePricingDefaults() {
 
 
 async function connectEbay() {
-  if (!S.serverUrl && !S.backendUrl) { toast('Set Railway URL first in Settings', 'error'); return; }
+  if (!S.serverUrl) { toast('Set Railway URL first in Settings', 'error'); return; }
   try {
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=auth`);
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=auth`);
     const d = await safeJson(r);
     if (!d.url) throw new Error('No auth URL returned from backend');
     
@@ -7563,7 +7529,7 @@ async function connectEbay() {
 
 async function refreshToken() {
   try {
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=refresh`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=refresh`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: S.refreshToken }),
     });
@@ -7744,13 +7710,13 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
   btn.textContent = '⏳ Fetching Amazon…';
   btn.disabled = true;
   try {
-    // Fetch Amazon page via Railway proxy BEFORE calling Vercel
+    // Fetch Amazon page via Railway proxy BEFORE calling the server
     const clientHtml = await fetchAmazonInBrowser(p.sourceUrl);
     const clientAsinData = clientHtml ? await prefetchAsinPrices(clientHtml) : {};
     btn.textContent = clientHtml ? '⏳ Replenishing…' : '⏳ Replenishing (no proxy)…';
 
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=replenish`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=replenish`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:  token,
@@ -7760,7 +7726,7 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
         quantity:      p.quantity || 1,
         markup:        S.markup,
         handlingCost:  S.handlingCost,
-        clientHtml,   // browser-fetched Amazon HTML (bypasses Vercel IP blocks)
+        clientHtml,   // browser-fetched Amazon HTML (bypasses datacenter-IP blocks)
         clientAsinData, // browser-prefetched per-ASIN price+stock data
       })
     });
@@ -7826,7 +7792,7 @@ async function repushFromOrder(productId, orderIdSafe, btn) {
     // End current eBay listing
     if (p.ebayListingId && p.ebaySku) {
       const token = await ensureToken();
-      await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=endListing`, {
+      await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
       }).catch(e => console.warn('[repushFromOrder] end failed:', e.message));
@@ -7904,7 +7870,7 @@ async function linkAndReplenish(productId, itemListingId, itemSku, orderIdSafe, 
     const clientAsinData = clientHtml ? await prefetchAsinPrices(clientHtml) : {};
     if (btn) btn.textContent = clientHtml ? '⏳ Replenishing…' : '⏳ Replenishing (no proxy)…';
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=replenish`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=replenish`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:  token,
@@ -7958,7 +7924,7 @@ async function recoverSkusFromEbay() {
   toast('🔧 Fetching SKUs from eBay — may take 30s…', 'info', 5000);
   try {
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=recoverSkus`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=recoverSkus`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ access_token: token }),
     });
@@ -7993,10 +7959,10 @@ async function syncWorkerPauseState() {
 }
 
 async function loadPolicies() {
-  if (!S.token || !(S.serverUrl||S.backendUrl)) return;
+  if (!S.token || !S.serverUrl) return;
   try {
     const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=policies`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=policies`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ access_token: token }),
     });
@@ -8010,93 +7976,6 @@ async function loadPolicies() {
     populate('pp-sel', d.payment||[], S.paymentPolicyId, 'id', 'name');
     populate('rp-sel', d.return||[], S.returnPolicyId, 'id', 'name');
   } catch (e) { console.warn('loadPolicies:', e.message); }
-}
-
-// ══════════════════════════════════════════════════════
-// 24/7 SERVER MONITOR
-// ══════════════════════════════════════════════════════
-async function registerMonitor() {
-  if (!S.monitor24h || !S.token || !(S.serverUrl||S.backendUrl) || !S.refreshToken) return;
-  const tracked = (S.products||[]).filter(p => p.status==='listed' && p.sourceUrl && p.ebaySku);
-  if (!tracked.length) return;
-  try {
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/monitor?action=register`, {
-      method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ products: tracked, refresh_token: S.refreshToken, markup: S.markup, quantity: S.quantity })
-    });
-    const d = await safeJson(r);
-    if (d.success) {
-      S.monitorLastReg = new Date().toISOString();
-      save();
-      console.log('[Monitor] registered', d.tracked, 'products for 24/7 monitoring');
-    }
-  } catch(e) { console.warn('[Monitor] register failed:', e.message); }
-}
-
-async function toggleMonitor24h() {
-  if (!S.serverUrl && !S.backendUrl) { toast('Set Railway URL in Settings first', 'error'); return; }
-  if (!S.token) { toast('Connect eBay first', 'error'); return; }
-  if (!S.refreshToken) { toast('Please reconnect eBay to enable 24/7 monitoring (need refresh token)', 'warn', 5000); return; }
-  S.monitor24h = true;
-  save();
-  const btn = $('monitor-btn');
-  if (btn) btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:10px;height:10px"></div> Registering…</span>';
-  await registerMonitor();
-  toast('✅ 24/7 monitoring enabled — your listings are tracked every hour even when offline!', 'success', 6000);
-  renderSettings();
-}
-
-function disableMonitor24h() {
-  S.monitor24h = false; S.monitorLastReg = null;
-  save(); renderSettings();
-  toast('24/7 monitoring disabled', 'info');
-}
-
-async function checkMonitorStatus() {
-  if (!S.serverUrl && !S.backendUrl) return;
-  try {
-    const r = await fetch(`${S.backendUrl}/api/monitor?action=status`);
-    const d = await safeJson(r);
-    if (!d.registered) { toast('No products registered yet — click Enable Now', 'warn'); return; }
-    const lastRun = d.lastRun ? timeAgo(d.lastRun) : 'never';
-    const sum = d.lastSummary;
-    const msg = sum
-      ? `Last run ${lastRun}: ${sum.ran} checked · ${sum.priceUpdates} price updates · ${sum.stockUpdates} stock updates`
-      : `${d.tracked} products registered · last run: ${lastRun}`;
-    toast('📊 ' + msg, 'info', 7000);
-    // Inject last run results into logs + clear OOS locks for back-in-stock products
-    if (d.lastResults?.length) {
-      let oosCleared = 0;
-      for (const r of d.lastResults) {
-        if (r.priceChanges?.length) addLog('price', `[Server] Price updated: ${r.title}`, r.priceChanges.join(' · '), { changes: r.priceChanges });
-        if (r.stockChanges?.length) addLog('stock', `[Server] Stock updated: ${r.title}`, r.stockChanges.join(' · '), { changes: r.stockChanges });
-        if (r.wentOos) addLog('stock', `[Server] ⚠️ OOS: ${r.title}`, 'qty → 0 on eBay', {});
-
-        // FIX: if worker successfully revised and product is now in stock → clear _markedOos
-        // Match by title (Railway doesn't send product ID, only title + SKU)
-        const hasBackInStock = r.stockChanges?.some(s => s.includes('back in stock'));
-        const isNowInStock   = r.inStock === true || r.inStock > 0 || hasBackInStock;
-        if (isNowInStock || (r.status === 'ok' && !r.wentOos)) {
-          // Find matching product by ebaySku or title
-          const match = (S.products||[]).find(p =>
-            (r.sku && p.ebaySku === r.sku) ||
-            (r.title && p.title?.slice(0,40) === r.title?.slice(0,40))
-          );
-          if (match && match._markedOos) {
-            match._markedOos = false;
-            oosCleared++;
-          }
-        }
-      }
-      if (oosCleared > 0) {
-        _saveOosLocks();
-        console.log(`[Monitor] cleared _markedOos on ${oosCleared} products`);
-        if (S.view === 'listed' || S.view === 'products') renderProducts();
-      }
-      save();
-      if (S.view === 'logs') renderLogs();
-    }
-  } catch(e) { toast('Could not reach monitor: ' + e.message, 'error'); }
 }
 
 // ══════════════════════════════════════════════════════
@@ -8118,7 +7997,7 @@ function setupAutoSync() {
       for (const p of listed.slice(0, 20)) {
         try {
           const token = await ensureToken();
-          const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=sync`, {
+          const r = await fetch(`${S.serverUrl}/api/ebay?action=sync`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               access_token: token,
@@ -8218,7 +8097,6 @@ const initHash = location.hash;
 // URL hash is source of truth — fall back to 'import' (not last saved view)
 const initView = HASH_MAP[initHash] || 'import';
 nav(initView);
-  // setTimeout(registerMonitor, 2000); // DISABLED
 })();
 
 // ═══════════════════════════════════════════════════════════════════
@@ -8502,12 +8380,12 @@ function aeExtractFromDom(html, aeId) {
 }
 
 async function fetchAliExpressInBrowser(aeId) {
-  // Use server-side fetch via Vercel — browser popup is always cross-origin blocked
+  // Use server-side fetch — browser popup is always cross-origin blocked
   // (aliexpress.us ≠ DropSync origin → win.document throws SecurityError every time)
   // Server fetches aliexpress.com with global-site cookie to get window.runParams data
   try {
-    if (S.serverUrl||S.backendUrl) {
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=aeScrapeProduct`, {
+    if (S.serverUrl) {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=aeScrapeProduct`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ aeId }),
@@ -8577,7 +8455,7 @@ function aeCalcPrice(cost, shippingCost) {
 
 async function aeFetchDeals(dept) {
   dept = dept || window.AE_SELECTED_DEPT || 'all';
-  if (!S.serverUrl && !S.backendUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
+  if (!S.serverUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
   if (AE.scraping) return;
   AE.scraping = true;
   renderAeImport();
@@ -8586,7 +8464,7 @@ async function aeFetchDeals(dept) {
     aeLog(`Scanning AliExpress ${dept === 'all' ? 'all departments' : dept}…`);
     const usedSet = new Set([...AE.usedIds, ...(S.products||[]).filter(p=>p._source==='aliexpress').map(p=>p.aeId).filter(Boolean)]);
 
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=aeScrapeDeals`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=aeScrapeDeals`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
         dept: dept === 'all' ? null : dept,
@@ -8704,7 +8582,7 @@ async function aePushAll() {
   for (const p of queue) {
     try {
       const token = await ensureToken();
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=push`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
           access_token: token,
@@ -8908,7 +8786,7 @@ async function wsFetchDeals() {
 
   try {
     // Fetch category page (100 products per page)
-    const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=ws-category`, {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=ws-category`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url: catUrl, page: 1 }),
     });
@@ -8999,7 +8877,7 @@ async function wsPushAll() {
       if (p._needsFullScrape && p.sourceUrl) {
         wsLog(`🔍 Scraping ${p._wsItemNumber}…`);
         try {
-          const sr = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=ws-scrape`, {
+          const sr = await fetch(`${S.serverUrl}/api/ebay?action=ws-scrape`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url: p.sourceUrl, wsSettings }),
           });
@@ -9024,7 +8902,7 @@ async function wsPushAll() {
       }
 
       // Step 2: Push to eBay
-      const r = await fetch(`${S.serverUrl||S.backendUrl}/api/ebay?action=push`, {
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           access_token:        token,

@@ -62,7 +62,7 @@ async function fetchPage(url, ua, maxAttempts) {
   const _chromeVersions = ['131', '132', '133', '134', '135'];
   const _cv = _chromeVersions[Math.floor(Math.random() * _chromeVersions.length)];
 
-  // Vercel serverless IPs are residential-grade and rotate per invocation.
+  // Serverless CDN IPs rotate per invocation (residential-grade).
   // Use varied UA + headers + URL forms + delays to maximize hit rate.
   const urlVariants = asin ? [
     `https://www.amazon.com/dp/${asin}?th=1&psc=1`,
@@ -778,7 +778,7 @@ function extractColorAsinMaps(html) {
 
 // ── eBay Taxonomy API: get leaf category suggestions ─────────────────────────
 
-// In-process caches — valid for the lifetime of the Vercel function instance (~5min)
+// In-process caches — valid for the lifetime of the Node process.
 // Policies and locations rarely change — caching saves 3-4 API calls per push
 const _policyCache = {}; // token.slice(-8) → { fulfillmentPolicyId, paymentPolicyId, returnPolicyId, ts }
 const _locationCache = {}; // 'us'|'cn' → locationKey
@@ -1040,7 +1040,7 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
   if (asin) url = `https://www.amazon.com/dp/${asin}?th=1`;
 
   const ua = randUA();
-  // Use pre-fetched HTML if provided by browser (bypasses Vercel IP blocking)
+  // Use pre-fetched HTML if provided by browser (bypasses datacenter-IP blocking)
   let html = preloadedHtml || null;
   if (!html) {
     html = await fetchPage(url, ua);
@@ -1091,10 +1091,8 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
   if (parentAsinM2?.[1]) product.parentAsin = parentAsinM2[1];
   // Stock — buy-box only to avoid false OOS from ads/recommendations
   const _bbMain1 = (html.match(/id="availability"[\s\S]{0,3000}/)?.[0]||'')
-                 + (html.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0]||'')
-                 + ''  // removed: outOfStockBuyBox appears for sibling OOS variants, not current;
-  if (false) { // outOfStockBuyBox removed: appears for sibling OOS variants on shoe/apparel listings
-  } else if (html.toLowerCase().includes('see all available options') && !html.includes('id="add-to-cart-button"')) {
+                 + (html.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0]||'');
+  if (html.toLowerCase().includes('see all available options') && !html.includes('id="add-to-cart-button"')) {
     product.inStock = false;  // "See all available options" = no direct buy = OOS
   } else if (_bbMain1.length > 30) {
     product.inStock = !isAmazonOOS(_bbMain1);
@@ -1652,7 +1650,7 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
     //   2. Fetch per-ASIN pages for price + stock (fills gaps from step 0)
     //   3. For stock: ONLY mark OOS if buy-box EXPLICITLY says "currently unavailable"
     //      If blocked/ambiguous → fall back to baseInStock (main page result)
-    //   4. This avoids false OOS from Vercel's server location + ads on page
+    //   4. This avoids false OOS from the server's location + ads on page
 
     // ── Step 0: Extract swatch prices from embedded page HTML ─────────────────
     // Amazon renders per-ASIN prices in the swatch HTML as:
@@ -1677,8 +1675,7 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
 
     // baseInStock: what the main page currently shows for the selected variant
     const bbMain = (html.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '')
-                 + (html.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '')
-                 + ''  // removed: outOfStockBuyBox appears for sibling OOS variants, not current;
+                 + (html.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '');
     const mainInStock = bbMain.length > 30
       ? !isAmazonOOS(bbMain)
       : !html.includes('id="outOfStock"') && !html.includes('Currently unavailable');
@@ -1690,7 +1687,7 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
 
     // ── Price + stock per ASIN ────────────────────────────────────────────────
     // Priority: browser clientAsinData (real IP) > swatch prices (from HTML) > server fetch (last resort)
-    // Goal: Vercel never fetches Amazon if browser already did it.
+    // Goal: server never fetches Amazon if browser already did it.
     const asinInStock   = {};
     const asinPrice     = {};
     const asinShipping  = {}; // per-ASIN shipping cost (0 = free, null = unknown)
@@ -1826,8 +1823,7 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
         // Cache main image while page is in memory — avoids second fetch for non-color dims
         if (!asinImgCache[asin]) { const _imgs = extractAllImages(h); if (_imgs.length) asinImgCache[asin] = _imgs; }
         const bb = (h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '')
-                 + (h.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '')
-                 + ''  // removed: outOfStockBuyBox appears for sibling OOS variants, not current;
+                 + (h.match(/id="addToCart_feature_div"[\s\S]{0,1000}/)?.[0] || '');
         // Price is truth — BUT main-page OOS signals override price.
         // "Currently unavailable" / "Temporarily out of stock" can show a price but no buy box.
         if (unavailableAsins.has(asin)) {
@@ -3016,7 +3012,7 @@ async function handleRevise(body, res) {
     let _bulkHit = 0;
 
     if (_parentUrl && uniqueAsins.length > 1) {
-      // Random startup jitter — prevents multiple Vercel instances hitting Amazon simultaneously
+      // Random startup jitter — avoids burst patterns to Amazon
       await sleep(Math.random() * 2000);
       console.log(`[revise] step2: trying BULK parent fetch (${uniqueAsins.length} ASINs) — 1 request`);
       const ph = await fetchPage(_parentUrl, _ua, 1);
@@ -3153,7 +3149,7 @@ async function handleRevise(body, res) {
     console.log(`[revise] step2: ${Object.values(asinPrice).length} prices, ${Object.values(asinImages).length} image sets fetched`);
 
     // ── Fast path: if browser sent prices (clientAsinData), skip separate step3 ─
-    // Merge step2 + step3 into one Vercel call — saves a round trip
+    // Merge step2 + step3 into one call — saves a round trip
     const _hasBrowserPrices = (body.clientAsinData ? Object.keys(body.clientAsinData).length : 0) > 0 || Object.keys(asinPrice).length > 0;
     if (_hasBrowserPrices && body.mergeStep3) {
       console.log(`[revise] step2+3 merged — skipping separate step3 call`);
@@ -3808,8 +3804,10 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       const errMsg = pd.errors[0]?.message || '';
       if (existing) {
         // Confirmed real duplicate — already listed, return success so frontend marks it as listed
+        // Note: createdSkus isn't declared in the simple path — simple listings have a single SKU,
+        // so variantsCreated is always 1 when the listing exists.
         console.log(`[push] confirmed duplicate — already listed as ${existing}`);
-        return res.json({ success: true, sku: groupSku, listingId: existing, variantsCreated: createdSkus.size, duplicate: true });
+        return res.json({ success: true, sku: groupSku, listingId: existing, variantsCreated: 1, duplicate: true });
       }
       // 25002 system error — retry
       console.warn('[push] 25002 system error on simple publish — retrying');
@@ -4266,7 +4264,8 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
           { method: 'POST', headers: auth, body: JSON.stringify({ requests: _reOfferReqs.slice(_roi, _roi+25) }) }
         ).catch(() => null);
       }
-      offerIdsBySku = {};
+      // Clear cached offer IDs in place (const, can't reassign)
+      for (const _ok of Object.keys(offerIdsBySku)) delete offerIdsBySku[_ok];
       console.log(`[push] ${errId} recovery: offers re-created, retrying publish`);
       if (attempt < 5) { await sleep(3000); continue; }
       return res.status(400).json({ error: 'eBay group not found (25705) — try re-pushing', errorId: errId });
@@ -4977,7 +4976,7 @@ async function handleRebuildPhotos(body, res) {
     if (asin && !_asinImgMap[asin]) _neededAsins.add(asin);
   }
 
-  // Don't fetch from Amazon on Vercel — always blocked.
+  // Don't server-fetch Amazon here — datacenter IPs are blocked.
   // Browser should send fresh asinImages via doRebuildPhotos() which uses residential IP.
   // Log which ASINs are missing so user knows to re-try with browser relay active.
   if (_neededAsins.size > 0) {
@@ -5270,7 +5269,7 @@ module.exports = async (req, res) => {
       const asin  = asinM?.[1] || asinP?.[1];
       if (asin) url = `https://www.amazon.com/dp/${asin}?th=1`;
 
-      // Use browser-provided HTML if available (bypasses Vercel IP blocking)
+      // Use browser-provided HTML if available (bypasses datacenter-IP blocking)
       const clientHtml     = (body.pageHtml && body.pageHtml.length > 5000) ? body.pageHtml : null;
       const clientAsinData = body.clientAsinData || null;
       const primeOnly      = body.primeOnly === true;
@@ -5779,7 +5778,8 @@ module.exports = async (req, res) => {
         return res.json({ success: false, error: 'Amazon blocked or no HTML', skippable: true });
 
       // Extract unique ASINs from dimensionToAsinMap
-      const dtaM = html.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,50000}\})/);
+      // Window widened to 200k chars to cover listings with 900+ ASIN entries
+      const dtaM = html.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/);
       let dta = {};
       try { dta = JSON.parse(dtaM?.[1] || '{}'); } catch(e) {}
       const allUniqueAsins = [...new Set(Object.values(dta))].filter(Boolean);
@@ -5811,7 +5811,7 @@ module.exports = async (req, res) => {
             const h = await fetchPage(`https://www.amazon.com/dp/${asin}?th=1&psc=1`, randUA(), 2);
             if (!h) { asinInStock[asin] = false; fetchFail++; return; }
             const price = extractPriceFromBuyBox(h) || extractPrice(h) || 0;
-            const oos   = isAmazonOOS(h.match(/id="availability"[\s\S]{0,2000}/)?.[0] || '');
+            const oos   = isAmazonOOS(h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '');
             asinPrice[asin]   = price;
             asinInStock[asin] = !oos && price > 0;
             console.log(`[smartSync] ${asin} → $${price} inStock=${!oos}`);
@@ -6202,16 +6202,13 @@ module.exports = async (req, res) => {
           if (!product._source)      product._source      = 'aliexpress';
         }
       } else {
-        // Amazon: call action=scrape (scraper2)
-        const baseUrl = process.env.VERCEL_URL
-          ? `https://${process.env.VERCEL_URL}`
-          : 'https://dropsync-one.vercel.app';
-        const scrapeR = await fetch(`${baseUrl}/api/ebay?action=scrape`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: sourceUrl }),
-        }).catch(e => { console.warn('[sync] scrape failed:', e.message); return null; });
-        const scrapeD = scrapeR?.ok ? await scrapeR.json().catch(() => null) : null;
-        product = scrapeD?.product || null;
+        // Amazon: call the scraper directly in-process (no HTTP, no self-call)
+        try {
+          product = await scrapeAmazonProduct(sourceUrl, body.clientHtml || null, body.clientAsinData || null);
+        } catch (e) {
+          console.warn('[sync] scrape failed:', e.message);
+          product = null;
+        }
       }
 
       // Fallback to cached frontend data if Amazon blocked
@@ -7223,7 +7220,7 @@ module.exports = async (req, res) => {
       }
 
       // Server-side fetch: try aliexpress.com with global-site cookie to get window.runParams
-      // Use multiple URL patterns — .com may redirect to .us (React SPA) on Vercel US IPs
+      // Use multiple URL patterns — .com may redirect to .us (React SPA) on datacenter US IPs
       const _aeUrls = [
         `https://www.aliexpress.com/item/${aeId}.html`,
         `https://www.aliexpress.com/i/${aeId}.html`,
@@ -7718,6 +7715,32 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 };
+
+// ── In-process invocation helper ─────────────────────────────────────────────
+// Lets worker.js (and internal self-calls) invoke any action without HTTP.
+// Mocks Express req/res so the existing handler body runs unchanged.
+// Returns { ok, status, data } — same shape regardless of how the handler responded.
+module.exports.callAction = async function callEbayAction(body) {
+  const mockReq = { method: 'POST', query: {}, body: body || {}, headers: {} };
+  let _status = 200;
+  let _data = null;
+  const mockRes = {
+    setHeader() { return this; },
+    status(code) { _status = code; return this; },
+    json(obj)    { if (_data === null) _data = obj; return this; },
+    send(obj)    { if (_data === null) _data = obj; return this; },
+    end()        { return this; },
+  };
+  try {
+    await module.exports(mockReq, mockRes);
+  } catch (e) {
+    return { ok: false, status: 500, data: { error: e.message } };
+  }
+  return { ok: _status >= 200 && _status < 300, status: _status, data: _data };
+};
+
+// Also expose scrapeAmazonProduct directly so the sync action can call it in-process
+module.exports.scrapeAmazonProduct = scrapeAmazonProduct;
 
 // ══════════════════════════════════════════════════════════════════════
 // ALIEXPRESS SCRAPER — Completely separate from Amazon scraper

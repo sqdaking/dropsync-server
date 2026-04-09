@@ -1,8 +1,14 @@
 const fetch = require('node-fetch');
 const db    = require('./db');
+const ebayHandler = require('./ebay');
 
-const VERCEL_URL = process.env.VERCEL_BACKEND_URL || 'https://dropsync-one.vercel.app';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Call an eBay action in-process (no HTTP, no self-call).
+// Returns { ok, status, data } matching the old fetch().json() shape.
+async function callEbay(body) {
+  return ebayHandler.callAction(body);
+}
 
 // ── Token management ──────────────────────────────────────────────────────────
 async function getValidToken() {
@@ -89,8 +95,7 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
     // Rebuild skuToAsin from comboAsin if missing (old listings pushed before skuToAsin was tracked)
     let skuToAsin = product.skuToAsin && Object.keys(product.skuToAsin).length > 0 ? product.skuToAsin : null;
     if (!skuToAsin && product.comboAsin && Object.keys(product.comboAsin).length > 0) {
-      const _normSku = sku.replace(/-[A-Z0-9_]+$/, '') === sku ? sku : sku; // group SKU
-      const _pfx = _normSku + '-';
+      const _pfx = sku + '-';
       const _SKU_MAX = 50;
       const _slug = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
       const _mkSku = parts => {
@@ -109,16 +114,12 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       console.log(`[Worker]   rebuilt skuToAsin: ${Object.keys(skuToAsin).length} entries`);
     }
 
-    // Step 1: Scrape Amazon for fresh data
+    // Step 1: Scrape Amazon for fresh data (in-process)
     let _scraped = null;
     try {
-      const _sr = await fetch(`${VERCEL_URL}/api/ebay`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'scrape', url: product.sourceUrl }),
-      });
-      const _sd = await _sr.json().catch(() => null);
-      if (_sd?.success && _sd?.product?.comboAsin) {
-        _scraped = _sd.product;
+      const _sd = await callEbay({ action: 'scrape', url: product.sourceUrl });
+      if (_sd.ok && _sd.data?.success && _sd.data?.product?.comboAsin) {
+        _scraped = _sd.data.product;
         const _nC = Object.keys(_scraped.comboAsin || {}).length;
         const _nP = Object.values(_scraped.comboPrices || {}).filter(Boolean).length;
         console.log(`[Worker]   scraped: ${_nC} combos, ${_nP} prices`);
@@ -161,31 +162,28 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       console.warn(`[Worker]   scrape error: ${_se.message}`);
     }
 
-    // Step 2: smartSync with fresh scraped data
-    const resp = await fetch(`${VERCEL_URL}/api/ebay`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action:        'smartSync',
-        access_token:  token,
-        ebaySku:       sku,
-        ebayListingId: product.ebayListingId || '',
-        sourceUrl:     product.sourceUrl,
-        markup,
-        handlingCost,
-        quantity:      product.quantity || 1,
-        skuToAsin:          skuToAsin && Object.keys(skuToAsin).length <= 500 ? skuToAsin : null,
-        cachedOfferIds:     product.offerIdCache && Object.keys(product.offerIdCache).length <= 500 ? product.offerIdCache : null,
-        comboAsin:                  (_scraped?.comboAsin         || product.comboAsin)         || null,
-        fallbackComboPrices:        (_scraped?.comboPrices       || product.comboPrices)       || null,
-        fallbackComboInStock:       (_scraped?.comboInStock      || product.comboInStock)      || null,
-        fallbackVariations:         (_scraped?.variations        || product.variations)        || null,
-        fallbackPrimaryDimName:     (_scraped?._primaryDimName   || product._primaryDimName)   || null,
-        fallbackSecondaryDimName:   (_scraped?._secondaryDimName || product._secondaryDimName) || null,
-        fallbackPrice:              _scraped?.price || product.cost || 0,
-        fallbackShipping:           product.shippingCost || 0,
-      }),
+    // Step 2: smartSync with fresh scraped data (in-process)
+    const _resp = await callEbay({
+      action:        'smartSync',
+      access_token:  token,
+      ebaySku:       sku,
+      ebayListingId: product.ebayListingId || '',
+      sourceUrl:     product.sourceUrl,
+      markup,
+      handlingCost,
+      quantity:      product.quantity || 1,
+      skuToAsin:          skuToAsin && Object.keys(skuToAsin).length <= 500 ? skuToAsin : null,
+      cachedOfferIds:     product.offerIdCache && Object.keys(product.offerIdCache).length <= 500 ? product.offerIdCache : null,
+      comboAsin:                  (_scraped?.comboAsin         || product.comboAsin)         || null,
+      fallbackComboPrices:        (_scraped?.comboPrices       || product.comboPrices)       || null,
+      fallbackComboInStock:       (_scraped?.comboInStock      || product.comboInStock)      || null,
+      fallbackVariations:         (_scraped?.variations        || product.variations)        || null,
+      fallbackPrimaryDimName:     (_scraped?._primaryDimName   || product._primaryDimName)   || null,
+      fallbackSecondaryDimName:   (_scraped?._secondaryDimName || product._secondaryDimName) || null,
+      fallbackPrice:              _scraped?.price || product.cost || 0,
+      fallbackShipping:           product.shippingCost || 0,
     });
-    const data = await resp.json().catch(() => ({}));
+    const data = _resp.data || {};
 
     if (!data.success) {
       // Stale offer ID cache — clear it so next cycle does fresh discovery
@@ -204,14 +202,18 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       return result;
     }
 
-    const synced  = data.synced  || 0;
-    const prices  = data.prices  || {};
-    const inStock = Object.values(data.inStock || {}).some(Boolean);
-    result.wentOos = !inStock;
+    // FIX: smartSync returns prices as { ASIN: { cost, inStock } } — not flat numbers.
+    // Previous code treated them as numbers → avg was NaN, inStock was always false,
+    // and every successful revise was reported as OOS on the webhook.
+    const synced      = data.synced || 0;
+    const pricesObj   = data.prices || {};
+    const priceEntries = Object.values(pricesObj);
+    const costList    = priceEntries.map(p => (typeof p === 'number' ? p : p?.cost) || 0).filter(c => c > 0);
+    const avgPrice    = costList.length ? costList.reduce((a, b) => a + b, 0) / costList.length : 0;
+    const anyInStock  = costList.length > 0 && priceEntries.some(p => (typeof p === 'object' ? p?.inStock !== false : true));
+    result.wentOos = !anyInStock;
 
-    const priceList = Object.values(prices).filter(Boolean);
-    const avgPrice  = priceList.length ? priceList.reduce((a, b) => a + b, 0) / priceList.length : 0;
-    console.log(`[Worker]   ✓ ${synced} offers updated · avg Amazon $${avgPrice.toFixed(2)} · ${inStock ? 'In Stock' : 'OOS'}`);
+    console.log(`[Worker]   ✓ ${synced} offers updated · avg Amazon $${avgPrice.toFixed(2)} · ${anyInStock ? 'In Stock' : 'OOS'}`);
 
     await db.updateProductSync(product.id, {
       lastSynced:    new Date().toISOString(),
@@ -247,6 +249,7 @@ async function runForever() {
   let cursor = parseInt(await db.getSetting('revise_cursor') || '0') || 0;
   let _cachedListed = null;   // cached product list — only reloaded on wrap
   let _cacheLoadedAt = 0;
+  let _emptyCount = 0;        // FIX: declared at scope, was implicit global
 
   while (true) {
     let _reviseStart = Date.now(); // declared here so spacing code always has it
@@ -300,7 +303,6 @@ async function runForever() {
       }
 
       // Reload product list only when cursor wraps or cache is stale (>10min)
-      // Loading 3000 products every 30s was the main memory leak
       const _cacheStale = Date.now() - _cacheLoadedAt > 600000; // 10min
       if (!_cachedListed || cursor === 0 || _cacheStale) {
         const allProducts = await db.getProductsForSync(9999);
@@ -316,8 +318,6 @@ async function runForever() {
 
       if (!listed.length) {
         // Back off: 30s → 60s → 120s → ... → 600s max
-        // Avoids hammering Railway DB when catalog is empty
-        if (typeof _emptyCount === 'undefined') _emptyCount = 0;
         _emptyCount++;
         const _backoff = Math.min(30000 * Math.pow(2, _emptyCount - 1), 600000);
         console.log(`[Worker] No listed products — waiting ${Math.round(_backoff/1000)}s (check #${_emptyCount})`);
@@ -326,7 +326,7 @@ async function runForever() {
         continue;
       }
       // Reset empty counter when products found
-      if (typeof _emptyCount !== 'undefined') _emptyCount = 0;
+      _emptyCount = 0;
 
       // Wrap cursor
       if (cursor >= listed.length) {
@@ -369,7 +369,6 @@ async function runForever() {
 
     // Adaptive spacing between revises to avoid Amazon rate limiting.
     // Target: ~60s between revise starts — gives Amazon IP cooldown time.
-    // Also check for push lock: if frontend is pushing, wait it out.
     const _reviseDuration = Date.now() - _reviseStart;
     const _minGap = 60000; // 60s minimum between revise starts
     const _remaining = _minGap - _reviseDuration;
