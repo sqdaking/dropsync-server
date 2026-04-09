@@ -2441,6 +2441,12 @@ function renderProducts() {
           ${S.lastAutoSync ? `<span style="font-size:11px;color:var(--text3)">Last sync: ${timeAgo(S.lastAutoSync)}</span>` : ''}
           <button class="btn btn-sm" style="background:rgba(239,68,68,.2);border:1px solid rgba(239,68,68,.5);color:#f87171;font-weight:600" onclick="markAllOos()" title="Emergency: set ALL listed products to qty=0 immediately — stops all orders">🚫 Mark All OOS</button>
           <button id="btn-oos-filter" class="btn btn-sm" style="background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#f87171;font-weight:600" onclick="toggleOosFilter()" title="Show only OOS-locked listings">🔒 OOS Only</button>
+          ${(() => {
+            const _orphanCount = (S.products||[]).filter(p => p.status === 'listed' && !p.sourceUrl).length;
+            return _orphanCount > 0
+              ? `<button id="btn-orphan-filter" class="btn btn-sm" style="background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.35);color:#fbbf24;font-weight:600" onclick="toggleOrphanFilter()" title="Show only listings with no Amazon URL — paste a URL to reconnect each one">🔗 Orphans (${_orphanCount})</button>`
+              : '';
+          })()}
           <button class="btn btn-sm" style="background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:#4ade80;font-weight:600" onclick="fixAndReviseAllOos()" title="Fix & Revise all OOS-locked listings">🔧 Fix All OOS</button>
 
 
@@ -2566,6 +2572,7 @@ function filterDrafts() {
 }
 
 let _oosFilter = false;
+let _orphanFilter = false;
 
 function toggleOosFilter() {
   _oosFilter = !_oosFilter;
@@ -2578,12 +2585,71 @@ function toggleOosFilter() {
   filterProducts();
 }
 
+function toggleOrphanFilter() {
+  _orphanFilter = !_orphanFilter;
+  const btn = document.getElementById('btn-orphan-filter');
+  if (btn) {
+    btn.style.background = _orphanFilter ? 'rgba(245,158,11,.35)' : 'rgba(245,158,11,.12)';
+    btn.style.fontWeight = '700';
+    const count = (S.products||[]).filter(p => p.status === 'listed' && !p.sourceUrl).length;
+    btn.textContent = _orphanFilter ? `🔗 Orphans (${count}) ✓` : `🔗 Orphans (${count})`;
+  }
+  filterProducts();
+}
+
+// ── Reconnect an orphaned listed product to its Amazon source URL ────────────
+// Orphans are listings imported via the eBay Import tab that never got an
+// Amazon URL attached, so the worker can't revise them. Paste a URL here to
+// link it and queue a fresh scrape + smartSync on the worker.
+async function linkOrphanToAmazon(pid) {
+  const p = (S.products||[]).find(x => x.id === pid);
+  if (!p) { toast('Product not found', 'error'); return; }
+  const inp = document.getElementById('orphan-url-' + pid);
+  if (!inp) return;
+  const raw = (inp.value || '').trim();
+  if (!raw) { toast('Paste an Amazon URL first', 'warn'); inp.focus(); return; }
+
+  const v = validateAmazonUrl(raw);
+  if (!v) return; // validateAmazonUrl already toasted the error
+
+  // Write URL + ASIN into the product and persist to Railway
+  p.sourceUrl = v.url;
+  if (v.asin) p.asin = v.asin;
+  if (v.source) p._source = v.source;
+  // Clear the _imported/_noOffers flags so the product behaves like a normal listed item
+  delete p._imported;
+  delete p._noOffers;
+  markDirty(p.id);
+
+  // Show pending state immediately
+  const row = document.getElementById('prod-row-' + pid);
+  if (row) {
+    const statusEl = document.getElementById('orphan-status-' + pid);
+    if (statusEl) statusEl.innerHTML = '<span style="color:var(--accent)">💾 Saving…</span>';
+  }
+
+  try {
+    // Persist the URL first (saveProduct = direct upsert to Railway, not batched)
+    await saveProduct(p);
+    addLog('import', `Linked orphan to Amazon: ${(p.title||'').slice(0,50)}`, v.url, { productId: p.id });
+    toast(`🔗 Linked — queuing sync to populate Amazon data…`, 'success', 3500);
+    // Queue a worker sync so the product gets fresh comboAsin / prices / images
+    await queueWorkerSync(p);
+  } catch(e) {
+    console.warn('[linkOrphan] failed:', e.message);
+    toast('Save failed: ' + e.message, 'error', 5000);
+    const statusEl = document.getElementById('orphan-status-' + pid);
+    if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">❌ ${e.message.slice(0,60)}</span>`;
+  }
+}
+
 function filterProducts() {
   const q = ($('prod-search')?.value || '').toLowerCase();
   let prods = (S.products||[]).filter(p =>
     (p.status==='listed'||p.status==='ended') &&
     (!q || (p.title||'').toLowerCase().includes(q) || (p.sourceUrl||'').includes(q)) &&
     (!_oosFilter || p._markedOos) &&
+    (!_orphanFilter || !p.sourceUrl) &&
     (_listedCatFilter === 'all' || detectCategory(p) === _listedCatFilter)
   );
   prods = _sortProducts(prods, _listedSort);
@@ -2714,6 +2780,18 @@ function renderProdRows(prods) {
           })() : ''}
           ${p.lastReviseError ? `<span style="color:var(--red);font-size:10px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(p.lastReviseError||'').replace(/"/g,"'")}">⚠ ${p.lastReviseError.slice(0,60)}${p.lastReviseError.length>60?'…':''}</span>` : ''}
         </div>
+        ${p.status === 'listed' && !p.sourceUrl ? `
+        <div style="margin-top:8px;display:flex;align-items:center;gap:8px;padding:8px 10px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px">
+          <span style="font-size:11px;font-weight:700;color:#fbbf24;white-space:nowrap" title="This listing has no Amazon source URL — paste one to reconnect it">🔗 Orphan:</span>
+          <input id="orphan-url-${p.id}" type="text"
+            placeholder="Paste Amazon URL (e.g. amazon.com/dp/B0XXXXXXXX)"
+            style="flex:1;min-width:200px;padding:5px 9px;font-size:11px;font-family:var(--font-mono);background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);outline:none"
+            onclick="event.stopPropagation()"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();linkOrphanToAmazon('${p.id}')}">
+          <button class="btn btn-sm" style="background:#f59e0b;color:#000;font-weight:700;border:none;font-size:11px;padding:5px 11px;white-space:nowrap"
+            onclick="event.stopPropagation();linkOrphanToAmazon('${p.id}')">🔗 Link & Sync</button>
+          <span id="orphan-status-${p.id}" style="font-size:10px;color:var(--text3)"></span>
+        </div>` : ''}
       </div>
       <div style="display:flex;gap:6px;align-items:center;flex-shrink:0">
         ${actionBtns}
