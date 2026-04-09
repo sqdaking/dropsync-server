@@ -2608,49 +2608,230 @@ function toggleOrphanFilter() {
 }
 
 // ── Reconnect an orphaned listed product to its Amazon source URL ────────────
-// Orphans are listings imported via the eBay Import tab that never got an
-// Amazon URL attached, so the worker can't revise them. Paste a URL here to
-// link it and queue a fresh scrape + smartSync on the worker.
-async function linkOrphanToAmazon(pid) {
+// DEEP CLEAN REBUILD: wipes all stored product data (comboAsin, variations,
+// images, aspects, myPrice, etc.) keeping ONLY the eBay listing ID + group SKU
+// + DropSync product id, then scrapes Amazon via browser relay (residential IP),
+// merges the fresh data back in, saves to Railway, and calls action=sync so the
+// backend refreshes the live eBay listing in place. Same eBay listing ID stays
+// — the catalog just gets fully reconnected to the Amazon source.
+async function linkOrphanToAmazon(pid, urlOverride) {
   const p = (S.products||[]).find(x => x.id === pid);
   if (!p) { toast('Product not found', 'error'); return; }
-  const inp = document.getElementById('orphan-url-' + pid);
-  if (!inp) return;
-  const raw = (inp.value || '').trim();
-  if (!raw) { toast('Paste an Amazon URL first', 'warn'); inp.focus(); return; }
+  let raw = urlOverride;
+  if (!raw) {
+    const inp = document.getElementById('orphan-url-' + pid);
+    if (!inp) return;
+    raw = (inp.value || '').trim();
+  }
+  if (!raw) { toast('Paste an Amazon URL first', 'warn'); const inp = document.getElementById('orphan-url-' + pid); inp?.focus(); return; }
 
   const v = validateAmazonUrl(raw);
   if (!v) return; // validateAmazonUrl already toasted the error
 
-  // Write URL + ASIN into the product and persist to Railway
-  p.sourceUrl = v.url;
-  if (v.asin) p.asin = v.asin;
-  if (v.source) p._source = v.source;
-  // Clear the _imported/_noOffers flags so the product behaves like a normal listed item
-  delete p._imported;
-  delete p._noOffers;
-  markDirty(p.id);
-
-  // Show pending state immediately
-  const row = document.getElementById('prod-row-' + pid);
-  if (row) {
-    const statusEl = document.getElementById('orphan-status-' + pid);
-    if (statusEl) statusEl.innerHTML = '<span style="color:var(--accent)">💾 Saving…</span>';
+  // Guard against re-linking a non-orphan by accident
+  if (!p.ebayListingId && !p.ebaySku) {
+    toast('This product has no eBay listing ID / SKU to relink to', 'error', 5000);
+    return;
   }
+
+  const setStatus = (html) => {
+    const el = document.getElementById('orphan-status-' + pid);
+    if (el) el.innerHTML = html;
+  };
 
   try {
-    // Persist the URL first (saveProduct = direct upsert to Railway, not batched)
-    await saveProduct(p);
-    addLog('import', `Linked orphan to Amazon: ${(p.title||'').slice(0,50)}`, v.url, { productId: p.id });
-    toast(`🔗 Linked — queuing sync to populate Amazon data…`, 'success', 3500);
-    // Queue a worker sync so the product gets fresh comboAsin / prices / images
-    await queueWorkerSync(p);
+    setStatus('<span style="color:var(--accent)">🧹 Deep cleaning…</span>');
+
+    // ── STEP 1: Preserve only the immutable identity fields ───────────────────
+    // Everything else (comboAsin, variations, images, aspects, skuToAsin, etc.)
+    // gets wiped so the rebuild starts from a known-clean slate.
+    const _preserved = {
+      id:            p.id,
+      ebaySku:       p.ebaySku,
+      ebayListingId: p.ebayListingId,
+      createdAt:     p.createdAt,
+      status:        'listed',
+      // Markup is a user preference, keep it. Everything else goes.
+      markup:        p.markup,
+      quantity:      p.quantity || 1,
+    };
+
+    // ── STEP 2: Scrape Amazon via browser relay (residential IP) ──────────────
+    setStatus('<span style="color:var(--accent)">📥 Scraping Amazon…</span>');
+    let clientHtml = null;
+    let clientAsinData = null;
+    try {
+      clientHtml = await fetchAmazonInBrowser(v.url).catch(() => null);
+      if (clientHtml === '__EXTENSION__' && window._extensionScrapeResult) {
+        clientHtml     = window._extensionScrapeResult.html || null;
+        clientAsinData = window._extensionScrapeResult.asinData || null;
+      }
+    } catch(e) { console.warn('[linkOrphan] browser scrape failed:', e.message); }
+
+    // ── STEP 3: Parse via scrape action — same path as import so the shape matches ──
+    setStatus('<span style="color:var(--accent)">🔨 Rebuilding product…</span>');
+    const scrapeResp = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: v.url, clientHtml, clientAsinData }),
+    });
+    const scrapeD = await scrapeResp.json().catch(() => ({}));
+    if (!scrapeD.success || !scrapeD.product) {
+      throw new Error(scrapeD.error || 'Scrape returned no product data');
+    }
+    const fresh = scrapeD.product;
+
+    // ── STEP 4: Build a clean product object — preserved identity + fresh scrape ───
+    const markup = _preserved.markup != null ? _preserved.markup : (S.markup || 23);
+    const rebuilt = {
+      ..._preserved,
+      // Fresh Amazon data — replaces everything that was stripped
+      source:           'amazon',
+      sourceUrl:        v.url,
+      asin:             v.asin || fresh.asin || '',
+      title:            fresh.title || '',
+      ebayTitle:        fresh.ebayTitle || fresh.title || '',
+      price:            fresh.price || 0,
+      myPrice:          fresh.price > 0 ? calcPrice(fresh.price, markup) : 0,
+      images:           (fresh.images || []).slice(0, 12),
+      description:      fresh.description || '',
+      bullets:          fresh.bullets || [],
+      descriptionPara:  fresh.descriptionPara || '',
+      aspects:          fresh.aspects || {},
+      breadcrumbs:      fresh.breadcrumbs || [],
+      variations:       fresh.variations || [],
+      variationImages:  fresh.variationImages || {},
+      hasVariations:    !!fresh.hasVariations,
+      comboAsin:        fresh.comboAsin || {},
+      comboPrices:      fresh.comboPrices || {},
+      comboInStock:     fresh.comboInStock || {},
+      sizePrices:       fresh.sizePrices || {},
+      asinImages:       fresh.asinImages || {},
+      _primaryDimName:  fresh._primaryDimName || null,
+      _secondaryDimName: fresh._secondaryDimName || null,
+      _extraDimNames:   fresh._extraDimNames || [],
+      inStock:          fresh.inStock !== false,
+      lastSynced:       null,
+      // Clear all the orphan-era flags & stale caches
+      _imported:        false,
+      _noOffers:        false,
+      _source:          v.source || 'amazon',
+      _asinOffset:      0,
+      skuToAsin:        {},
+      offerIdCache:     null,
+      offerIdCacheAt:   null,
+      _photosDimCycle:  0,
+      _markedOos:       false,
+      markedOos:        false,
+      sync_pending:     false,
+      lastReviseError:  null,
+    };
+
+    // Update local state immediately
+    const idx = S.products.findIndex(x => x.id === pid);
+    if (idx >= 0) S.products[idx] = rebuilt;
+    markDirty(pid);
+    save();
+
+    // Persist full rebuilt product to Railway — one atomic write, not fire-and-forget
+    // so subsequent sync call sees the new state.
+    setStatus('<span style="color:var(--accent)">💾 Persisting…</span>');
+    const saveR = await fetch(`${S.serverUrl}/api/products`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(rebuilt),
+    });
+    if (!saveR.ok) throw new Error('Railway save failed: HTTP ' + saveR.status);
+
+    addLog('import', `Deep-clean relinked: ${(rebuilt.title||'').slice(0,50)}`, v.url, { productId: pid, ebayListingId: rebuilt.ebayListingId });
+
+    // ── STEP 5: Refresh eBay listing in place via action=sync ─────────────────
+    // action=sync does a full in-place rebuild of the inventory item group,
+    // variant items, and offers — keeping the same ebayListingId.
+    setStatus('<span style="color:var(--accent)">🔄 Refreshing eBay listing…</span>');
+    toast(`🔄 Refreshing eBay listing in place — this takes 10-30s`, 'info', 8000);
+
+    const token = await ensureToken();
+    if (!token) throw new Error('No valid eBay token');
+
+    const syncR = await fetch(`${S.serverUrl}/api/ebay?action=sync`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        access_token:    token,
+        ebaySku:         rebuilt.ebaySku,
+        sourceUrl:       rebuilt.sourceUrl,
+        hasVariations:   rebuilt.hasVariations,
+        quantity:        rebuilt.quantity || 1,
+        markup,
+        handlingCost:    S.handlingCost || 2,
+        clientHtml,
+        clientAsinData,
+        // Let the backend know the fresh data so it doesn't need to re-scrape blindly
+        fallbackPrice:            rebuilt.price || 0,
+        fallbackInStock:          rebuilt.inStock !== false,
+        comboAsin:                rebuilt.comboAsin     || null,
+        fallbackComboPrices:      rebuilt.comboPrices   || null,
+        fallbackComboInStock:     rebuilt.comboInStock  || null,
+        fallbackVariations:       rebuilt.variations    || null,
+        fallbackPrimaryDimName:   rebuilt._primaryDimName || null,
+        fallbackSecondaryDimName: rebuilt._secondaryDimName || null,
+      }),
+    });
+    const syncD = await syncR.json().catch(() => ({}));
+
+    if (syncD.success) {
+      // Persist the post-sync state
+      rebuilt.lastSynced = new Date().toISOString();
+      if (syncD.updatedVariants) rebuilt._variantsUpdated = syncD.updatedVariants;
+      if (S.products[idx]) S.products[idx] = rebuilt;
+      markDirty(pid); save();
+      // Also push the updated lastSynced to Railway
+      await fetch(`${S.serverUrl}/api/products`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(rebuilt),
+      }).catch(()=>{});
+
+      const _summary = [
+        syncD.updatedVariants ? `${syncD.updatedVariants} variants updated` : '',
+        syncD.priceChanges?.length ? `${syncD.priceChanges.length} price changes` : '',
+        syncD.stockChanges?.length ? `${syncD.stockChanges.length} stock changes` : '',
+        syncD.imageChanges?.length ? `${syncD.imageChanges.length} image changes` : '',
+      ].filter(Boolean).join(' · ') || 'listing refreshed';
+      setStatus(`<span style="color:var(--green)">✅ ${_summary}</span>`);
+      toast(`✅ Deep-clean relink done — ${_summary}`, 'success', 6000);
+      addLog('sync', `Deep-clean rebuild: ${(rebuilt.title||'').slice(0,50)}`, _summary, { productId: pid });
+      // Re-render so the row shows the new title/images
+      if (S.view === 'listed' || S.view === 'products') renderProducts();
+    } else {
+      throw new Error(syncD.error || 'sync action failed');
+    }
   } catch(e) {
     console.warn('[linkOrphan] failed:', e.message);
-    toast('Save failed: ' + e.message, 'error', 5000);
-    const statusEl = document.getElementById('orphan-status-' + pid);
-    if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">❌ ${e.message.slice(0,60)}</span>`;
+    toast('Deep-clean failed: ' + e.message, 'error', 6000);
+    setStatus(`<span style="color:var(--red)">❌ ${e.message.slice(0,60)}</span>`);
+    addLog('error', `Deep-clean relink failed: ${(p.title||'').slice(0,50)}`, e.message, { productId: pid });
   }
+}
+
+// ── Deep Rebuild button handler: wipes + rebuilds a non-orphan listing using
+// its existing sourceUrl. Confirms first (destructive operation). This reuses
+// linkOrphanToAmazon's full deep-clean flow via the urlOverride parameter so
+// we don't need an on-row input field.
+async function deepRebuildFromSourceUrl(pid) {
+  const p = (S.products||[]).find(x => x.id === pid);
+  if (!p) { toast('Product not found', 'error'); return; }
+  if (!p.sourceUrl) { toast('No source URL set — use the orphan link flow instead', 'warn'); return; }
+  if (!p.ebayListingId || !p.ebaySku) { toast('No eBay listing to rebuild', 'error'); return; }
+  const ok = confirm(
+    `🧹 Deep Rebuild "${(p.title||'').slice(0,60)}"?\n\n` +
+    `This will:\n` +
+    `  • Wipe all stored product data (title, images, variations, prices, aspects)\n` +
+    `  • Re-scrape Amazon via browser relay\n` +
+    `  • Rebuild and overwrite the live eBay listing in place\n\n` +
+    `eBay listing ID (${p.ebayListingId}) stays the same.\n\n` +
+    `Amazon URL: ${p.sourceUrl}\n\n` +
+    `Continue?`
+  );
+  if (!ok) return;
+  return linkOrphanToAmazon(pid, p.sourceUrl);
 }
 
 function filterProducts() {
@@ -2757,6 +2938,7 @@ function renderProdRows(prods) {
         const _curDim = _dims[_cycle] || _dims[0] || '';
         return `<button class="btn btn-ghost btn-sm" style="color:#a78bfa;font-size:11px;border:1px solid rgba(167,139,250,.3)" onclick="rebuildPhotos('${p.id}')" title="Rotate which dimension drives the product images on eBay. Current: ${_curDim}">📸 Rebuild Photos (${_curDim})</button>`;
       })() : ''}
+      ${p.status === 'listed' && p.sourceUrl && S.token && p.ebayListingId && p.ebaySku ? `<button class="btn btn-ghost btn-sm" style="color:#60a5fa;font-size:11px;border:1px solid rgba(96,165,250,.3)" onclick="deepRebuildFromSourceUrl('${p.id}')" title="Wipe all product data and rebuild from Amazon, keeping the same eBay listing ID">🧹 Deep Rebuild</button>` : ''}
       <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="confirmEnd('${p.id}')">End</button>
       ${p._markedOos
         ? `<button class="btn btn-sm" style="background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.4);color:#4ade80;font-weight:600" onclick="fixAndRevise('${p.id}')" title="Unlock this listing and revise it with fresh Amazon data">🔧 Fix & Sync</button>
