@@ -5216,12 +5216,32 @@ async function handleRebuildPhotos(body, res) {
 
     requests.push({
       sku,
+      // Whitelist only the fields that eBay accepts in bulk_create_or_replace_inventory_item.
+      // The GET response includes extra fields (like a nested `sku`, `groupIds`, `locale`,
+      // and others) that silently cause the PUT to fail with no error body — the responses
+      // array comes back empty, making `updated:0 failed:0` look like success with nothing
+      // happening. Only pass the documented writable fields.
       inventoryItem: {
-        ...item,
+        availability:          item.availability,
+        condition:             item.condition,
+        conditionDescription:  item.conditionDescription,
+        conditionDescriptors:  item.conditionDescriptors,
+        packageWeightAndSize:  item.packageWeightAndSize,
         product: {
-          ...(item.product || {}),
-          imageUrls: imgs.slice(0, 12), // eBay max 12 images
+          title:        item.product?.title,
+          description:  item.product?.description,
+          aspects:      item.product?.aspects,
+          brand:        item.product?.brand,
+          mpn:          item.product?.mpn,
+          ean:          item.product?.ean,
+          upc:          item.product?.upc,
+          isbn:         item.product?.isbn,
+          epid:         item.product?.epid,
+          subtitle:     item.product?.subtitle,
+          videoIds:     item.product?.videoIds,
+          imageUrls:    imgs.slice(0, 12), // eBay max 12 images — fresh ones
         },
+        locale:  item.locale,
       },
     });
   }
@@ -5229,6 +5249,9 @@ async function handleRebuildPhotos(body, res) {
 
   // ── 6. Batch PUT inventory items ─────────────────────────────────────────────
   let updated = 0, failed = 0;
+  const _putErrors = []; // First few errors surfaced in the response for frontend diagnosis
+  let _putHttpStatus = null;
+  let _putHttpErrorBody = null;
   for (let i = 0; i < requests.length; i += 25) {
     const batch = requests.slice(i, i + 25);
     try {
@@ -5236,12 +5259,43 @@ async function handleRebuildPhotos(body, res) {
         method: 'POST', headers: auth,
         body: JSON.stringify({ requests: batch }),
       });
+      _putHttpStatus = putr.status;
       const putd = await putr.json().catch(() => ({}));
+      // If eBay returns an HTTP error with no `responses` array, surface the body
+      // so we can see exactly what it rejected. Previously we silently swallowed it
+      // and reported `updated: 0` with no explanation.
+      if (!putr.ok && !Array.isArray(putd.responses)) {
+        _putHttpErrorBody = JSON.stringify(putd).slice(0, 800);
+        console.warn(`[rebuild-photos] PUT bulk HTTP ${putr.status}: ${_putHttpErrorBody}`);
+        failed += batch.length;
+        if (_putErrors.length < 5) {
+          _putErrors.push({ httpStatus: putr.status, body: _putHttpErrorBody });
+        }
+        continue;
+      }
       for (const resp of (putd.responses || [])) {
         if ([200, 201, 204].includes(resp.statusCode)) updated++;
-        else { failed++; console.warn(`[rebuild-photos] PUT failed ${resp.sku}: ${JSON.stringify(resp.errors||[]).slice(0,120)}`); }
+        else {
+          failed++;
+          const errSnippet = JSON.stringify(resp.errors || []).slice(0, 200);
+          console.warn(`[rebuild-photos] PUT failed ${resp.sku}: statusCode=${resp.statusCode} ${errSnippet}`);
+          if (_putErrors.length < 5) {
+            _putErrors.push({
+              sku:        (resp.sku || '').slice(-30),
+              statusCode: resp.statusCode,
+              errors:     (resp.errors || []).slice(0, 2).map(e => ({
+                errorId:   e.errorId,
+                message:   (e.message || '').slice(0, 200),
+                parameters: (e.parameters || []).slice(0, 3),
+              })),
+            });
+          }
+        }
       }
-    } catch(e) { console.warn('[rebuild-photos] PUT error:', e.message); }
+    } catch(e) {
+      console.warn('[rebuild-photos] PUT error:', e.message);
+      if (_putErrors.length < 5) _putErrors.push({ exception: e.message });
+    }
     if (i + 25 < requests.length) await sleep(300);
   }
 
@@ -5307,7 +5361,7 @@ async function handleRebuildPhotos(body, res) {
     } catch(e) { console.warn('[rebuild-photos] re-publish error:', e.message); }
   }
 
-  console.log(`[rebuild-photos] done — updated=${updated} failed=${failed} noAsin=${noAsin} noImages=${noImages} noItem=${noItem} allSkus=${allSkus.length}`);
+  console.log(`[rebuild-photos] done — updated=${updated} failed=${failed} noAsin=${noAsin} noImages=${noImages} noItem=${noItem} allSkus=${allSkus.length}${_putHttpStatus ? ` putHttp=${_putHttpStatus}` : ''}`);
   return res.json({
     success: true,
     chosenDim:       chosenDimName,
@@ -5322,6 +5376,9 @@ async function handleRebuildPhotos(body, res) {
     asinImagesProvided: Object.keys(_asinImgMap).length,
     comboMatched: _comboMatched,
     comboUnmatched: _comboUnmatched,
+    requestsBuilt: requests.length,
+    putHttpStatus: _putHttpStatus,
+    putErrors:    _putErrors.length ? _putErrors : undefined,
     // Return new dim order + variationImages so frontend can update stored product
     newPrimaryDim:   chosenDimName,
     newSecondaryDim: _allDimNames.find(d => d !== chosenDimName) || null,
@@ -5987,8 +6044,19 @@ module.exports = async (req, res) => {
       console.log(`[smartSync] ${allUniqueAsins.length} ASINs total — fetching ${uniqueAsins.length} (offset ${asinOffset})${nextAsinOffset ? ` → next: ${nextAsinOffset}` : ' → complete'}`);
 
       // ── STEP 2: Fetch each ASIN page → price (fail fast, 2 attempts max) ───────
+      // Failed fetches used to leave asinPrice[asin] undefined which caused the
+      // variant to silently hit _skippedNoBatch in the main update loop, preserving
+      // whatever stale price/qty was last on eBay. That broke the user's ability
+      // to undo manual price/qty edits by running a sync: if one of the failed
+      // ASINs was a variant they'd touched, the sync would appear to succeed but
+      // those specific variants wouldn't actually be updated. Fix: always set
+      // asinPrice[asin] = 0 on fetch failure and mark inStock=false. Downstream,
+      // cost=0 naturally forces qty=0 and preserves the existing eBay offer price.
+      // This means a transient Amazon block briefly OOSes a variant (safer than
+      // selling at an unknown wrong price), and the next sync restores it.
       const asinPrice   = {};
       const asinInStock = {};
+      const _fetchFailed = new Set(); // ASINs where fetchPage returned null
       if (uniqueAsins.length > 0) {
         console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1}: ASINs ${asinOffset+1}–${asinOffset+uniqueAsins.length} of ${allUniqueAsins.length} ──`);
         const BATCH = 6;
@@ -5996,9 +6064,17 @@ module.exports = async (req, res) => {
         for (let i = 0; i < uniqueAsins.length; i += BATCH) {
           await Promise.all(uniqueAsins.slice(i, i + BATCH).map(async (asin, bi) => {
             await sleep(bi * 150);
-            // 2 attempts max — blocked ASINs retried on next cycle, don't waste time
+            // 2 attempts max — blocked ASINs get force-OOSed this cycle and
+            // re-tried next cycle, so we don't waste time retrying here.
             const h = await fetchPage(`https://www.amazon.com/dp/${asin}?th=1&psc=1`, randUA(), 2);
-            if (!h) { asinInStock[asin] = false; fetchFail++; return; }
+            if (!h) {
+              asinPrice[asin]   = 0;     // ← explicit 0 so _haveFreshPrice sees it
+              asinInStock[asin] = false;
+              _fetchFailed.add(asin);
+              fetchFail++;
+              console.log(`[smartSync] ${asin} → BLOCKED (force-OOS)`);
+              return;
+            }
             const price = extractPriceFromBuyBox(h) || extractPrice(h) || 0;
             const oos   = isAmazonOOS(h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '');
             asinPrice[asin]   = price;
@@ -6008,7 +6084,7 @@ module.exports = async (req, res) => {
           }));
           if (i + BATCH < uniqueAsins.length) await sleep(1000);
         }
-        console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1} done: ${fetchOk} ok, ${fetchFail} blocked ──`);
+        console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1} done: ${fetchOk} ok, ${fetchFail} blocked (force-OOS) ──`);
       }
 
       // Pick best price (use first in-stock ASIN price as fallback for any unpriced variant)
@@ -6505,10 +6581,16 @@ module.exports = async (req, res) => {
         success: true, synced: okCount, failed: failCount,
         orphanedCount: _orphanedSkus.length,
         orphanedSkus:  _orphanedSkus.length > 0 ? _orphanedSkus.slice(0, 20) : undefined,
+        fetchFailedCount: _fetchFailed.size,
+        fetchFailedAsins: _fetchFailed.size > 0 ? [..._fetchFailed].slice(0, 20) : undefined,
         nextAsinOffset,
         totalAsins: allUniqueAsins.length,
         skuToAsin: Object.keys(skuToAsin).length > 0 ? skuToAsin : undefined,
-        prices: Object.fromEntries(uniqueAsins.map(a => [a, { cost: asinPrice[a]||0, inStock: asinInStock[a]!==false }])),
+        prices: Object.fromEntries(uniqueAsins.map(a => [a, {
+          cost: asinPrice[a]||0,
+          inStock: asinInStock[a]!==false,
+          fetchFailed: _fetchFailed.has(a),
+        }])),
         // Representative values for frontend display — use the MIN in-stock cost so the
         // Listed view shows the cheapest available variant (matches eBay's "starting at" UX).
         // These update p.price and p.myPrice on the product after each successful sync so
@@ -6873,9 +6955,17 @@ module.exports = async (req, res) => {
         return p > 0 ? p : 0;
       };
 
-      // Per-variant qty — combo must exist AND be in stock on Amazon
+      // Per-variant qty — combo must exist AND be in stock on Amazon.
+      // CRITICAL: we do NOT gate this on the global `freshStock` (product.inStock)
+      // flag — that flag reflects the LANDING variant's buy box only. For variation
+      // products, if Amazon lands us on Chocolate 8'x10' and that specific variant
+      // is temporarily OOS, `product.inStock` comes back false, and the old code
+      // zeroed EVERY variant regardless of individual stock state. That was the
+      // "Deep Rebuild ended my listing" bug — all 23 LIANLAM rug variants went to
+      // qty=0 even though only the landing one was OOS. Per-variant data
+      // (comboAsin/comboInStock/comboPrices) already tells us each variant's
+      // real state; trust it.
       const getQtyForVariant = (color, size) => {
-        if (!freshStock) return 0;
         if (Object.keys(comboAsin).length) {
           const key = `${color||''}|${size||''}`;
           if (!comboAsin[key]) return 0;
@@ -6885,7 +6975,8 @@ module.exports = async (req, res) => {
           if (!hasPrice) return 0;
           return defaultQty;
         }
-        // Single-variant: need a base price
+        // Single-variant (no comboAsin): need a base price AND landing-variant in-stock
+        if (!freshStock) return 0;
         const hasBasePrice = parseFloat(product.price || product.cost || 0) > 0;
         return hasBasePrice ? defaultQty : 0;
       };
@@ -6897,13 +6988,75 @@ module.exports = async (req, res) => {
       console.log(`[sync] comboPrices=${Object.keys(comboPrices).length} sizePrices=${Object.keys(sizePrices).length} comboAsin=${Object.keys(comboAsin).length}`);
 
       // ── STEP 4: Get existing variant SKUs from eBay ──────────────────────────
-      const groupRes    = await fetch(
-        `${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`,
-        { headers: auth }
-      ).then(r => r.json()).catch(() => null);
-      const variantSkus = groupRes?.variantSKUs || [];
-      const isVariation = variantSkus.length > 0;
-      console.log(`[sync] type=${isVariation?'variation':'simple'} variantSkus=${variantSkus.length}`);
+      // SAFETY: this decision (variation vs simple) must be BULLETPROOF. If we
+      // can't confirm the group's state with high confidence, we MUST NOT fall
+      // through to the simple branch silently — doing so has caused listings to
+      // end accidentally when combined with the Deep Rebuild mismatch prompt.
+      // The rules:
+      //   1. If the GET succeeds AND returns variantSKUs[] non-empty → variation
+      //   2. If the GET returns 404 (no group) AND body.hasVariations is false → simple
+      //   3. Any other case (HTTP error, empty body, missing variantSKUs while
+      //      body.hasVariations=true, JSON parse failure, transient 5xx, etc.)
+      //      → ABORT with a clear error so the frontend never misinterprets
+      //      this as a simple listing and triggers a destructive re-push.
+      let _groupResp = null;
+      let _groupJson = null;
+      let _groupFetchErr = null;
+      try {
+        _groupResp = await fetch(
+          `${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(ebaySku)}`,
+          { headers: auth }
+        );
+        if (_groupResp.ok) {
+          _groupJson = await _groupResp.json().catch(e => { _groupFetchErr = 'json-parse'; return null; });
+        } else if (_groupResp.status !== 404) {
+          _groupFetchErr = `http-${_groupResp.status}`;
+        }
+      } catch(e) {
+        _groupFetchErr = 'network-' + (e.message || 'unknown');
+      }
+
+      const variantSkus = _groupJson?.variantSKUs || [];
+      const _clientHadVariations = body.hasVariations === true || (Array.isArray(body.fallbackVariations) && body.fallbackVariations.length > 0);
+
+      // Decision matrix:
+      let isVariation;
+      if (_groupFetchErr) {
+        // Unknown state — refuse to guess. Return an error with a clear code so
+        // the frontend can surface it without firing any destructive follow-up.
+        console.warn(`[sync] ABORT — inventory_item_group GET uncertain: ${_groupFetchErr}`);
+        return res.status(502).json({
+          success: false,
+          error: `Cannot determine listing type from eBay — ${_groupFetchErr}. Retry in a moment. No changes made to the listing.`,
+          code:   'GROUP_UNKNOWN',
+          groupFetchErr: _groupFetchErr,
+        });
+      } else if (variantSkus.length > 0) {
+        isVariation = true;
+      } else if (_groupResp?.status === 404 && !_clientHadVariations) {
+        // Group not found and client confirmed no variations → legitimate simple listing
+        isVariation = false;
+      } else if (_clientHadVariations) {
+        // eBay says "no variants" (or 404) but the client passed hasVariations=true.
+        // This is the Deep Rebuild trigger case — never silently fall through to
+        // simple. Instead, abort with a distinctive code so the frontend can
+        // show a specific warning without calling doRepush.
+        console.warn(`[sync] ABORT — eBay has no variants (status=${_groupResp?.status}) but client claims hasVariations=true. Refusing to treat as simple.`);
+        return res.status(409).json({
+          success: false,
+          error:   `eBay listing has no variant group but Amazon product has variations. ` +
+                   `This is likely an inventory_item_group drift — the listing may need manual inspection. ` +
+                   `No changes were made.`,
+          code:    'VARIATION_STATE_DRIFT',
+          ebayGroupStatus: _groupResp?.status,
+          ebayVariantCount: variantSkus.length,
+          clientHasVariations: true,
+        });
+      } else {
+        isVariation = false;
+      }
+      console.log(`[sync] type=${isVariation?'variation':'simple'} variantSkus=${variantSkus.length}${_groupFetchErr?` (err=${_groupFetchErr})`:''}`);
+      const groupRes = _groupJson; // back-compat alias for any later reference
 
       // Change tracking
       const priceChanges = [], stockChanges = [], imageChanges = [];
