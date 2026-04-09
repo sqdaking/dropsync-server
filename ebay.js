@@ -4924,48 +4924,102 @@ async function handleRebuildPhotos(body, res) {
   }
   console.log(`[rebuild-photos] fetched ${Object.keys(inventoryItems).length}/${allSkus.length} inventory items`);
 
-  // ── 4. Build ASIN → images map + derive skuToAsin from inventory items ─────────
-  // If skuToAsin is empty/incomplete, derive it from inventory item aspects (ASIN field)
+  // ── 4. Build ASIN → images map + derive skuToAsin via multi-strategy reconstruction ────
+  // Strategies tried in order for every variant SKU that doesn't already have a direct hit:
+  //   A. Direct lookup in passed-in skuToAsin
+  //   B. Aspect ASIN field on the inventory item
+  //   C. comboAsin matching (normalized substring)
+  //   D. Dim-value slug reconstruction from product._variationValues (fallback for old
+  //      truncated/hashed SKUs whose keys don't match the current 50-char format)
   const _effectiveSkuToAsin = { ...skuToAsin };
-  let _derivedCount = 0;
-  for (const sku of allSkus) {
-    if (_effectiveSkuToAsin[sku]) continue; // already have it
+
+  // Build "_needsRecon" set of SKUs that aren't covered by strategy A yet. This is the
+  // key change — the old code gated fallbacks on `< allSkus.length` which was always
+  // false when the frontend passed a full-but-wrong-format skuToAsin.
+  const _needsRecon = () => allSkus.filter(s => !_effectiveSkuToAsin[s]);
+
+  // Strategy B: aspect ASIN (rarely present — DropSync strips ASIN at push time, but some
+  // older listings kept it)
+  let _derivedFromAspects = 0;
+  for (const sku of _needsRecon()) {
     const item = inventoryItems[sku];
-    // eBay stores the Amazon ASIN in aspects.ASIN or product.mpn sometimes
     const aspectAsin = item?.product?.aspects?.ASIN?.[0]
                     || item?.product?.aspects?.['Item Model Number']?.[0]
                     || item?.product?.mpn;
     if (aspectAsin && /^[A-Z0-9]{10}$/.test(aspectAsin)) {
       _effectiveSkuToAsin[sku] = aspectAsin;
-      _derivedCount++;
+      _derivedFromAspects++;
     }
   }
-  if (_derivedCount > 0) console.log(`[rebuild-photos] derived ${_derivedCount} ASIN mappings from inventory aspects`);
+  if (_derivedFromAspects > 0) console.log(`[rebuild-photos] strategy B: ${_derivedFromAspects} SKUs resolved from aspects`);
 
-  // Also check comboAsin — map SKU suffix to ASIN via comboKey matching
-  if (Object.keys(_effectiveSkuToAsin).length < allSkus.length) {
-    const _comboAsinBody = body.comboAsin || {};
-    for (const sku of allSkus) {
-      if (_effectiveSkuToAsin[sku]) continue;
-      // SKU suffix encodes dim values — try to match against comboAsin keys
-      const prefix = ebaySku + '-';
-      const suffix = sku.startsWith(prefix) ? sku.slice(prefix.length) : sku;
-      const normSuffix = suffix.toLowerCase().replace(/[^a-z0-9]/g, '');
-      for (const [comboKey, asin] of Object.entries(_comboAsinBody)) {
-        if (!asin) continue;
-        const normCombo = comboKey.toLowerCase().replace(/[^a-z0-9]/g, '');
-        if (normSuffix.includes(normCombo) || normCombo.split('').every(c => normSuffix.includes(c))) {
-          // rough match — assign
-        }
-        // Better: check each part of comboKey against suffix
-        const parts = comboKey.split('|').map(p => p.toLowerCase().replace(/[^a-z0-9]/g,''));
-        if (parts.every(p => p && normSuffix.includes(p))) {
+  // Strategy C: comboAsin matching. Sort keys by length desc so the most specific
+  // combination matches first (avoids "Red" winning over "Dark Red" via substring).
+  const _comboAsinBody = body.comboAsin || {};
+  const _sortedComboKeys = Object.entries(_comboAsinBody)
+    .filter(([, asin]) => asin)
+    .map(([key, asin]) => {
+      const parts = key.split('|').map(p => p.toLowerCase().replace(/[^a-z0-9]/g, '')).filter(Boolean);
+      return { key, asin, parts, totalLen: parts.reduce((s, p) => s + p.length, 0) };
+    })
+    .sort((a, b) => b.totalLen - a.totalLen);
+
+  let _derivedFromCombo = 0;
+  for (const sku of _needsRecon()) {
+    const prefix = ebaySku + '-';
+    const suffix = sku.startsWith(prefix) ? sku.slice(prefix.length) : sku;
+    const normSuffix = suffix.toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (const { asin, parts } of _sortedComboKeys) {
+      if (parts.length && parts.every(p => normSuffix.includes(p))) {
+        _effectiveSkuToAsin[sku] = asin;
+        _derivedFromCombo++;
+        break;
+      }
+    }
+  }
+  if (_derivedFromCombo > 0) console.log(`[rebuild-photos] strategy C: ${_derivedFromCombo} SKUs resolved from comboAsin`);
+
+  // Strategy D: dim-value slug reconstruction — same logic as smartSync. Works even
+  // when variant SKUs are truncated/hashed because we match dim-value slugs against
+  // the SKU text rather than expecting an exact key.
+  const _stillUncovered = _needsRecon();
+  if (_stillUncovered.length > 0 && Object.keys(_comboAsinBody).length > 0) {
+    const _slug = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
+    // Build slug → ASIN from comboAsin keys (comboAsin keys are "PrimVal|SecVal")
+    const slugToAsin = {};
+    for (const [comboKey, asin] of Object.entries(_comboAsinBody)) {
+      if (!asin) continue;
+      const parts = comboKey.split('|').filter(Boolean);
+      if (!parts.length) continue;
+      const fullSlug = parts.map(_slug).join('_');
+      if (fullSlug) slugToAsin[fullSlug] = asin;
+      // Primary-only fallback for SKUs that truncated/hashed the secondary dim
+      if (parts.length > 1) {
+        const primary = _slug(parts[0]);
+        if (primary && !slugToAsin[primary]) slugToAsin[primary] = asin;
+      }
+    }
+    // CRITICAL: sort slugs by length DESC so "LAVENDER_BUTTERFLY" wins over "BUTTERFLY"
+    const _sortedSlugs = Object.entries(slugToAsin).sort((a, b) => b[0].length - a[0].length);
+    const _pfxUpper = ebaySku.toUpperCase() + '-';
+    let _derivedFromSlugs = 0;
+    for (const sku of _stillUncovered) {
+      const sfx = (sku.toUpperCase().startsWith(_pfxUpper)
+        ? sku.slice(ebaySku.length + 1)
+        : sku).toUpperCase();
+      for (const [slug, asin] of _sortedSlugs) {
+        if (sfx.startsWith(slug) || sfx.includes(slug)) {
           _effectiveSkuToAsin[sku] = asin;
+          _derivedFromSlugs++;
           break;
         }
       }
     }
+    if (_derivedFromSlugs > 0) console.log(`[rebuild-photos] strategy D: ${_derivedFromSlugs} SKUs resolved from slug reconstruction`);
   }
+
+  const _finalCovered = allSkus.filter(s => _effectiveSkuToAsin[s]).length;
+  console.log(`[rebuild-photos] SKU→ASIN resolution: ${_finalCovered}/${allSkus.length} covered`);
 
   const _asinImgMap = { ...asinImages }; // asin → [urls]
 
@@ -5017,9 +5071,9 @@ async function handleRebuildPhotos(body, res) {
   }
   console.log(`[rebuild-photos] rebuilt variationImages[${chosenDimName}]: ${Object.keys(_newVarImages[chosenDimName] || {}).length} values`);
 
-  // ── 6. Build PUT requests: clear old images, assign ASIN images ──────────────
+  // ── 6. Build PUT requests: assign ASIN images (preserve existing if unresolved) ─────
   const requests = [];
-  let noAsin = 0, noImages = 0;
+  let noAsin = 0, noImages = 0, preserved = 0;
 
   for (const sku of allSkus) {
     const item = inventoryItems[sku];
@@ -5028,10 +5082,23 @@ async function handleRebuildPhotos(body, res) {
     const asin = _effectiveSkuToAsin[sku];
     const imgs = asin ? (_asinImgMap[asin] || []) : [];
 
-    if (!asin) { noAsin++; }
-    else if (!imgs.length) { noImages++; console.warn(`[rebuild-photos] no images for ASIN ${asin} (SKU ${sku})`); }
+    // If we couldn't resolve the ASIN or don't have fresh images for it, SKIP the PUT
+    // entirely rather than clearing the variant's existing images. The old code would
+    // overwrite with an empty array, destroying good images whenever a reconstruction
+    // gap left a SKU unmatched.
+    if (!asin) {
+      noAsin++;
+      preserved++;
+      console.warn(`[rebuild-photos] preserving ${sku.slice(-24)} — no ASIN resolved, keeping existing images`);
+      continue;
+    }
+    if (!imgs.length) {
+      noImages++;
+      preserved++;
+      console.warn(`[rebuild-photos] preserving ${sku.slice(-24)} — ASIN ${asin} has no fresh images, keeping existing`);
+      continue;
+    }
 
-    // Always PUT — even if no new images (clears old ones)
     requests.push({
       sku,
       inventoryItem: {
@@ -5043,6 +5110,7 @@ async function handleRebuildPhotos(body, res) {
       },
     });
   }
+  console.log(`[rebuild-photos] updating ${requests.length} / preserving ${preserved} SKUs`);
 
   // ── 6. Batch PUT inventory items ─────────────────────────────────────────────
   let updated = 0, failed = 0;
@@ -6003,7 +6071,15 @@ module.exports = async (req, res) => {
       // when both are .includes() in the SKU.
       const _sortedValToAsin = Object.entries(valToAsin).sort((a, b) => b[0].length - a[0].length);
 
+      // Pre-compute the set of ASINs we have fresh data for. Variants whose ASIN isn't
+      // in this set are OUTSIDE the current fetch batch (asinOffset slice) and must be
+      // preserved as-is — touching them with cost=0 would OOS every variant beyond the
+      // first 100 on every worker cycle. The worker never advances asinOffset, so without
+      // this guard a 900-ASIN listing would flip 800 variants to qty=0 forever.
+      const _haveFreshPrice = new Set(uniqueAsins.filter(a => asinPrice[a] !== undefined));
+
       const updates = [];
+      const _skippedNoBatch = [];
       for (const [sku, offer] of Object.entries(offerMap)) {
         let asin = null;
 
@@ -6041,6 +6117,14 @@ module.exports = async (req, res) => {
           continue;
         }
 
+        // ── ACCURACY GUARD ─────────────────────────────────────────────────────
+        // If the matched ASIN is outside the current fetch batch, skip entirely.
+        // Preserves the variant's existing qty + price rather than OOSing it.
+        if (!_haveFreshPrice.has(asin)) {
+          _skippedNoBatch.push(sku);
+          continue;
+        }
+
         const cost      = asinPrice[asin] || 0;
         const inStock   = asinInStock[asin] !== false;
         const ebayPrice = cost > 0 ? applyMk(cost) : 0;
@@ -6054,6 +6138,9 @@ module.exports = async (req, res) => {
           availableQuantity: qty,
           price:             { value: putPrice.toFixed(2), currency: 'USD' },
         });
+      }
+      if (_skippedNoBatch.length > 0) {
+        console.log(`[smartSync] preserved ${_skippedNoBatch.length} variants whose ASIN is outside this batch (will be touched on a later cycle when asinOffset advances)`);
       }
 
       // ── STEP 5: Update all variants ──────────────────────────────────────────
@@ -6170,6 +6257,23 @@ module.exports = async (req, res) => {
         totalAsins: allUniqueAsins.length,
         skuToAsin: Object.keys(skuToAsin).length > 0 ? skuToAsin : undefined,
         prices: Object.fromEntries(uniqueAsins.map(a => [a, { cost: asinPrice[a]||0, inStock: asinInStock[a]!==false }])),
+        // Representative values for frontend display — use the MIN in-stock cost so the
+        // Listed view shows the cheapest available variant (matches eBay's "starting at" UX).
+        // These update p.price and p.myPrice on the product after each successful sync so
+        // the stored display values can't go stale.
+        appliedCost:  (() => {
+          const inStockCosts = uniqueAsins
+            .filter(a => asinInStock[a] !== false && asinPrice[a] > 0)
+            .map(a => asinPrice[a]);
+          if (inStockCosts.length) return Math.min(...inStockCosts);
+          // Fallback: min of ALL non-zero costs (even OOS) so we have SOMETHING sensible
+          const anyCosts = uniqueAsins.map(a => asinPrice[a]).filter(p => p > 0);
+          return anyCosts.length ? Math.min(...anyCosts) : 0;
+        })(),
+        appliedPrice: (() => {
+          const appliedPrices = updates.map(u => parseFloat(u.price.value)).filter(p => p > 0);
+          return appliedPrices.length ? Math.min(...appliedPrices) : 0;
+        })(),
       });
     }
 

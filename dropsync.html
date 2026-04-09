@@ -1992,7 +1992,17 @@ async function bulkFetchDeals(dept) {
 
         const markup = S.markup;
         const calcP = cost => { const c=parseFloat(cost)||0; return c ? Math.ceil(((c+2)*(1+markup/100)/(1-0.1335)+0.30)*100)/100 : 0; };
-        p.myPrice = calcP(p.price);
+        // FIX: if the scraped primary variant is OOS (price=0), fall back to the MIN
+        // non-zero comboPrices so myPrice reflects a real variant cost instead of being
+        // stored as $0.00 forever. Without this, bulk-imported products whose default
+        // variant was OOS at scrape time show $0.00 in the Listed view permanently.
+        let _effectiveCost = parseFloat(p.price) || 0;
+        if (_effectiveCost <= 0) {
+          const _cpVals = Object.values(p.comboPrices || {}).filter(v => parseFloat(v) > 0).map(v => parseFloat(v));
+          if (_cpVals.length) _effectiveCost = Math.min(..._cpVals);
+        }
+        if (_effectiveCost > 0 && !p.price) p.price = _effectiveCost;
+        p.myPrice = calcP(_effectiveCost);
         if (p.variations) p.variations.forEach(g => g.values.forEach(v => { if(v.price) v.myPrice=calcP(v.price); }));
 
         // AI title optimization (non-blocking)
@@ -2691,6 +2701,28 @@ function _sortProducts(prods, sortMode) {
 function renderProdRows(prods) {
   const list = $('prod-list');
   if (!list) return;
+  // Compute a display price that never shows $0.00 for a valid listing. Prefer the
+  // stored myPrice (set by smartSync's appliedPrice on every sync), but if it's 0 for
+  // any reason — stale push data, bulk-import bug, etc. — fall back to calcPrice of
+  // the effective cost, which itself falls back from p.price to min(comboPrices>0).
+  const _displayPrice = (p) => {
+    if (p.myPrice > 0) return p.myPrice;
+    let cost = parseFloat(p.price) || 0;
+    if (cost <= 0) {
+      const cp = Object.values(p.comboPrices || {}).map(v => parseFloat(v)).filter(v => v > 0);
+      if (cp.length) cost = Math.min(...cp);
+    }
+    if (cost <= 0) return 0;
+    return calcPrice(cost, p.markup);
+  };
+  const _displayCost = (p) => {
+    let cost = parseFloat(p.price) || 0;
+    if (cost <= 0) {
+      const cp = Object.values(p.comboPrices || {}).map(v => parseFloat(v)).filter(v => v > 0);
+      if (cp.length) cost = Math.min(...cp);
+    }
+    return cost;
+  };
   list.innerHTML = prods.map(p => {
     const img = p.images?.[0] || '';
     const variants = p.hasVariations ? p.variations?.reduce((sum, g) => sum + g.values.length, 0) : 1;
@@ -2751,8 +2783,8 @@ function renderProdRows(prods) {
         <div style="font-size:11px;color:var(--text3);margin-top:2px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           ${p.sourceUrl ? `<a href="${p.sourceUrl}" target="_blank" style="color:${p._source==='aliexpress'?'#ff6b00':'var(--accent)'};text-decoration:none">${p._source==='aliexpress'?'↗ AliExpress':'↗ Amazon'}</a>` : ''}
           <span>${p.asin||''}</span>
-          <span style="color:var(--green);font-family:var(--font-mono)">$${(p.myPrice||0).toFixed(2)}</span>
-          <span style="color:var(--text3);font-family:var(--font-mono)">(cost $${(p.price||0).toFixed(2)})</span>
+          <span style="color:var(--green);font-family:var(--font-mono)">$${_displayPrice(p).toFixed(2)}</span>
+          <span style="color:var(--text3);font-family:var(--font-mono)">(cost $${_displayCost(p).toFixed(2)})</span>
           <span style="display:inline-flex;align-items:center;gap:3px;background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:1px 5px" title="Markup % for this listing — overrides store default of ${S.markup||23}%">
             <span style="font-size:10px;color:var(--text3)">mkp</span>
             <input id="mkp-${p.id}" type="number" min="0" max="999" step="1" value="${p.markup||S.markup||23}"
@@ -6449,6 +6481,11 @@ async function smartSyncProduct(p) {
     // Save next ASIN offset for progressive slicing (large products)
     p._asinOffset = d.nextAsinOffset || 0;
     if (d.nextAsinOffset > 0) console.log(`[smartSync] ${p.ebaySku?.slice(-10)} → next cycle: ASINs from offset ${d.nextAsinOffset}/${d.totalAsins}`);
+    // Persist representative cost/price so the Listed view reflects the latest sync
+    // instead of the stale push-time value. Without this, bulk imports whose primary
+    // variant was OOS at scrape time would show $0.00 forever.
+    if (typeof d.appliedCost === 'number' && d.appliedCost > 0) p.price = d.appliedCost;
+    if (typeof d.appliedPrice === 'number' && d.appliedPrice > 0) p.myPrice = d.appliedPrice;
     if (d.freshData) {
       const fd = d.freshData;
       if (fd.comboAsin   && Object.keys(fd.comboAsin).length)   p.comboAsin   = fd.comboAsin;

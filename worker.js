@@ -172,6 +172,11 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       markup,
       handlingCost,
       quantity:      product.quantity || 1,
+      // ACCURACY: advance ASIN batch window across worker cycles so large listings
+      // (>100 ASINs) eventually touch every variant. Without this the worker would
+      // only ever fetch ASINs 0-99 and smartSync would preserve (but never update)
+      // everything beyond that.
+      asinOffset:         parseInt(product._asinOffset || 0) || 0,
       skuToAsin:          skuToAsin && Object.keys(skuToAsin).length <= 500 ? skuToAsin : null,
       cachedOfferIds:     product.offerIdCache && Object.keys(product.offerIdCache).length <= 500 ? product.offerIdCache : null,
       comboAsin:                  (_scraped?.comboAsin         || product.comboAsin)         || null,
@@ -220,6 +225,24 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       status:        'listed',
       ebayListingId: product.ebayListingId || null,
     });
+
+    // Persist fresh display values back to the product. Combines the advancing ASIN
+    // batch window (nextAsinOffset) with the representative cost/price returned by
+    // smartSync so the Listed view never shows stale $0.00 pricing. One upsert avoids
+    // race conditions with the worker's next iteration.
+    const _patch = {};
+    if (typeof data.nextAsinOffset === 'number' && data.nextAsinOffset !== (product._asinOffset || 0)) {
+      _patch._asinOffset = data.nextAsinOffset;
+    }
+    if (typeof data.appliedCost === 'number' && data.appliedCost > 0) {
+      _patch.price = data.appliedCost;
+    }
+    if (typeof data.appliedPrice === 'number' && data.appliedPrice > 0) {
+      _patch.myPrice = data.appliedPrice;
+    }
+    if (Object.keys(_patch).length > 0) {
+      await db.upsertProduct({ ...product, ..._patch });
+    }
 
     if (result.wentOos) {
       await db.addLog('sync', `OOS: ${(product.title||'').slice(0,50)}`, `${synced} offers updated`, { productId: product.id });
