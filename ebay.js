@@ -6019,18 +6019,51 @@ module.exports = async (req, res) => {
       console.log(`[smartSync] ${normSku} — ${sourceUrl}`);
 
       // ── STEP 1: Scrape Amazon parent page ─────────────────────────────────
+      // If the parent scrape fails (Amazon block, rate limit, network error), we
+      // DO NOT bail out — the purpose of sync is to make eBay match Amazon's
+      // dictated state, so we need to keep going even when the parent page is
+      // unavailable. The frontend/worker already sends `comboAsin` and
+      // `fallbackComboPrices` as a backup ASIN source derived from the last
+      // successful scrape, so we use those to build the ASIN list and proceed
+      // to per-ASIN fetching. Only genuinely-unreachable ASINs end up as
+      // force-OOS via the fetchFailed path in STEP 2.
       const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
-      if (!html || html.length < 5000)
-        return res.json({ success: false, error: 'Amazon blocked or no HTML', skippable: true });
+      const _parentHtmlOk = !!(html && html.length >= 5000);
 
-      // Extract unique ASINs from dimensionToAsinMap
-      // Window widened to 200k chars to cover listings with 900+ ASIN entries
-      const dtaM = html.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/);
+      // Extract unique ASINs from the parent page's dimensionToAsinMap.
+      // Window widened to 200k chars to cover listings with 900+ ASIN entries.
       let dta = {};
-      try { dta = JSON.parse(dtaM?.[1] || '{}'); } catch(e) {}
-      const allUniqueAsins = [...new Set(Object.values(dta))].filter(Boolean);
+      if (_parentHtmlOk) {
+        const dtaM = html.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/);
+        try { dta = JSON.parse(dtaM?.[1] || '{}'); } catch(e) {}
+      }
+      let allUniqueAsins = [...new Set(Object.values(dta))].filter(Boolean);
+
+      // FALLBACK: if parent scrape failed OR the twister data was malformed,
+      // use the stored comboAsin from the body (sent by frontend/worker as
+      // the last known-good Amazon mapping). This lets sync still push fresh
+      // per-ASIN prices even when Amazon is blocking the parent page.
+      if (!allUniqueAsins.length && body.comboAsin && typeof body.comboAsin === 'object') {
+        const _fallbackAsins = [...new Set(Object.values(body.comboAsin))].filter(Boolean);
+        if (_fallbackAsins.length > 0) {
+          allUniqueAsins = _fallbackAsins;
+          console.log(`[smartSync] parent scrape ${_parentHtmlOk ? 'returned no dta' : 'BLOCKED'} — falling back to body.comboAsin (${allUniqueAsins.length} ASINs)`);
+        }
+      }
       const _urlAsin = sourceUrl.match(/\/dp\/([A-Z0-9]{10})/)?.[1];
       if (!allUniqueAsins.length && _urlAsin) allUniqueAsins.push(_urlAsin);
+
+      // Only bail if we have absolutely nothing to sync — no fresh parent data
+      // AND no stored comboAsin AND no URL ASIN. In that case there's literally
+      // nothing we can fetch.
+      if (!allUniqueAsins.length) {
+        return res.json({
+          success: false,
+          error: 'Amazon parent scrape blocked and no fallback comboAsin available — cannot determine ASIN list',
+          skippable: true,
+          parentHtmlOk: _parentHtmlOk,
+        });
+      }
 
       // ── Progressive slicing — 100 ASINs per cycle ─────────────────────────────
       // Large products (147, 900 ASINs) spread across multiple sync cycles.
@@ -6143,7 +6176,7 @@ module.exports = async (req, res) => {
       }
 
       // Step 3d: if still 0 offers, try method 4 (predict SKUs from dta + hash)
-      if (Object.keys(offerMap).length === 0 && Object.keys(dta).length > 0) {
+      if (Object.keys(offerMap).length === 0 && Object.keys(dta).length > 0 && html) {
         const vvM3 = html.match(/"variationValues"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
         let vv3 = {};
         try { vv3 = JSON.parse(vvM3?.[1] || '{}'); } catch(e) {}
@@ -6174,9 +6207,12 @@ module.exports = async (req, res) => {
       // Method B: variationValues + dta → displayValue→ASIN map
       // Method C: inventory item aspects → displayValue lookup
 
-      const vvM2 = html.match(/"variationValues"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
+      // Guard html.match — parent scrape may have failed (we're now in fallback mode)
       let vv2 = {};
-      try { vv2 = JSON.parse(vvM2?.[1] || '{}'); } catch(e) {}
+      if (html) {
+        const vvM2 = html.match(/"variationValues"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
+        try { vv2 = JSON.parse(vvM2?.[1] || '{}'); } catch(e) {}
+      }
 
       // CRITICAL: Read the authoritative dimension order from Amazon's "dimensions"
       // array. Object.keys(vv2) cannot be trusted — on many listings (e.g. LIANLAM
@@ -6185,9 +6221,15 @@ module.exports = async (req, res) => {
       // keys ("0_1", "1_0", ...) are ALWAYS ordered per the `dimensions` array, so
       // using the wrong key order silently swaps color and size on every variant
       // and produces completely wrong SKU→ASIN mappings.
-      const _dimOrderM = html.match(/"dimensions"\s*:\s*(\[[^\]]{0,400}\])/);
       let _dimOrder = [];
-      try { _dimOrder = JSON.parse(_dimOrderM?.[1] || '[]'); } catch(e) {}
+      if (html) {
+        const _dimOrderM = html.match(/"dimensions"\s*:\s*(\[[^\]]{0,400}\])/);
+        try { _dimOrder = JSON.parse(_dimOrderM?.[1] || '[]'); } catch(e) {}
+      }
+      // Fallback: use fallbackVariations from body to infer dim names when parent is blocked
+      if (!_dimOrder.length && Array.isArray(body.fallbackVariations) && body.fallbackVariations.length > 0) {
+        _dimOrder = body.fallbackVariations.map(v => String(v.name||'').toLowerCase().replace(/\s+/g, '_')).filter(Boolean);
+      }
       const _authDimKeys = (_dimOrder.length ? _dimOrder : Object.keys(vv2))
         .filter(k => Array.isArray(vv2[k]) && vv2[k].length > 0);
 
@@ -6207,7 +6249,20 @@ module.exports = async (req, res) => {
           }
         }
       }
-      console.log(`[smartSync] valToAsin: ${Object.keys(valToAsin).length} entries, skuToAsin: ${Object.keys(skuToAsin).length} entries, dimOrder: [${_authDimKeys.join(',')}]`);
+      // Fallback: if dta was empty (parent blocked), also populate valToAsin from
+      // body.comboAsin keys. comboAsin keys are already in "PrimVal|SecVal" form,
+      // so we can slice out each dim value and map to the ASIN.
+      if (Object.keys(valToAsin).length === 0 && body.comboAsin && typeof body.comboAsin === 'object') {
+        for (const [comboKey, asin] of Object.entries(body.comboAsin)) {
+          if (!asin) continue;
+          const parts = String(comboKey).split(/\s*\|\s*|\s*\/\s*/).map(s => s.trim()).filter(Boolean);
+          for (const p of parts) {
+            const k = p.toLowerCase();
+            if (k && !valToAsin[k]) valToAsin[k] = asin;
+          }
+        }
+      }
+      console.log(`[smartSync] valToAsin: ${Object.keys(valToAsin).length} entries, skuToAsin: ${Object.keys(skuToAsin).length} entries, dimOrder: [${_authDimKeys.join(',')}]${!html ? ' (parent BLOCKED, using fallback)' : ''}`);
 
       // Reconstruct skuToAsin from dta + variationValues + offer SKU suffixes for any SKUs
       // not already covered by Method A. This is needed for old listings whose variant SKUs
@@ -6219,7 +6274,11 @@ module.exports = async (req, res) => {
       for (const sku of Object.keys(offerMap)) {
         if (!skuToAsin[sku]) _needsRecon.add(sku);
       }
-      if (_needsRecon.size > 0 && Object.keys(dta).length > 0 && _authDimKeys.length > 0) {
+      // Reconstruction path 1: use parent's dta + vv2 (most accurate when available)
+      // Reconstruction path 2: use body.comboAsin directly (fallback when parent blocked)
+      const _canReconFromDta = Object.keys(dta).length > 0 && _authDimKeys.length > 0;
+      const _canReconFromCombo = body.comboAsin && typeof body.comboAsin === 'object' && Object.keys(body.comboAsin).length > 0;
+      if (_needsRecon.size > 0 && (_canReconFromDta || _canReconFromCombo)) {
         const _slug = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
         // Use the authoritative dim key order parsed from Amazon's "dimensions" array,
         // NOT Object.keys(vv2). See the big comment above — getting this wrong silently
@@ -6232,6 +6291,8 @@ module.exports = async (req, res) => {
         // order than Amazon (e.g. Amazon "color_name, size_name" vs eBay SKU
         // "SIZE_COLOR" or "COLOR_SIZE"). We accept both directions.
         const slugToAsinReversed = {};
+        // Path 1: parent dta iteration
+        if (_canReconFromDta) {
         for (const [idx, asin] of Object.entries(dta)) {
           const parts = String(idx).split('_');
           const vals = _dimKeys.map((k, ki) => {
@@ -6259,6 +6320,33 @@ module.exports = async (req, res) => {
             }
           }
         }
+        } // end path 1 (_canReconFromDta)
+
+        // Path 2: body.comboAsin fallback — runs in addition to path 1 so stored
+        // combo entries fill any gaps the parent-scrape-based path couldn't cover
+        // (and is the ONLY source when parent is blocked).
+        if (_canReconFromCombo) {
+          for (const [comboKey, asin] of Object.entries(body.comboAsin)) {
+            if (!asin) continue;
+            // comboKey format from scraper: "PrimVal|SecVal" or "PrimVal|SecVal / Size"
+            const rawParts = String(comboKey).split(/\s*\|\s*|\s*\/\s*/).map(s => s.trim()).filter(Boolean);
+            if (rawParts.length === 0) continue;
+            // Full compound slug
+            const fullSlug = rawParts.map(_slug).join('_');
+            if (fullSlug && !slugToAsin[fullSlug]) slugToAsin[fullSlug] = asin;
+            // Reversed slug
+            if (rawParts.length > 1) {
+              const revSlug = rawParts.slice().reverse().map(_slug).join('_');
+              if (revSlug && !slugToAsinReversed[revSlug]) slugToAsinReversed[revSlug] = asin;
+            }
+            // Primary-dim-only (last resort)
+            if (rawParts.length > 1) {
+              const primary = _slug(rawParts[0]);
+              if (primary && !slugToAsin[primary]) slugToAsin[primary] = asin;
+            }
+          }
+        }
+
         // CRITICAL: sort slugs by length DESCENDING so the most specific slug matches first.
         // Without this, "BUTTERFLY" can match a variant whose actual color is "LAVENDER BUTTERFLY"
         // because both .includes() the substring — whichever is iterated first wins.
@@ -6282,7 +6370,7 @@ module.exports = async (req, res) => {
             }
           }
         }
-        console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}])`);
+        console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}]${_canReconFromCombo?' +comboAsin fallback':''})`);
         // Stash the sorted slug map for aspect-based reconstruction below
         global.__smartSyncSlugMap = _sortedSlugs;
         global.__smartSyncSlug    = _slug;
