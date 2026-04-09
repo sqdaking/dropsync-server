@@ -6102,15 +6102,36 @@ module.exports = async (req, res) => {
       let vv2 = {};
       try { vv2 = JSON.parse(vvM2?.[1] || '{}'); } catch(e) {}
 
-      // Build displayValue → ASIN (case-insensitive) from variationValues
+      // CRITICAL: Read the authoritative dimension order from Amazon's "dimensions"
+      // array. Object.keys(vv2) cannot be trusted — on many listings (e.g. LIANLAM
+      // rugs B0G3NJ2L3Z) `variationValues` is serialized as {size_name,color_name}
+      // while `dimensions` says ["color_name","size_name"]. The `dimensionToAsinMap`
+      // keys ("0_1", "1_0", ...) are ALWAYS ordered per the `dimensions` array, so
+      // using the wrong key order silently swaps color and size on every variant
+      // and produces completely wrong SKU→ASIN mappings.
+      const _dimOrderM = html.match(/"dimensions"\s*:\s*(\[[^\]]{0,400}\])/);
+      let _dimOrder = [];
+      try { _dimOrder = JSON.parse(_dimOrderM?.[1] || '[]'); } catch(e) {}
+      const _authDimKeys = (_dimOrder.length ? _dimOrder : Object.keys(vv2))
+        .filter(k => Array.isArray(vv2[k]) && vv2[k].length > 0);
+
+      // Build valToAsin directly from dimensionToAsinMap entries, using the correct
+      // dim key order. For each "idx0_idx1" entry, look up vv2[dimKey][idx] for each
+      // dimension position. This replaces the old code which did `dta[String(idx)]`
+      // where `idx` was a single digit — that only worked for single-dim products.
       const valToAsin = {};
-      for (const vals of Object.values(vv2)) {
-        for (const [idx, val] of (Array.isArray(vals) ? vals : []).entries()) {
-          const asin = dta[String(idx)];
-          if (asin && val) valToAsin[String(val).toLowerCase()] = asin;
+      for (const [dtaKey, asin] of Object.entries(dta || {})) {
+        if (!asin) continue;
+        const parts = String(dtaKey).split('_');
+        for (let pi = 0; pi < _authDimKeys.length && pi < parts.length; pi++) {
+          const dimKey = _authDimKeys[pi];
+          const val    = (vv2[dimKey] || [])[parseInt(parts[pi]) || 0];
+          if (val && !valToAsin[String(val).toLowerCase()]) {
+            valToAsin[String(val).toLowerCase()] = asin;
+          }
         }
       }
-      console.log(`[smartSync] valToAsin: ${Object.keys(valToAsin).length} entries, skuToAsin: ${Object.keys(skuToAsin).length} entries`);
+      console.log(`[smartSync] valToAsin: ${Object.keys(valToAsin).length} entries, skuToAsin: ${Object.keys(skuToAsin).length} entries, dimOrder: [${_authDimKeys.join(',')}]`);
 
       // Reconstruct skuToAsin from dta + variationValues + offer SKU suffixes for any SKUs
       // not already covered by Method A. This is needed for old listings whose variant SKUs
@@ -6122,12 +6143,19 @@ module.exports = async (req, res) => {
       for (const sku of Object.keys(offerMap)) {
         if (!skuToAsin[sku]) _needsRecon.add(sku);
       }
-      if (_needsRecon.size > 0 && Object.keys(dta).length > 0 && Object.keys(vv2).length > 0) {
+      if (_needsRecon.size > 0 && Object.keys(dta).length > 0 && _authDimKeys.length > 0) {
         const _slug = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
-        const _dimKeys = Object.keys(vv2);
+        // Use the authoritative dim key order parsed from Amazon's "dimensions" array,
+        // NOT Object.keys(vv2). See the big comment above — getting this wrong silently
+        // swaps color/size on every variant.
+        const _dimKeys = _authDimKeys;
         // Build slug → ASIN from dta. For each dimensionToAsinMap entry, take the
         // combination of dim values it points to and slugify them.
         const slugToAsin = {};
+        // Also build reversed-order slugs — eBay SKUs may store dims in a different
+        // order than Amazon (e.g. Amazon "color_name, size_name" vs eBay SKU
+        // "SIZE_COLOR" or "COLOR_SIZE"). We accept both directions.
+        const slugToAsinReversed = {};
         for (const [idx, asin] of Object.entries(dta)) {
           const parts = String(idx).split('_');
           const vals = _dimKeys.map((k, ki) => {
@@ -6135,20 +6163,34 @@ module.exports = async (req, res) => {
             return arr[parseInt(parts[ki] ?? parts[0]) || 0] || '';
           }).filter(Boolean);
           if (vals.length) {
-            // Full slug (all dims joined) — most specific
+            // Full slug (all dims joined in Amazon's order) — most specific
             const slug = vals.map(_slug).join('_');
             if (slug) slugToAsin[slug] = asin;
+            // Reversed-order slug — for eBay SKUs that flipped dim order at push time
+            if (vals.length > 1) {
+              const revSlug = vals.slice().reverse().map(_slug).join('_');
+              if (revSlug && !slugToAsinReversed[revSlug]) slugToAsinReversed[revSlug] = asin;
+            }
             // Primary-dim-only slug — fallback for SKUs that hashed/truncated the secondary dim
             if (vals.length > 1) {
               const primary = _slug(vals[0]);
               if (primary && !slugToAsin[primary]) slugToAsin[primary] = asin;
+              // Also secondary-only, but only as a last-resort (lowest priority)
+              const secondary = _slug(vals[1]);
+              if (secondary && !slugToAsin[secondary] && !slugToAsinReversed[secondary]) {
+                slugToAsinReversed[secondary] = asin;
+              }
             }
           }
         }
         // CRITICAL: sort slugs by length DESCENDING so the most specific slug matches first.
         // Without this, "BUTTERFLY" can match a variant whose actual color is "LAVENDER BUTTERFLY"
         // because both .includes() the substring — whichever is iterated first wins.
-        const _sortedSlugs = Object.entries(slugToAsin).sort((a, b) => b[0].length - a[0].length);
+        // Primary (Amazon-order) slugs take precedence over reversed-order slugs.
+        const _sortedSlugs = [
+          ...Object.entries(slugToAsin),
+          ...Object.entries(slugToAsinReversed),
+        ].sort((a, b) => b[0].length - a[0].length);
         const _pfxUpper = normSku.toUpperCase() + '-';
         let _reconHits = 0;
         for (const sku of _needsRecon) {
@@ -6164,12 +6206,21 @@ module.exports = async (req, res) => {
             }
           }
         }
-        console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs (${Object.keys(offerMap).length} total)`);
+        console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}])`);
+        // Stash the sorted slug map for aspect-based reconstruction below
+        global.__smartSyncSlugMap = _sortedSlugs;
+        global.__smartSyncSlug    = _slug;
       }
 
-      // GET inventory item aspects for aspect-based matching (only if valToAsin is empty)
+      // GET inventory item aspects — ALWAYS, not just when valToAsin is empty. We
+      // use aspects to disambiguate truncated/hashed SKUs that the slug reconstruction
+      // could only match via primary-only fallback (e.g. "CHOCOLATE_10_X_14__9EBE3186"
+      // only matches the "CHOCOLATE" primary slug and grabs the first Chocolate ASIN,
+      // which is invariably the 2'x3' variant — cheapest, smallest). With aspects
+      // available we build a compound slug from aspect values and look up the exact
+      // variant.
       const skuAspects = {};
-      if (Object.keys(valToAsin).length === 0) {
+      {
         const offerSkus = Object.keys(offerMap);
         for (let i = 0; i < offerSkus.length; i += 25) {
           const batch = offerSkus.slice(i, i + 25);
@@ -6187,6 +6238,63 @@ module.exports = async (req, res) => {
         }
       }
 
+      // Aspect-based compound-slug upgrade: for every SKU (including ones already
+      // matched above via primary-only fallback), try to build a compound slug from
+      // its aspects and look it up. If it resolves to a different ASIN than the
+      // primary-only match, prefer the aspect match — it's strictly more specific.
+      if (Object.keys(skuAspects).length > 0 && global.__smartSyncSlugMap) {
+        const _slug = global.__smartSyncSlug;
+        const _slugMap = Object.fromEntries(global.__smartSyncSlugMap);
+        let _aspectUpgrades = 0;
+        let _aspectNewMatches = 0;
+        for (const sku of Object.keys(offerMap)) {
+          const aspects = skuAspects[sku];
+          if (!aspects || Object.keys(aspects).length === 0) continue;
+          // Flatten all aspect values (e.g. Color=['Chocolate'], Size=['10\' x 14\' (Rectangular)'])
+          const aspectVals = [];
+          for (const vals of Object.values(aspects)) {
+            for (const v of (Array.isArray(vals) ? vals : [vals])) {
+              if (v && typeof v === 'string') aspectVals.push(v);
+            }
+          }
+          if (aspectVals.length === 0) continue;
+          // Try every permutation of 2 values (covers color-first + size-first orderings)
+          // For compound keys with 2+ parts, we generate both orderings.
+          let _bestAsin = null;
+          if (aspectVals.length >= 2) {
+            // Build both orderings of the first two aspect values
+            const slugs = [
+              aspectVals.map(_slug).join('_'),                       // all aspects in object order
+              aspectVals.slice().reverse().map(_slug).join('_'),     // reversed
+              [aspectVals[0], aspectVals[1]].map(_slug).join('_'),   // first two only
+              [aspectVals[1], aspectVals[0]].map(_slug).join('_'),   // first two reversed
+            ];
+            for (const s of slugs) {
+              if (_slugMap[s]) { _bestAsin = _slugMap[s]; break; }
+            }
+          }
+          // Fallback: single aspect value direct lookup
+          if (!_bestAsin) {
+            for (const v of aspectVals) {
+              const s = _slug(v);
+              if (_slugMap[s]) { _bestAsin = _slugMap[s]; break; }
+            }
+          }
+          if (_bestAsin) {
+            if (!skuToAsin[sku]) {
+              skuToAsin[sku] = _bestAsin;
+              _aspectNewMatches++;
+            } else if (skuToAsin[sku] !== _bestAsin) {
+              skuToAsin[sku] = _bestAsin;
+              _aspectUpgrades++;
+            }
+          }
+        }
+        console.log(`[smartSync] aspect-slug upgrade: ${_aspectUpgrades} corrected, ${_aspectNewMatches} new matches (from ${Object.keys(skuAspects).length} SKUs with aspects)`);
+        delete global.__smartSyncSlugMap;
+        delete global.__smartSyncSlug;
+      }
+
       // Pre-sort valToAsin entries by key length desc — same reason as the reconstruction
       // path: longer values must be checked first so "lavender butterfly" wins over "butterfly"
       // when both are .includes() in the SKU.
@@ -6201,6 +6309,7 @@ module.exports = async (req, res) => {
 
       const updates = [];
       const _skippedNoBatch = [];
+      const _orphanedSkus = [];
       for (const [sku, offer] of Object.entries(offerMap)) {
         let asin = null;
 
@@ -6232,9 +6341,26 @@ module.exports = async (req, res) => {
         // Last resort: single ASIN product
         if (!asin && uniqueAsins.length === 1) asin = uniqueAsins[0];
 
-        // If still no ASIN match — skip this variant, don't touch it
+        // If still no ASIN match — this is an ORPHAN variant: it exists on eBay but
+        // no longer corresponds to any ASIN on the current Amazon parent page. This
+        // commonly happens when Amazon consolidates/removes colors or sizes. The old
+        // behavior was to `continue` and preserve whatever stale price was there,
+        // which meant orphan variants would keep selling at wrong prices indefinitely
+        // (e.g. a 2'x6' runner priced at $278.71 because historical sync assigned
+        // the 10'x14' cost by accident). Force qty=0 so the variant is un-sellable,
+        // keep the existing price (eBay requires > 0). The user can re-push to drop
+        // orphans entirely, or the variant will simply stop being offered.
         if (!asin) {
-          console.log(`[smartSync] ${sku.slice(-20)} → no ASIN match, skipping`);
+          _orphanedSkus.push(sku);
+          const preservePrice = offer.currentPrice > 0 ? offer.currentPrice : 1;
+          console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match on current Amazon parent), forcing qty=0 price=$${preservePrice}`);
+          updates.push({
+            offerId:           offer.offerId,
+            sku,
+            availableQuantity: 0,
+            price:             { value: preservePrice.toFixed(2), currency: 'USD' },
+            _orphan:           true,
+          });
           continue;
         }
 
@@ -6262,6 +6388,9 @@ module.exports = async (req, res) => {
       }
       if (_skippedNoBatch.length > 0) {
         console.log(`[smartSync] preserved ${_skippedNoBatch.length} variants whose ASIN is outside this batch (will be touched on a later cycle when asinOffset advances)`);
+      }
+      if (_orphanedSkus.length > 0) {
+        console.log(`[smartSync] forced OOS on ${_orphanedSkus.length} orphan variants: ${_orphanedSkus.slice(0,5).map(s => s.slice(-24)).join(', ')}${_orphanedSkus.length > 5 ? '…' : ''}`);
       }
 
       // ── STEP 5: Update all variants ──────────────────────────────────────────
@@ -6374,6 +6503,8 @@ module.exports = async (req, res) => {
 
       return res.json({
         success: true, synced: okCount, failed: failCount,
+        orphanedCount: _orphanedSkus.length,
+        orphanedSkus:  _orphanedSkus.length > 0 ? _orphanedSkus.slice(0, 20) : undefined,
         nextAsinOffset,
         totalAsins: allUniqueAsins.length,
         skuToAsin: Object.keys(skuToAsin).length > 0 ? skuToAsin : undefined,
@@ -6392,7 +6523,12 @@ module.exports = async (req, res) => {
           return anyCosts.length ? Math.min(...anyCosts) : 0;
         })(),
         appliedPrice: (() => {
-          const appliedPrices = updates.map(u => parseFloat(u.price.value)).filter(p => p > 0);
+          // Exclude orphan force-OOS updates from the representative price calc —
+          // orphans carry stale/wrong prices and would pollute the "starting at" value.
+          const appliedPrices = updates
+            .filter(u => !u._orphan)
+            .map(u => parseFloat(u.price.value))
+            .filter(p => p > 0);
           return appliedPrices.length ? Math.min(...appliedPrices) : 0;
         })(),
       });
