@@ -5039,6 +5039,63 @@ async function handleRebuildPhotos(body, res) {
     if (_derivedFromSlugs > 0) console.log(`[rebuild-photos] strategy D: ${_derivedFromSlugs} SKUs resolved from slug reconstruction`);
   }
 
+  // Strategy E: aspect-based matching — the strongest fallback for truncated/hashed SKUs.
+  // Reads the Color/Size/Fit_type/etc. aspects directly from each SKU's inventory item
+  // and finds a comboAsin entry whose compound key contains ALL the aspect values. This
+  // works regardless of how the SKU string is formatted because we never parse the SKU
+  // text — we rely on eBay's structured aspect data which is always correctly keyed.
+  const _stillUncoveredE = _needsRecon();
+  if (_stillUncoveredE.length > 0 && Object.keys(_comboAsinBody).length > 0) {
+    // Build: list of { asin, parts } where parts is the set of normalized sub-values
+    // from the comboKey (splitting on both `|` and ` / `). Sorted by total length so
+    // more-specific compound keys win over less-specific ones.
+    const _comboParts = Object.entries(_comboAsinBody)
+      .filter(([, asin]) => asin)
+      .map(([key, asin]) => {
+        const parts = key.split(/\s*\|\s*|\s*\/\s*/)
+          .map(p => (p||'').toLowerCase().trim())
+          .filter(Boolean);
+        return { key, asin, parts, totalLen: parts.reduce((s,p) => s + p.length, 0) };
+      })
+      .sort((a, b) => b.totalLen - a.totalLen);
+
+    const _norm = s => (s||'').toLowerCase().trim();
+    const _normFuzzy = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+    let _derivedFromAspectsE = 0;
+    for (const sku of _stillUncoveredE) {
+      const item = inventoryItems[sku];
+      const aspects = item?.product?.aspects || {};
+      // Collect all aspect values as a flat set (lowercase)
+      const aspectVals = new Set();
+      const aspectValsFuzzy = new Set();
+      for (const v of Object.values(aspects)) {
+        for (const val of (Array.isArray(v) ? v : [v])) {
+          const n = _norm(val);
+          if (n) aspectVals.add(n);
+          const f = _normFuzzy(val);
+          if (f) aspectValsFuzzy.add(f);
+        }
+      }
+      if (aspectVals.size === 0) continue;
+
+      // Find the comboAsin entry whose parts are ALL represented in aspectVals (direct
+      // match first, fuzzy fallback for compound values like "3X-Large" vs "3XL").
+      let best = null;
+      for (const cp of _comboParts) {
+        if (cp.parts.length === 0) continue;
+        const allDirect = cp.parts.every(p => aspectVals.has(p));
+        const allFuzzy  = !allDirect && cp.parts.every(p => aspectValsFuzzy.has(_normFuzzy(p)));
+        if (allDirect || allFuzzy) { best = cp; break; }
+      }
+      if (best) {
+        _effectiveSkuToAsin[sku] = best.asin;
+        _derivedFromAspectsE++;
+      }
+    }
+    if (_derivedFromAspectsE > 0) console.log(`[rebuild-photos] strategy E: ${_derivedFromAspectsE} SKUs resolved from inventory aspects`);
+  }
+
   const _finalCovered = allSkus.filter(s => _effectiveSkuToAsin[s]).length;
   console.log(`[rebuild-photos] SKU→ASIN resolution: ${_finalCovered}/${allSkus.length} covered`);
 
@@ -5061,44 +5118,81 @@ async function handleRebuildPhotos(body, res) {
   // ── 5. Build variationImages keyed by chosenDim from asinImages + skuToAsin ───
   // This lets the frontend update its stored product so future operations use the right dim
   const _newVarImages = {}; // { chosenDimName: { "Black": [url,...], "Navy": [...] } }
-  const _comboAsin = body.comboAsin || {}; // { "FitType|Color": asin, ... }
+  const _comboAsin = body.comboAsin || {}; // { "FitType|Color / Size": asin, ... }
 
+  // Collect the set of KNOWN values for the chosen dimension. We use these to
+  // identify which part of a comboKey corresponds to chosenDim, instead of
+  // relying on positional lookup (which is broken when comboKey ordering
+  // doesn't match _allDimNames ordering — e.g. comboKey="FitType|Color / Size"
+  // but _primaryDimName="Color" puts Color at index 0 and extracts "FitType").
+  const _chosenDimVariation = (variations || []).find(v => v.name === chosenDimName);
+  const _chosenDimValues = new Set((_chosenDimVariation?.values || []).map(v => (v.value || '').toLowerCase().trim()));
+  // Also build a normalized lookup that ignores whitespace/punct for fuzzy matching
+  const _chosenDimValuesNorm = new Map();
+  for (const v of (_chosenDimVariation?.values || [])) {
+    const raw = (v.value || '').trim();
+    if (raw) _chosenDimValuesNorm.set(raw.toLowerCase().replace(/[^a-z0-9]/g, ''), raw);
+  }
+
+  // Helper: given a comboKey, find the sub-part that matches a known value of chosenDim
+  const _extractDimValFromCombo = (comboKey) => {
+    // Split the whole key by both `|` and ` / ` — gets all possible sub-values.
+    // "Seamless|Grey / 3X-Large" → ["Seamless", "Grey", "3X-Large"]
+    const rawParts = comboKey.split(/\s*\|\s*|\s*\/\s*/).map(s => s.trim()).filter(Boolean);
+    // Direct match
+    for (const part of rawParts) {
+      if (_chosenDimValues.has(part.toLowerCase())) return part;
+    }
+    // Normalized fuzzy match (strips punctuation/whitespace)
+    for (const part of rawParts) {
+      const norm = part.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (_chosenDimValuesNorm.has(norm)) return _chosenDimValuesNorm.get(norm);
+    }
+    return null;
+  };
+
+  let _comboMatched = 0, _comboUnmatched = 0;
   for (const [comboKey, asin] of Object.entries(_comboAsin || {})) {
     if (!asin || !_asinImgMap[asin]?.length) continue;
-    const parts = comboKey.split('|');
-    // Find which part matches the chosen dim by position in _allDimNames
-    // comboKey format: "PrimVal|SecVal" — map dim index to part index
-    // chosenDimPos relative to all dims (0=prim, 1=sec, 2=extra)
-    const chosenDimPos = _allDimNames.indexOf(chosenDimName);
-    const dimVal = parts[chosenDimPos] || parts[parts.length - 1] || '';
-    if (!dimVal) continue;
+    const dimVal = _extractDimValFromCombo(comboKey);
+    if (!dimVal) { _comboUnmatched++; continue; }
     if (!_newVarImages[chosenDimName]) _newVarImages[chosenDimName] = {};
     if (!_newVarImages[chosenDimName][dimVal]) {
       _newVarImages[chosenDimName][dimVal] = _asinImgMap[asin].slice(0, 6);
     }
+    _comboMatched++;
   }
-  // Also fill from skuToAsin if comboAsin didn't cover everything
+  // Also fill from skuToAsin + inventory-item aspects if comboAsin didn't cover
+  let _aspectMatched = 0;
   for (const [sku, asin] of Object.entries(_effectiveSkuToAsin)) {
     if (!asin || !_asinImgMap[asin]?.length) continue;
-    // Try to extract chosen dim value from inventory item aspects
     const item = inventoryItems[sku];
     const aspects = item?.product?.aspects || {};
-    const dimVal = (aspects[chosenDimName] || [])[0];
+    // Try exact dim name, then lowercase, then underscore variants
+    const dimVal = (aspects[chosenDimName] || aspects[chosenDimName.toLowerCase()] || aspects[chosenDimName.replace(/_/g, ' ')] || [])[0];
     if (!dimVal) continue;
     if (!_newVarImages[chosenDimName]) _newVarImages[chosenDimName] = {};
     if (!_newVarImages[chosenDimName][dimVal]) {
       _newVarImages[chosenDimName][dimVal] = _asinImgMap[asin].slice(0, 6);
+      _aspectMatched++;
     }
   }
-  console.log(`[rebuild-photos] rebuilt variationImages[${chosenDimName}]: ${Object.keys(_newVarImages[chosenDimName] || {}).length} values`);
+  console.log(`[rebuild-photos] rebuilt variationImages[${chosenDimName}]: ${Object.keys(_newVarImages[chosenDimName] || {}).length} values (combo ${_comboMatched}/${Object.keys(_comboAsin).length} matched, ${_comboUnmatched} unmatched, +${_aspectMatched} from aspects)`);
 
   // ── 6. Build PUT requests: assign ASIN images (preserve existing if unresolved) ─────
   const requests = [];
-  let noAsin = 0, noImages = 0, preserved = 0;
+  let noAsin = 0, noImages = 0, noItem = 0, preserved = 0;
 
   for (const sku of allSkus) {
     const item = inventoryItems[sku];
-    if (!item) continue;
+    // Surface SKUs whose inventory_item fetch failed — previously these were silently dropped,
+    // making the endpoint report updated:0 with no explanation for the vanishing variants.
+    if (!item) {
+      noItem++;
+      preserved++;
+      console.warn(`[rebuild-photos] preserving ${sku.slice(-24)} — bulk_get_inventory_item had no data`);
+      continue;
+    }
 
     const asin = _effectiveSkuToAsin[sku];
     const imgs = asin ? (_asinImgMap[asin] || []) : [];
@@ -5131,7 +5225,7 @@ async function handleRebuildPhotos(body, res) {
       },
     });
   }
-  console.log(`[rebuild-photos] updating ${requests.length} / preserving ${preserved} SKUs`);
+  console.log(`[rebuild-photos] updating ${requests.length} / preserving ${preserved} SKUs (noItem=${noItem}, noAsin=${noAsin}, noImages=${noImages})`);
 
   // ── 6. Batch PUT inventory items ─────────────────────────────────────────────
   let updated = 0, failed = 0;
@@ -5213,7 +5307,7 @@ async function handleRebuildPhotos(body, res) {
     } catch(e) { console.warn('[rebuild-photos] re-publish error:', e.message); }
   }
 
-  console.log(`[rebuild-photos] done — updated=${updated} failed=${failed} noAsin=${noAsin} noImages=${noImages}`);
+  console.log(`[rebuild-photos] done — updated=${updated} failed=${failed} noAsin=${noAsin} noImages=${noImages} noItem=${noItem} allSkus=${allSkus.length}`);
   return res.json({
     success: true,
     chosenDim:       chosenDimName,
@@ -5221,7 +5315,13 @@ async function handleRebuildPhotos(body, res) {
     totalDims,
     nextDimIndex:    (dimIndex + 1) % totalDims,
     nextDim:         _allDimNames[(dimIndex + 1) % totalDims],
-    updated, failed, noAsin, noImages,
+    updated, failed, noAsin, noImages, noItem,
+    allSkusCount:    allSkus.length,
+    inventoryFetched: Object.keys(inventoryItems).length,
+    skuToAsinCovered: allSkus.filter(s => _effectiveSkuToAsin[s]).length,
+    asinImagesProvided: Object.keys(_asinImgMap).length,
+    comboMatched: _comboMatched,
+    comboUnmatched: _comboUnmatched,
     // Return new dim order + variationImages so frontend can update stored product
     newPrimaryDim:   chosenDimName,
     newSecondaryDim: _allDimNames.find(d => d !== chosenDimName) || null,

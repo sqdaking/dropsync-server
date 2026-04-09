@@ -791,7 +791,15 @@ async function fetchAmazonInBrowser(url) {
 
   // Direct fetch attempt — browser sends real cookies + residential IP
   const cleanUrl = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
-  const isBlocked = html => !html || html.length < 5000 || /validateCaptcha|robot|captcha/i.test(html);
+  // Only match REAL captcha/block pages, not legit product pages that happen to
+  // contain "robot" in Amazon's perf telemetry JS (e.g. isRobot:false, robotdetection).
+  // Real block pages are tiny and contain specific text like "/errors/validateCaptcha"
+  // or "Enter the characters you see below".
+  const isBlocked = html => !html || html.length < 5000 ||
+    html.includes('/errors/validateCaptcha') ||
+    html.includes('Enter the characters you see below') ||
+    html.includes('Type the characters you see in this image') ||
+    html.includes('To discuss automated access to Amazon data');
   const wt = (p, ms) => Promise.race([p, new Promise((_,r) => setTimeout(() => r(new Error('timeout')), ms))]);
 
   // Attempt 1: Direct fetch — uses browser cookies + residential IP
@@ -4372,30 +4380,84 @@ async function doRebuildPhotos(pid, dimIndex) {
     try {
       const bHtml = await fetchAmazonInBrowser(p.sourceUrl).catch(() => null);
 
-      // Helper: extract ASIN→images from raw HTML
+      // Helper: extract ASIN→images from raw HTML using multiple format strategies.
+      // Has access to `p` (the product) for cross-referencing variant labels → ASINs.
       const _extractAsinImages = (html) => {
         const result = {};
         if (!html || html.length < 1000) return result;
-        // Format 1: 'colorImages' initial array — most reliable, has per-ASIN image sets
-        const ciM = html.match(/'colorImages'\s*:\s*\{'initial'\s*:\s*(\[[\s\S]{0,80000}?\]),\s*'variants'/);
+
+        // ── Format A (preferred): "FitType Color" → [{large, hiRes, thumb}] ─────
+        // Real Amazon format used by fashion/apparel listings with 40+ colors.
+        // The variant data sits in a script block way past `'colorImages'`, and the
+        // keys are compound labels of the form "PrimaryDim SecondaryDim" separated
+        // by a single space. We match each entry's `large` + `hiRes`, then resolve
+        // the label back to an ASIN via comboAsin (p.comboAsin uses `Prim|Sec / Size`
+        // format — we strip size and try both dim orderings).
+        const variantLabels = {}; // "FitType Color" -> hiRes URL
+        for (const m of html.matchAll(/"([A-Za-z][\w\s\-\/+]{2,60})"\s*:\s*\[\s*\{\s*"large"\s*:\s*"(https:\/\/[^"]+)"[\s\S]{0,400}?"hiRes"\s*:\s*"(https:\/\/[^"]+)"/g)) {
+          variantLabels[m[1]] = { large: m[2], hiRes: m[3] };
+        }
+
+        if (Object.keys(variantLabels).length > 0 && Object.keys(p.comboAsin || {}).length > 0) {
+          // Cross-reference: for each comboAsin entry, build the expected variant label
+          // and look it up in `variantLabels`. comboAsin key format: "Fit|Color / Size"
+          // but the actual order in the key depends on whatever the scraper stored
+          // (not always primary|secondary — can be secondary|primary). Try both.
+          const _norm = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g, '');
+          const _byNorm = {};
+          for (const lbl of Object.keys(variantLabels)) _byNorm[_norm(lbl)] = lbl;
+
+          let matched = 0;
+          for (const [comboKey, asin] of Object.entries(p.comboAsin || {})) {
+            if (!asin) continue;
+            const parts = comboKey.split('|');
+            if (parts.length < 2) continue;
+            // Strip size suffix from parts[1]: "Grey / 3X-Large" -> "Grey"
+            const a = (parts[0]||'').trim();
+            const b = ((parts[1]||'').split(' / ')[0] || '').trim();
+            if (!a || !b) continue;
+            // Try both orderings: "A B" and "B A"
+            const tryLabels = [`${a} ${b}`, `${b} ${a}`];
+            let match = null;
+            for (const tl of tryLabels) {
+              if (variantLabels[tl]) { match = variantLabels[tl]; break; }
+              const nm = _byNorm[_norm(tl)];
+              if (nm) { match = variantLabels[nm]; break; }
+            }
+            if (match) {
+              if (!result[asin]) result[asin] = [];
+              if (!result[asin].includes(match.hiRes)) result[asin].push(match.hiRes);
+              matched++;
+            }
+          }
+          if (matched > 0) {
+            console.log(`[rebuildPhotos] format A: ${Object.keys(variantLabels).length} variant labels → ${matched} ASINs matched`);
+          }
+        }
+
+        // ── Format B (legacy): 'colorImages':{'initial':[...]} with explicit asin ─
+        // Used by older Amazon pages where each element in `initial` has its own asin.
+        const ciM = html.match(/'colorImages'\s*:\s*\{\s*'initial'\s*:\s*(\[[\s\S]{0,80000}?\])\s*,\s*'variants'/);
         if (ciM) {
           try {
             const arr = JSON.parse(ciM[1]);
             for (const item of arr) {
               if (item.asin && /^[A-Z0-9]{10}$/.test(item.asin)) {
                 if (!result[item.asin]) result[item.asin] = [];
-                const imgs = [item.hiRes, item.large, item.main].filter(Boolean).filter(u => u.startsWith('http'));
+                const imgs = [item.hiRes, item.large].filter(u => typeof u === 'string' && u.startsWith('http'));
                 for (const img of imgs) if (!result[item.asin].includes(img)) result[item.asin].push(img);
               }
             }
           } catch(e) {}
         }
-        // Format 2: hiRes URLs near ASIN strings
+
+        // ── Format C (fallback): hiRes URLs near ASIN strings within 800 chars ───
         for (const m of html.matchAll(/"asin"\s*:\s*"([A-Z0-9]{10})"[\s\S]{0,800}?"hiRes"\s*:\s*"(https[^"]+)"/g)) {
           if (!result[m[1]]) result[m[1]] = [];
           if (!result[m[1]].includes(m[2])) result[m[1]].push(m[2]);
         }
-        // Format 3: media-amazon image URLs near ASINs
+
+        // ── Format D (fallback): bare "ASIN": [media-amazon URL] pattern ─────────
         for (const m of html.matchAll(/"([A-Z0-9]{10})"\s*:\s*\[[\s\S]{0,500}?"(https:\/\/m\.media-amazon\.com\/images\/I\/[^"]+)"/g)) {
           if (!result[m[1]]) result[m[1]] = [];
           if (!result[m[1]].includes(m[2])) result[m[1]].push(m[2]);
@@ -4464,14 +4526,31 @@ async function doRebuildPhotos(pid, dimIndex) {
       }
 
       markDirty(p.id); save();
+      // Build a detailed summary that surfaces the silent-drop cases so a "success"
+      // with 0 updates is clearly visible to the user instead of being reported as OK.
       const _details = [
-        `${d.updated} variants updated`,
-        d.noImages > 0 ? `${d.noImages} had no images` : '',
-        d.noAsin   > 0 ? `${d.noAsin} had no ASIN` : '',
+        `${d.updated||0} updated`,
         d.failed   > 0 ? `${d.failed} failed` : '',
+        d.noItem   > 0 ? `${d.noItem} no inventory item` : '',
+        d.noAsin   > 0 ? `${d.noAsin} no ASIN match` : '',
+        d.noImages > 0 ? `${d.noImages} no image data` : '',
       ].filter(Boolean).join(' · ');
-      toast(`✅ Photos rebuilt using "${chosenDim}" — ${_details}`, 'success', 6000);
-      addLog('info', `Rebuilt photos: ${p.title?.slice(0,40)}`, `dim="${chosenDim}" updated=${d.updated} newPrimary=${d.newPrimaryDim}`, { productId: pid });
+      const _diag = `asinImages=${d.asinImagesProvided||0} skuToAsinCov=${d.skuToAsinCovered||0}/${d.allSkusCount||0} comboMatch=${d.comboMatched||0}/${(d.comboMatched||0)+(d.comboUnmatched||0)}`;
+      console.log(`[rebuildPhotos] ${_details} — ${_diag}`);
+
+      if ((d.updated||0) === 0) {
+        // Explicit warning — the old code silently reported success
+        let reason = 'unknown';
+        if ((d.asinImagesProvided||0) === 0) reason = 'browser fetch returned no images (Amazon may have blocked)';
+        else if ((d.skuToAsinCovered||0) === 0) reason = 'could not map any eBay SKU to an Amazon ASIN';
+        else if ((d.noImages||0) === (d.allSkusCount||0)) reason = 'SKU→ASIN matched but no fresh images for any ASIN';
+        else if ((d.noItem||0) > 0) reason = `${d.noItem} SKUs missing inventory data from eBay`;
+        toast(`⚠️ Photos NOT updated on eBay — ${reason}. ${_details}`, 'error', 10000);
+        addLog('warn', `Rebuild photos 0 updates: ${p.title?.slice(0,40)}`, `${reason} · ${_diag}`, { productId: pid });
+      } else {
+        toast(`✅ Photos rebuilt using "${chosenDim}" — ${_details}`, 'success', 6000);
+        addLog('info', `Rebuilt photos: ${p.title?.slice(0,40)}`, `dim="${chosenDim}" ${_details} · ${_diag}`, { productId: pid });
+      }
       renderProducts();
     } else {
       toast(`❌ Rebuild failed: ${d.error || 'Unknown error'}`, 'error', 6000);
