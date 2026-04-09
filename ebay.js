@@ -2040,13 +2040,34 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
       ? Object.values(comboInStock).some(v => v !== false)
       : mainInStock;
 
-    // Best price = cheapest in-stock variation price
+    // Best price selection:
+    //   1. If the URL's ASIN has a matching entry in comboAsin → use THAT entry's price
+    //      (this is what the user expects when they paste a dp/ASIN URL — the page's own
+    //      variant's price, not the cheapest sibling variant).
+    //   2. Else cheapest in-stock variant price.
+    //   3. Else cheapest any variant.
+    //   4. Else fall back to the buy-box base price.
+    let _urlAsinPrice = 0;
+    if (asin) {
+      for (const [key, a] of Object.entries(comboAsin)) {
+        if (a === asin) {
+          const cp = comboPrices[key];
+          if (cp > 0 && comboInStock[key] !== false) { _urlAsinPrice = cp; break; }
+          // Track even if OOS so we have a fallback over cheapest-variant
+          if (cp > 0 && !_urlAsinPrice) _urlAsinPrice = cp;
+        }
+      }
+    }
     const inStockPrices = Object.entries(comboPrices)
       .filter(([k]) => comboInStock[k] !== false)
       .map(([,p]) => p)
       .filter(p => p > 0);
-    if (inStockPrices.length) {
+    if (_urlAsinPrice > 0) {
+      product.price = _urlAsinPrice;
+      console.log(`[scraper] product.price=$${_urlAsinPrice} (URL ASIN ${asin} match)`);
+    } else if (inStockPrices.length) {
       product.price = Math.min(...inStockPrices);
+      console.log(`[scraper] product.price=$${product.price} (cheapest in-stock — URL ASIN ${asin||'(none)'} not in combos)`);
     } else {
       const allPrices = Object.values(comboPrices).filter(p=>p>0);
       if (allPrices.length) product.price = Math.min(...allPrices);
@@ -6868,7 +6889,20 @@ module.exports = async (req, res) => {
 
       } else {
         // ── SIMPLE LISTING: full inventory PUT (same as push/revise) ──────────
-        const newPrice = applyMk(product.price) || 0;
+        // Price selection: if the URL's ASIN has a matching combo entry, use THAT
+        // price (so a simple listing of B01M14RQVX gets B01M14RQVX's own price,
+        // not the cheapest sibling variant). Else fall back to product.price.
+        let _simplePriceCost = parseFloat(product.price) || 0;
+        const _urlAsin = (sourceUrl||'').match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/)?.[1];
+        if (_urlAsin && Object.keys(comboAsin).length) {
+          for (const [k, a] of Object.entries(comboAsin)) {
+            if (a === _urlAsin) {
+              const cp = comboPrices[k];
+              if (cp > 0) { _simplePriceCost = cp; console.log(`[sync/simple] using URL ASIN ${_urlAsin} price: $${cp} (overriding product.price=$${product.price})`); break; }
+            }
+          }
+        }
+        const newPrice = applyMk(_simplePriceCost) || 0;
         const newQty   = freshStock ? defaultQty : 0;
 
         // Track old values

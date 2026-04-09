@@ -2778,27 +2778,58 @@ async function linkOrphanToAmazon(pid, urlOverride) {
     const syncD = await syncR.json().catch(() => ({}));
 
     if (syncD.success) {
-      // Persist the post-sync state
+      // Detect the "simple listing carrying a variation product" mismatch:
+      // fresh Amazon has multiple variations but the eBay listing was published
+      // as a single-SKU simple item, so sync took the simple branch and only
+      // updated 1 SKU instead of creating N variants. eBay's inventory API
+      // cannot convert a simple listing into a variation listing in place —
+      // the only way to get the variants is to end + re-push, which issues a
+      // new eBay listing ID.
+      const _freshVariantCount = (rebuilt.variations || []).reduce((s,v) => s + (v.values?.length || 0), 0);
+      const _isSimpleOnEbay    = syncD.type === 'simple';
+      const _variationMismatch = _isSimpleOnEbay && rebuilt.hasVariations && _freshVariantCount > 1;
+
       rebuilt.lastSynced = new Date().toISOString();
       if (syncD.updatedVariants) rebuilt._variantsUpdated = syncD.updatedVariants;
       if (S.products[idx]) S.products[idx] = rebuilt;
       markDirty(pid); save();
-      // Also push the updated lastSynced to Railway
       await fetch(`${S.serverUrl}/api/products`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(rebuilt),
       }).catch(()=>{});
 
       const _summary = [
-        syncD.updatedVariants ? `${syncD.updatedVariants} variants updated` : '',
+        syncD.updatedVariants ? `${syncD.updatedVariants} variant${syncD.updatedVariants===1?'':'s'} updated` : '',
         syncD.priceChanges?.length ? `${syncD.priceChanges.length} price changes` : '',
         syncD.stockChanges?.length ? `${syncD.stockChanges.length} stock changes` : '',
         syncD.imageChanges?.length ? `${syncD.imageChanges.length} image changes` : '',
       ].filter(Boolean).join(' · ') || 'listing refreshed';
-      setStatus(`<span style="color:var(--green)">✅ ${_summary}</span>`);
-      toast(`✅ Deep-clean relink done — ${_summary}`, 'success', 6000);
-      addLog('sync', `Deep-clean rebuild: ${(rebuilt.title||'').slice(0,50)}`, _summary, { productId: pid });
-      // Re-render so the row shows the new title/images
+
+      if (_variationMismatch) {
+        // Warn and offer re-push — eBay can't add variations to a simple listing
+        // in place, so getting the N variants requires a new listing ID.
+        setStatus(`<span style="color:#f59e0b">⚠️ Simple listing — can't add ${_freshVariantCount} variants in place</span>`);
+        toast(`⚠️ eBay listing is simple (1 SKU), but Amazon has ${_freshVariantCount} variants. eBay can't add variations in place — you'll need to Re-push (new listing ID) to get them.`, 'warn', 15000);
+        addLog('sync', `Deep-clean partial: ${(rebuilt.title||'').slice(0,40)}`, `Simple listing kept — can't add ${_freshVariantCount} variants without re-push`, { productId: pid });
+        const wantRepush = confirm(
+          `⚠️ Variation Mismatch\n\n` +
+          `Amazon has ${_freshVariantCount} variants, but the eBay listing is a simple (single-SKU) listing. ` +
+          `eBay's API can't convert a simple listing into a variation listing in place — only title, price, ` +
+          `description, and images were updated.\n\n` +
+          `To get all ${_freshVariantCount} variants on eBay, we have to:\n` +
+          `  1. End the current listing (${rebuilt.ebayListingId})\n` +
+          `  2. Publish a brand-new variation listing (new eBay listing ID)\n\n` +
+          `Re-push now? (Cancel = keep the simple listing as-is)`
+        );
+        if (wantRepush) {
+          // doRepush re-uses pushExisting which handles variations correctly
+          return doRepush(pid);
+        }
+      } else {
+        setStatus(`<span style="color:var(--green)">✅ ${_summary}</span>`);
+        toast(`✅ Deep-clean done — ${_summary}`, 'success', 8000);
+        addLog('sync', `Deep-clean rebuild: ${(rebuilt.title||'').slice(0,50)}`, _summary, { productId: pid });
+      }
       if (S.view === 'listed' || S.view === 'products') renderProducts();
     } else {
       throw new Error(syncD.error || 'sync action failed');
