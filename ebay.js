@@ -5923,12 +5923,21 @@ module.exports = async (req, res) => {
       }
       console.log(`[smartSync] valToAsin: ${Object.keys(valToAsin).length} entries, skuToAsin: ${Object.keys(skuToAsin).length} entries`);
 
-      // If skuToAsin is empty, reconstruct it from dta + variationValues + offer SKU suffixes
-      // Same slug logic used at push time: "White" → "WHITE", "4 Tier" → "4_TIER"
-      if (Object.keys(skuToAsin).length === 0 && Object.keys(dta).length > 0 && Object.keys(vv2).length > 0) {
+      // Reconstruct skuToAsin from dta + variationValues + offer SKU suffixes for any SKUs
+      // not already covered by Method A. This is needed for old listings whose variant SKUs
+      // were truncated/hashed by an earlier push code (different SKU_MAX) — the worker
+      // pre-builds skuToAsin in the current 50-char format, so direct lookup misses every
+      // truncated variant. Reconstruction matches dim-value slugs against the variant SKU
+      // text, which works regardless of how the SKU was truncated.
+      const _needsRecon = new Set();
+      for (const sku of Object.keys(offerMap)) {
+        if (!skuToAsin[sku]) _needsRecon.add(sku);
+      }
+      if (_needsRecon.size > 0 && Object.keys(dta).length > 0 && Object.keys(vv2).length > 0) {
         const _slug = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
         const _dimKeys = Object.keys(vv2);
-        // Build slug → ASIN from dta
+        // Build slug → ASIN from dta. For each dimensionToAsinMap entry, take the
+        // combination of dim values it points to and slugify them.
         const slugToAsin = {};
         for (const [idx, asin] of Object.entries(dta)) {
           const parts = String(idx).split('_');
@@ -5937,27 +5946,36 @@ module.exports = async (req, res) => {
             return arr[parseInt(parts[ki] ?? parts[0]) || 0] || '';
           }).filter(Boolean);
           if (vals.length) {
-            // Try all combinations of dim values as slug
+            // Full slug (all dims joined) — most specific
             const slug = vals.map(_slug).join('_');
-            slugToAsin[slug] = asin;
-            // Also try just primary dim
-            if (vals.length > 1) slugToAsin[_slug(vals[0])] = asin;
+            if (slug) slugToAsin[slug] = asin;
+            // Primary-dim-only slug — fallback for SKUs that hashed/truncated the secondary dim
+            if (vals.length > 1) {
+              const primary = _slug(vals[0]);
+              if (primary && !slugToAsin[primary]) slugToAsin[primary] = asin;
+            }
           }
         }
-        // Match each offer SKU suffix against slugToAsin
+        // CRITICAL: sort slugs by length DESCENDING so the most specific slug matches first.
+        // Without this, "BUTTERFLY" can match a variant whose actual color is "LAVENDER BUTTERFLY"
+        // because both .includes() the substring — whichever is iterated first wins.
+        const _sortedSlugs = Object.entries(slugToAsin).sort((a, b) => b[0].length - a[0].length);
         const _pfxUpper = normSku.toUpperCase() + '-';
-        for (const sku of Object.keys(offerMap)) {
-          const sfx = sku.toUpperCase().startsWith(_pfxUpper) ? sku.slice(normSku.length + 1) : sku;
-          // Try exact match first, then partial
-          for (const [slug, asin] of Object.entries(slugToAsin)) {
+        let _reconHits = 0;
+        for (const sku of _needsRecon) {
+          // Strip the group SKU prefix when present, then uppercase for case-insensitive matching
+          const sfx = (sku.toUpperCase().startsWith(_pfxUpper)
+            ? sku.slice(normSku.length + 1)
+            : sku).toUpperCase();
+          for (const [slug, asin] of _sortedSlugs) {
             if (sfx.startsWith(slug) || sfx.includes(slug)) {
               skuToAsin[sku] = asin;
+              _reconHits++;
               break;
             }
           }
         }
-        const rebuilt = Object.keys(skuToAsin).length;
-        console.log(`[smartSync] rebuilt skuToAsin: ${rebuilt}/${Object.keys(offerMap).length} SKUs matched`);
+        console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs (${Object.keys(offerMap).length} total)`);
       }
 
       // GET inventory item aspects for aspect-based matching (only if valToAsin is empty)
@@ -5980,6 +5998,11 @@ module.exports = async (req, res) => {
         }
       }
 
+      // Pre-sort valToAsin entries by key length desc — same reason as the reconstruction
+      // path: longer values must be checked first so "lavender butterfly" wins over "butterfly"
+      // when both are .includes() in the SKU.
+      const _sortedValToAsin = Object.entries(valToAsin).sort((a, b) => b[0].length - a[0].length);
+
       const updates = [];
       for (const [sku, offer] of Object.entries(offerMap)) {
         let asin = null;
@@ -5990,7 +6013,7 @@ module.exports = async (req, res) => {
         }
 
         // Method B: valToAsin via aspects
-        if (!asin && Object.keys(valToAsin).length > 0) {
+        if (!asin && _sortedValToAsin.length > 0) {
           const aspects = skuAspects[sku] || {};
           for (const vals of Object.values(aspects)) {
             for (const v of (Array.isArray(vals) ? vals : [vals])) {
@@ -5999,10 +6022,12 @@ module.exports = async (req, res) => {
             }
             if (asin) break;
           }
-          // Also try matching valToAsin against the SKU suffix directly
+          // Also try matching valToAsin against the SKU suffix directly — sorted by length
+          // descending so the most specific dimension value matches first.
           if (!asin) {
-            for (const [val, a] of Object.entries(valToAsin)) {
-              if (sku.toLowerCase().includes(val.replace(/\s+/g, '_').toLowerCase())) { asin = a; break; }
+            const _skuLower = sku.toLowerCase();
+            for (const [val, a] of _sortedValToAsin) {
+              if (_skuLower.includes(val.replace(/\s+/g, '_'))) { asin = a; break; }
             }
           }
         }
