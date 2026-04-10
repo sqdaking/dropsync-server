@@ -246,6 +246,17 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
 
     if (result.wentOos) {
       await db.addLog('sync', `OOS: ${(product.title||'').slice(0,50)}`, `${synced} offers updated`, { productId: product.id });
+    } else {
+      // Log successful in-stock revises too — without this, the activity log
+      // only shows OOS entries and gives the user the impression the worker
+      // isn't doing anything for in-stock products. Now every successful
+      // revise leaves a trail. Includes the fetch-failed count from 6a1cd52
+      // so the user can see when Amazon is partially blocking us.
+      const _failed = data.fetchFailedCount || 0;
+      const _detail = _failed > 0
+        ? `${synced} offers updated · avg $${avgPrice.toFixed(2)} · ${_failed} ASIN${_failed>1?'s':''} blocked`
+        : `${synced} offers updated · avg $${avgPrice.toFixed(2)}`;
+      await db.addLog('sync', `Synced: ${(product.title||'').slice(0,50)}`, _detail, { productId: product.id });
     }
 
     if (webhookUrl) {
