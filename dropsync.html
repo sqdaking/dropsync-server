@@ -599,6 +599,70 @@ const HASH_MAP = {
 };
 const VIEW_HASH = Object.fromEntries(Object.entries(HASH_MAP).map(([h,v])=>[v,h]));
 
+// ── Worker progress refresher ────────────────────────────────────────────────
+// The Railway worker writes lastSynced/price/myPrice to Postgres on every sync
+// cycle, but the frontend's S.products cache stays stale until the user reloads.
+// This polls Railway every 60s while the Listed view is open and merges only
+// the worker-updated fields (lastSynced, price, myPrice, _asinOffset, _markedOos)
+// back into S.products. Doesn't clobber any user-edited fields like markup,
+// images, title, etc — only the things the worker is allowed to touch.
+let _workerRefreshTimer = null;
+let _workerRefreshInflight = false;
+async function _refreshWorkerProgress() {
+  if (_workerRefreshInflight) return;
+  if (S.view !== 'products') return; // only poll while looking at the listed view
+  if (!S.serverUrl) return;
+  _workerRefreshInflight = true;
+  try {
+    const r = await fetch(`${S.serverUrl}/api/products?limit=9000`);
+    if (!r.ok) return;
+    const d = await r.json();
+    const fresh = d.products || d || [];
+    const freshById = {};
+    for (const p of fresh) freshById[p.id] = p;
+    // Merge worker-touched fields only — leave user edits intact
+    let updated = 0;
+    for (const local of (S.products||[])) {
+      const f = freshById[local.id];
+      if (!f) continue;
+      const wasSynced = local.lastSynced;
+      const isSynced  = f.lastSynced;
+      // Update if the DB version has a newer lastSynced timestamp
+      if (isSynced && (!wasSynced || new Date(isSynced) > new Date(wasSynced))) {
+        local.lastSynced = isSynced;
+        if (typeof f.price === 'number' && f.price > 0) local.price = f.price;
+        if (typeof f.myPrice === 'number' && f.myPrice > 0) local.myPrice = f.myPrice;
+        if (typeof f._asinOffset === 'number') local._asinOffset = f._asinOffset;
+        if (f._markedOos !== undefined) local._markedOos = f._markedOos;
+        if (f.lastReviseError !== undefined) local.lastReviseError = f.lastReviseError;
+        if (f.status && f.status !== local.status) local.status = f.status;
+        updated++;
+      }
+    }
+    if (updated > 0) {
+      console.log(`[refresher] worker updated ${updated} products from Railway`);
+      // Re-render only if the user is on the listed view (don't disturb other tabs)
+      if (S.view === 'products' && typeof filterProducts === 'function') {
+        try { filterProducts(); } catch(e) {}
+      }
+      // Don't call save() — that would write the merged state to Railway and
+      // create a feedback loop. The fields we updated are server-authoritative.
+    }
+  } catch(e) {
+    console.warn('[refresher] failed:', e.message);
+  } finally {
+    _workerRefreshInflight = false;
+  }
+}
+function startWorkerRefresher() {
+  if (_workerRefreshTimer) return;
+  _workerRefreshTimer = setInterval(_refreshWorkerProgress, 60000); // every 60s
+  console.log('[refresher] started — will poll Railway every 60s while on Listed view');
+}
+function stopWorkerRefresher() {
+  if (_workerRefreshTimer) { clearInterval(_workerRefreshTimer); _workerRefreshTimer = null; }
+}
+
 function nav(view) {
   S.view = view;
   // Don't save view to localStorage — URL hash is the source of truth
@@ -640,6 +704,16 @@ function nav(view) {
     loadLogsFromRailway().catch(()=>{});
   } else {
     renders[view]?.();
+  }
+  // Worker progress refresher: only runs while on the Listed view. Pulls fresh
+  // lastSynced/price/myPrice from Railway every 60s and merges into S.products
+  // so the dashboard reflects what the worker has been doing.
+  if (view === 'products') {
+    startWorkerRefresher();
+    // Immediate refresh on entry so the user doesn't have to wait 60s
+    _refreshWorkerProgress().catch(()=>{});
+  } else {
+    stopWorkerRefresher();
   }
 }
 
@@ -2557,6 +2631,7 @@ function renderProducts() {
           <button class="btn btn-sm" style="background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:#4ade80;font-weight:600" onclick="fixAndReviseAllOos()" title="Fix & Revise all OOS-locked listings">🔧 Fix All OOS</button>
 
 
+          <button class="btn btn-sm" style="background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:#4ade80;font-weight:600" onclick="_refreshWorkerProgress().then(()=>toast('🔄 Refreshed worker progress','info',1500))" title="Pull the latest sync timestamps + prices from Railway. Auto-runs every 60s while on this view.">🔄 Refresh</button>
           <button class="btn btn-sm" style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.35);color:var(--red);font-weight:700" onclick="deleteDuplicateListed()" title="Find and delete duplicate listed products (same URL or parentAsin). Keeps the newest listing.">🧹 Dupes</button>
           <button class="btn btn-sm" style="background:rgba(239,68,68,.25);border:1px solid rgba(239,68,68,.6);color:#f87171;font-weight:700" onclick="deleteAllListed()" title="Delete ALL listed products from DropSync AND end them on eBay (withdraws + deletes offers). Cannot be undone.">🗑 Delete All</button>
           <button id="rescrape-all-btn" class="btn btn-sm" style="background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.4);color:#a5b4fc;font-weight:600" onclick="bulkRescrapeAll()" title="Wipe &amp; rebuild every listed product from Amazon — slow, use for fixing structure issues">🔁 Rescrape All</button>
