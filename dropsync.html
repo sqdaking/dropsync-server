@@ -1093,13 +1093,22 @@ async function doScrape() {
       addLog('warn', `Duplicate import blocked: ${IMP.title?.slice(0,50)}`, `Already listed as eBay ID ${_existingDup.ebayListingId}`);
       IMP = null; return;
     }
-    // Also check drafts
+    // Also check drafts — and BLOCK the new import (used to only warn, which
+    // let the user accidentally create duplicates of their own drafts).
     const _draftDup = (S.products||[]).find(x => !x.ebayListingId && x.status !== 'listed' && (
       (IMP.parentAsin && x.parentAsin && IMP.parentAsin === x.parentAsin) ||
-      (IMP.asin && x.asin && IMP.asin === x.asin)
+      (IMP.asin && x.asin && IMP.asin === x.asin) ||
+      (x.sourceUrl && x.sourceUrl === url)
     ));
     if (_draftDup) {
-      toast(`Note: Similar product "${(_draftDup.title||'').slice(0,40)}" already in Drafts`, 'info', 5000);
+      _scraping = false; renderImport();
+      const _matchType = (IMP.parentAsin && _draftDup.parentAsin === IMP.parentAsin) ? 'same parent listing'
+        : (IMP.asin && _draftDup.asin === IMP.asin) ? 'same ASIN'
+        : 'same URL';
+      setStatus(`⚠️ Already in drafts (${_matchType}): "${(_draftDup.title||'').slice(0,50)}"`, 'warning');
+      toast(`Duplicate draft: this Amazon listing is already saved as "${(_draftDup.title||'').slice(0,40)}" — open Drafts to find it`, 'warn', 7000);
+      addLog('warn', `Duplicate draft import blocked: ${IMP.title?.slice(0,50)}`, `Matched existing draft "${_draftDup.title?.slice(0,50)}" (${_matchType})`);
+      IMP = null; return;
     }
 
     // Apply markup to all variations
@@ -1291,6 +1300,7 @@ function buildProd() {
     sourceUrl: IMP.url || '',
     source: 'amazon',
     asin: IMP.asin || '',
+    parentAsin: IMP.parentAsin || '', // ← persisted so dedup-by-parent works on future imports
     title: IMP.title || '',        // raw Amazon title (kept for reference)
     ebayTitle: IMP.ebayTitle || '', // user-set or AI-optimized title for eBay
     price: IMP.price || 0,
@@ -1998,6 +2008,57 @@ async function bulkFetchDeals(dept) {
           continue;
         }
 
+        // ── Post-scrape dedup ─────────────────────────────────────────────────
+        // The deals page only exposed the child ASIN — we couldn't dedup by
+        // parentAsin earlier because Amazon category pages don't expose it. Now
+        // that we've actually scraped the product page, parentAsin is known.
+        // Check the new (parent, asin, sourceUrl, normalized-title) against
+        // every existing product. If it's a dupe, NEVER create the draft and
+        // mark both the child ASIN and the parent ASIN as used so the next
+        // fetch round doesn't waste time re-scraping the same family.
+        const _normT = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,40);
+        const _newPa = p.parentAsin || '';
+        const _newAsin = p.asin || asin;
+        const _newUrl = `https://www.amazon.com/dp/${_newAsin}`;
+        const _newTitleN = _normT(p.title || hintTitle);
+        const _bulkDup = (S.products||[]).find(x => (
+          (_newPa && x.parentAsin && _newPa === x.parentAsin) ||
+          (_newAsin && x.asin && _newAsin === x.asin) ||
+          (x.sourceUrl && x.sourceUrl === _newUrl) ||
+          (_newTitleN.length > 15 && _normT(x.title) === _newTitleN)
+        ));
+        if (_bulkDup) {
+          const _matchType = (_newPa && _bulkDup.parentAsin === _newPa) ? 'same parent listing'
+            : (_newAsin && _bulkDup.asin === _newAsin) ? 'same ASIN'
+            : (_bulkDup.sourceUrl === _newUrl) ? 'same URL'
+            : 'same title';
+          bulkLog(`${asin}: skipped — ${_matchType} as "${(_bulkDup.title||'').slice(0,40)}" (${_bulkDup.status||'draft'})`, 'warn');
+          skipped++;
+          // Remember both the variant AND the parent so next fetch round excludes them
+          BULK.usedAsins.add(_newAsin);
+          if (_newPa) BULK.usedAsins.add(_newPa);
+          bulkSaveState();
+          await new Promise(res=>setTimeout(res,200));
+          continue;
+        }
+
+        // Internal-batch dedup: if a previous iteration in THIS bulk fetch
+        // already added a product with the same parentAsin, skip this one too.
+        // Without this, two children of the same parent on the same deals page
+        // both slip through because neither was in S.products yet when the
+        // first one was added.
+        if (_newPa) {
+          const _batchDup = BULK.queue.find(q => q.parentAsin === _newPa);
+          if (_batchDup) {
+            bulkLog(`${asin}: skipped — same parent as "${(_batchDup.title||'').slice(0,40)}" earlier in this batch`, 'warn');
+            skipped++;
+            BULK.usedAsins.add(_newAsin);
+            BULK.usedAsins.add(_newPa);
+            bulkSaveState();
+            continue;
+          }
+        }
+
         const markup = S.markup;
         const calcP = cost => { const c=parseFloat(cost)||0; return c ? Math.ceil(((c+2)*(1+markup/100)/(1-0.1335)+0.30)*100)/100 : 0; };
         // FIX: if the scraped primary variant is OOS (price=0), fall back to the MIN
@@ -2019,6 +2080,7 @@ async function bulkFetchDeals(dept) {
         const prod = {
           id: uid(), sourceUrl: `https://www.amazon.com/dp/${asin}`,
           source: 'amazon', asin: p.asin||asin,
+          parentAsin: p.parentAsin || '', // ← persisted so next fetch round can dedup by parent
           title: p.title||hintTitle||'', ebayTitle: p.ebayTitle||'',
           price: p.price||0, myPrice: p.myPrice||0, markup: S.markup||35,
           images: p.images||[], description: p.description||'',
@@ -2074,6 +2136,33 @@ async function bulkPushAll() {
       BULK.queue = BULK.queue.filter(x=>x.id!==p.id);
       continue;
     }
+
+    // ── Pre-push dedup ───────────────────────────────────────────────────
+    // Even if dedup passed at fetch time, the user may have pushed something
+    // else in a different tab/session that landed on this product first. Check
+    // again right before we hit eBay, and AUTO-DELETE the draft if it's now a
+    // dupe — never waste an eBay API call on a duplicate push.
+    const _normT = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,40);
+    const _dupListed = (S.products||[]).find(x =>
+      x.id !== p.id && x.status === 'listed' && x.ebayListingId && (
+        (p.parentAsin && x.parentAsin && p.parentAsin === x.parentAsin) ||
+        (p.asin && x.asin && p.asin === x.asin) ||
+        (x.sourceUrl && p.sourceUrl && x.sourceUrl === p.sourceUrl) ||
+        (_normT(p.title).length > 15 && _normT(x.title) === _normT(p.title))
+      )
+    );
+    if (_dupListed) {
+      // Auto-delete the draft
+      S.products = S.products.filter(x => x.id !== p.id);
+      BULK.queue  = BULK.queue.filter(x => x.id !== p.id);
+      try { deleteProductFromRailway(p.id); } catch(e) {}
+      save();
+      bulkLog(`🗑 ${p.asin}: dupe of eBay #${_dupListed.ebayListingId} — draft deleted, push skipped`, 'warn');
+      addLog('warn', `Bulk push dupe auto-deleted: ${(p.title||'').slice(0,50)}`, `Matched eBay #${_dupListed.ebayListingId}`, {productId: p.id});
+      skipped = (skipped || 0) + 1;
+      continue;
+    }
+
     const btnEl = $('bulk-push-btn');
     if (btnEl) btnEl.innerHTML = `<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> ${i+1}/${toPush.length}: ${p.asin}…</span>`;
     bulkLog(`Pushing ${i+1}/${toPush.length}: ${p.asin}…`);
@@ -2469,7 +2558,7 @@ function renderProducts() {
 
 
           <button class="btn btn-sm" style="background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.35);color:var(--red);font-weight:700" onclick="deleteDuplicateListed()" title="Find and delete duplicate listed products (same URL or parentAsin). Keeps the newest listing.">🧹 Dupes</button>
-          <button class="btn btn-sm" style="background:rgba(239,68,68,.25);border:1px solid rgba(239,68,68,.6);color:#f87171;font-weight:700" onclick="deleteAllListed()" title="Delete ALL listed products from DropSync (does NOT end eBay listings)">🗑 Delete All</button>
+          <button class="btn btn-sm" style="background:rgba(239,68,68,.25);border:1px solid rgba(239,68,68,.6);color:#f87171;font-weight:700" onclick="deleteAllListed()" title="Delete ALL listed products from DropSync AND end them on eBay (withdraws + deletes offers). Cannot be undone.">🗑 Delete All</button>
           <button id="rescrape-all-btn" class="btn btn-sm" style="background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.4);color:#a5b4fc;font-weight:600" onclick="bulkRescrapeAll()" title="Wipe &amp; rebuild every listed product from Amazon — slow, use for fixing structure issues">🔁 Rescrape All</button>
           <button class="btn btn-sm" style="background:rgba(99,102,241,.15);border:1px solid rgba(99,102,241,.4);color:#818cf8;font-weight:600" onclick="fixAllOffers()" title="Scan eBay inventory items to discover offer IDs for all listings — fixes 'No offers found' errors">🔗 Fix All Offers</button>
           <select class="input select" style="width:130px;font-size:12px" onchange="_listedSort=this.value;filterProducts()">
@@ -2575,6 +2664,19 @@ function filterDrafts() {
   );
   prods = _sortProducts(prods, _draftSort);
   renderProdRows(prods);
+  // Drop selections of products no longer visible — same fix as filterProducts.
+  if (S._selectedIds && S._selectedIds.size > 0) {
+    const visibleIds = new Set(prods.map(p => p.id));
+    let pruned = 0;
+    for (const id of [...S._selectedIds]) {
+      if (!visibleIds.has(id)) { S._selectedIds.delete(id); pruned++; }
+    }
+    if (pruned > 0) {
+      updateBulkToolbar();
+      const allChk = document.getElementById('draft-select-all');
+      if (allChk) allChk.checked = false;
+    }
+  }
   // Re-render pills
   const pillsEl = document.getElementById('draft-cat-pills');
   if (pillsEl) {
@@ -2814,25 +2916,32 @@ async function linkOrphanToAmazon(pid, urlOverride) {
       ].filter(Boolean).join(' · ') || 'listing refreshed';
 
       if (_variationMismatch) {
-        // Warn and offer re-push — eBay can't add variations to a simple listing
-        // in place, so getting the N variants requires a new listing ID.
-        setStatus(`<span style="color:#f59e0b">⚠️ Simple listing — can't add ${_freshVariantCount} variants in place</span>`);
-        toast(`⚠️ eBay listing is simple (1 SKU), but Amazon has ${_freshVariantCount} variants. eBay can't add variations in place — you'll need to Re-push (new listing ID) to get them.`, 'warn', 15000);
-        addLog('sync', `Deep-clean partial: ${(rebuilt.title||'').slice(0,40)}`, `Simple listing kept — can't add ${_freshVariantCount} variants without re-push`, { productId: pid });
-        const wantRepush = confirm(
-          `⚠️ Variation Mismatch\n\n` +
-          `Amazon has ${_freshVariantCount} variants, but the eBay listing is a simple (single-SKU) listing. ` +
-          `eBay's API can't convert a simple listing into a variation listing in place — only title, price, ` +
-          `description, and images were updated.\n\n` +
-          `To get all ${_freshVariantCount} variants on eBay, we have to:\n` +
-          `  1. End the current listing (${rebuilt.ebayListingId})\n` +
-          `  2. Publish a brand-new variation listing (new eBay listing ID)\n\n` +
-          `Re-push now? (Cancel = keep the simple listing as-is)`
+        // ⚠️ SAFETY: do NOT auto-cascade into doRepush here. The old code path
+        // showed a confirm() and if the user clicked OK it called doRepush,
+        // which ends the eBay listing. Coming from Deep Rebuild that's a
+        // two-click path to accidentally destroying a live listing — and if
+        // the re-push step then fails for ANY reason (Amazon block, network,
+        // eBay rate limit, variation mismatch error), the listing is ended
+        // with no automatic recovery. This caused a real production incident
+        // that ended the Leggings listing 198252714911.
+        //
+        // The new behavior: surface the mismatch as a warning + log entry
+        // only. The user can manually click the separate ♻️ Re-push button
+        // on the row if they understand the risk and want to proceed. Deep
+        // Rebuild must NEVER end a listing on its own.
+        setStatus(`<span style="color:#f59e0b">⚠️ Simple listing — ${_freshVariantCount} variants can't be added in place</span>`);
+        toast(
+          `⚠️ Deep Rebuild partial — eBay listing is SIMPLE (1 SKU) but Amazon ` +
+          `has ${_freshVariantCount} variants. Title/price/description/images ` +
+          `were updated, but eBay's API cannot add variations to a simple listing ` +
+          `in place. This listing was NOT ended. If you want the variants, click ` +
+          `the separate ♻️ Re-push button (understand: that will end this listing ` +
+          `and create a new one with a different ID).`,
+          'warn', 20000
         );
-        if (wantRepush) {
-          // doRepush re-uses pushExisting which handles variations correctly
-          return doRepush(pid);
-        }
+        addLog('warn', `Deep-clean partial: ${(rebuilt.title||'').slice(0,40)}`,
+          `Simple listing kept — ${_freshVariantCount} variants need manual Re-push to appear`,
+          { productId: pid });
       } else {
         setStatus(`<span style="color:var(--green)">✅ ${_summary}</span>`);
         toast(`✅ Deep-clean done — ${_summary}`, 'success', 8000);
@@ -2884,6 +2993,21 @@ function filterProducts() {
   );
   prods = _sortProducts(prods, _listedSort);
   renderProdRows(prods);
+  // After re-render, drop any selections that aren't in the new visible set.
+  // Without this, "All" + filter + Delete Selected would still hit hidden rows.
+  if (S._selectedIds && S._selectedIds.size > 0) {
+    const visibleIds = new Set(prods.map(p => p.id));
+    let pruned = 0;
+    for (const id of [...S._selectedIds]) {
+      if (!visibleIds.has(id)) { S._selectedIds.delete(id); pruned++; }
+    }
+    if (pruned > 0) {
+      // Re-sync the All checkbox state and toolbar count
+      updateBulkToolbar();
+      const allChk = document.getElementById('chk-select-all');
+      if (allChk) allChk.checked = false;
+    }
+  }
   // Re-render pills so active state updates
   const pillsEl = document.getElementById('listed-cat-pills');
   if (pillsEl) {
@@ -3070,10 +3194,23 @@ function toggleProdSelect(pid, checked) {
 }
 
 function toggleSelectAll(checked) {
-  const checkboxes = document.querySelectorAll('[id^="chk-"]:not(#chk-select-all)');
-  checkboxes.forEach(cb => {
-    const pid = cb.id.replace('chk-', '');
-    cb.checked = checked;
+  // The "All" checkbox should mean "exactly what's visible right now" —
+  // stale selections from a previous filter state would otherwise leak
+  // into bulkDelete and the user would be horrified. Clear anything that
+  // isn't in the current DOM, then toggle what is.
+  if (!S._selectedIds || !(S._selectedIds instanceof Set)) S._selectedIds = new Set();
+  const visibleIds = new Set();
+  document.querySelectorAll('[id^="chk-"]:not(#chk-select-all):not(#draft-select-all)').forEach(cb => {
+    visibleIds.add(cb.id.replace('chk-', ''));
+  });
+  // Drop stale selections (selected products that are no longer rendered)
+  for (const id of [...S._selectedIds]) {
+    if (!visibleIds.has(id)) S._selectedIds.delete(id);
+  }
+  // Toggle visible
+  visibleIds.forEach(pid => {
+    const cb = document.getElementById('chk-' + pid);
+    if (cb) cb.checked = checked;
     toggleProdSelect(pid, checked);
   });
 }
@@ -3143,12 +3280,27 @@ function updateBulkToolbar() {
 }
 
 function selectAllDrafts(checked) {
-  const prods = (S.products||[]).filter(p => p.status === 'draft');
+  // CRITICAL: read from the DOM, NOT S.products.filter(p=>p.status==='draft').
+  // The state-based version ignored category/search filters and selected
+  // every draft regardless of what was visible. The DOM only contains the
+  // currently filtered/rendered drafts, so this respects all active filters.
   if (!S._selectedIds || !(S._selectedIds instanceof Set)) S._selectedIds = new Set();
-  prods.forEach(p => {
-    if (checked) S._selectedIds.add(p.id);
-    else S._selectedIds.delete(p.id);
-    const cb = document.getElementById('chk-' + p.id);
+  // Clear any stale selections from products that aren't currently visible —
+  // ensures "All" means "exactly what I see right now" with no leftovers.
+  const visibleIds = new Set();
+  document.querySelectorAll('[id^="chk-"]:not(#draft-select-all):not(#chk-select-all)').forEach(cb => {
+    const pid = cb.id.replace('chk-', '');
+    visibleIds.add(pid);
+  });
+  // Drop selections that are no longer visible
+  for (const id of [...S._selectedIds]) {
+    if (!visibleIds.has(id)) S._selectedIds.delete(id);
+  }
+  // Toggle visible ones
+  visibleIds.forEach(pid => {
+    if (checked) S._selectedIds.add(pid);
+    else S._selectedIds.delete(pid);
+    const cb = document.getElementById('chk-' + pid);
     if (cb) cb.checked = checked;
   });
   updateBulkToolbar();
@@ -5224,6 +5376,10 @@ async function markAllOos() {
 }
 
 // ── doRepush: end current listing and publish a fresh new one ─────────────────
+// SAFETY: snapshots the full product before ending the listing. If the new push
+// fails for ANY reason, the snapshot is restored to S.products so the user can
+// see the old ebayListingId/ebaySku/data and at minimum relist manually from
+// the My eBay page (eBay allows relisting ended items for 90 days).
 async function doRepush(pid) {
   const p = S.products.find(x => x.id === pid);
   if (!p || !S.token) return;
@@ -5235,23 +5391,37 @@ async function doRepush(pid) {
     <b>2.</b> Re-import fresh data from Amazon<br>
     <b>3.</b> Publish a brand-new listing with a new ID<br>
     <br>
-    <span style="color:var(--text3);font-size:11px">The old listing URL will stop working. Any watchers will be lost.</span>`,
+    <span style="color:var(--text3);font-size:11px">The old listing URL will stop working. Any watchers will be lost.</span><br>
+    <span style="color:#f59e0b;font-size:11px">⚠️ If step 3 fails, the old listing is already ended — you'll need to manually relist from the My eBay page.</span>`,
     '♻️ Re-push',
     'Cancel'
   );
   if (!confirmed) return;
 
+  // ── SNAPSHOT the full product before doing anything destructive ─────────────
+  // Deep clone so later mutations don't affect the snapshot.
+  const _snapshot = JSON.parse(JSON.stringify(p));
+  // Persist to a rescue key in localStorage too — so if the tab is closed or
+  // the state gets wiped mid-flow, the user can recover from this backup.
+  try {
+    const rescues = JSON.parse(localStorage.getItem('dropsync_repush_rescues') || '{}');
+    rescues[pid] = { snapshot: _snapshot, at: new Date().toISOString() };
+    localStorage.setItem('dropsync_repush_rescues', JSON.stringify(rescues));
+  } catch(e) { console.warn('[doRepush] rescue snapshot failed:', e.message); }
+
   const toastId = toast('Re-pushing — ending old listing…', 'info', 60000);
+  let _endedOk = false;
 
   try {
     // Step 1: End the old eBay listing
     if (p.ebayListingId && p.ebaySku) {
       try {
         const token = await ensureToken();
-        await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
+        const endR = await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId }),
         });
+        _endedOk = endR.ok;
       } catch(e) { console.warn('[doRepush] end listing failed (continuing):', e.message); }
     }
 
@@ -5267,10 +5437,34 @@ async function doRepush(pid) {
     toast('Re-pushing — creating new listing…', 'info', 60000);
     await pushExisting(pid);
 
+    // If we get here, push succeeded — clear the rescue snapshot
+    try {
+      const rescues = JSON.parse(localStorage.getItem('dropsync_repush_rescues') || '{}');
+      delete rescues[pid];
+      localStorage.setItem('dropsync_repush_rescues', JSON.stringify(rescues));
+    } catch(e) {}
+
   } catch(e) {
-    p.lastReviseError = 'Re-push failed: ' + e.message;
-    markDirty(p.id); save(); renderProducts();
-    toast(`Re-push failed: ${e.message}`, 'error', 8000);
+    // ── ROLLBACK: restore the snapshot so the user at least has the old data
+    // (old ebayListingId is useful because they can manually relist from
+    // eBay's My eBay → Sold → Relist interface for 90 days after ending).
+    console.warn('[doRepush] push failed, restoring snapshot:', e.message);
+    const rIdx = S.products.findIndex(x => x.id === pid);
+    if (rIdx >= 0) {
+      S.products[rIdx] = _snapshot;
+      // Mark the snapshot as "ended on eBay but still in DropSync" so the user knows
+      S.products[rIdx]._endedOnEbay = _endedOk ? new Date().toISOString() : null;
+      S.products[rIdx].lastReviseError = 'Re-push failed: ' + e.message + (
+        _endedOk ? ' · OLD LISTING WAS ENDED — manually relist from eBay → My eBay → Sold → Relist'
+                 : ' · old listing may still be live, try Sync'
+      );
+      markDirty(pid); save(); renderProducts();
+    }
+    toast(
+      `❌ Re-push failed: ${e.message}.` +
+      (_endedOk ? ' Old listing is ended — recover via eBay → My eBay → Sold → Relist.' : ' Old listing should still be live.'),
+      'error', 15000
+    );
   }
 }
 
@@ -7403,6 +7597,7 @@ function renderSettings() {
             ${S.token ? `<button class="btn" style="background:var(--red);color:#fff;font-weight:700" onclick="forceReconnect()" title="Clears token and re-authorizes with full permissions. Use this if you get 401 errors on push.">🔑 Force Reconnect (fix 401)</button>` : ''}
             ${S.token ? `<button class="btn btn-ghost" style="color:var(--red)" onclick="disconnectEbay()">Disconnect</button>` : ''}
             ${S.token ? `<button class="btn btn-outline" onclick="recoverSkusFromEbay()" title="Re-syncs eBay SKUs for all listed products. Run this if sync fails or after re-importing listings.">🔧 Recover SKUs</button>` : ''}
+            <button class="btn btn-outline" onclick="backfillParentAsins()" title="Re-scrape every product to populate the missing parentAsin field. Required to find and dedupe cross-variant duplicates from before this fix.">🧬 Backfill ParentASINs</button>
           </div>
           ${S.token ? `<div style="font-size:11px;color:var(--text3);margin-top:6px">Getting <b>401 errors</b> on push? Click <b>Force Reconnect</b> to re-authorize with full inventory permissions.</div>` : ''}
         </div>
@@ -8646,9 +8841,71 @@ function _normTitle(t) {
   return (t||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,40);
 }
 
+// ── Backfill: populate missing parentAsin on every product ────────────────────
+// Until commit XXX, parentAsin was extracted by the scraper but never persisted
+// to the saved product. This walks every product missing parentAsin and either
+// (a) reads it from the locally-stored comboAsin keys when possible, or
+// (b) re-scrapes the source URL to get a fresh parentAsin from Amazon.
+// Once this completes, dedup-by-parent works retroactively for all old imports.
+async function backfillParentAsins() {
+  const all = (S.products||[]).filter(p => p.sourceUrl && !p.parentAsin);
+  if (all.length === 0) {
+    toast('All products already have parentAsin ✅', 'success');
+    return;
+  }
+  if (!confirm(`Backfill parentAsin on ${all.length} products?\n\nThis re-scrapes each Amazon URL (~1 sec each, so ~${Math.ceil(all.length / 60)} min total). You can keep using DropSync while it runs in the background.`)) return;
+
+  toast(`🧬 Backfilling parentAsin on ${all.length} products…`, 'info', 4000);
+  addLog('info', `Backfill parentAsin started`, `${all.length} products to process`);
+
+  let ok = 0, failed = 0, sameAsAsin = 0;
+  const startTs = Date.now();
+
+  for (let i = 0; i < all.length; i++) {
+    const p = all[i];
+    try {
+      // Cheap path: if comboAsin exists and the product's own asin is in it, the
+      // scraped parentAsin is whatever Amazon's URL tree says — but we still
+      // need a real lookup to know the parent. So we always re-scrape.
+      const r = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ url: p.sourceUrl, lightweight: true }),
+      });
+      const d = await safeJson(r);
+      if (d.success && d.product?.parentAsin) {
+        p.parentAsin = d.product.parentAsin;
+        if (p.parentAsin === p.asin) sameAsAsin++;
+        markDirty(p.id);
+        ok++;
+      } else {
+        failed++;
+      }
+    } catch(e) {
+      failed++;
+    }
+
+    // Periodic save + progress
+    if ((i+1) % 25 === 0) {
+      save();
+      const eta = Math.ceil((Date.now() - startTs) / (i+1) * (all.length - i - 1) / 1000);
+      toast(`🧬 Backfill: ${i+1}/${all.length} (${ok} ok, ${failed} failed, ~${eta}s left)`, 'info', 2000);
+    }
+    // Small delay so we don't hammer the scrape proxy
+    await new Promise(res => setTimeout(res, 200));
+  }
+
+  save();
+  const summary = `Backfill complete: ${ok} populated, ${failed} failed, ${sameAsAsin} were single-ASIN products`;
+  toast(`✅ ${summary}`, 'success', 8000);
+  addLog('info', 'Backfill parentAsin complete', summary);
+}
+
 function _findDuplicates(products) {
-  // Group by: same sourceUrl, same parentAsin, or same normalized title (first 40 chars)
+  // Group by: same sourceUrl, same child asin, same parentAsin, or same normalized title.
+  // Child ASIN added because the parentAsin field is unpopulated on legacy products,
+  // so without it the existing 113 same-ASIN duplicates wouldn't be caught.
   const seenUrl     = {};  // sourceUrl → first product id
+  const seenAsin    = {};  // asin → first product id
   const seenParent  = {};  // parentAsin → first product id
   const seenTitle   = {};  // normTitle → first product id
   const duplicateIds = new Set();
@@ -8658,12 +8915,16 @@ function _findDuplicates(products) {
 
   for (const p of sorted) {
     const url = (p.sourceUrl||'').split('?')[0].toLowerCase();
+    const asin = p.asin || '';
     const parent = p.parentAsin || '';
     const nt = _normTitle(p.title);
     let isDupe = false;
 
     if (url && seenUrl[url])       { isDupe = true; }
     else if (url)                  { seenUrl[url] = p.id; }
+
+    if (!isDupe && asin && seenAsin[asin]) { isDupe = true; }
+    else if (!isDupe && asin)      { seenAsin[asin] = p.id; }
 
     if (!isDupe && parent && seenParent[parent]) { isDupe = true; }
     else if (!isDupe && parent)    { seenParent[parent] = p.id; }

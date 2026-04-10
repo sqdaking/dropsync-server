@@ -2093,35 +2093,108 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
       product._pricesFailed = false;
     }
 
-    // ── Per-color images ──────────────────────────────────────────────────────
+    // ── Per-variation images ──────────────────────────────────────────────────
+    // CRITICAL: Amazon's swatchImgMap is a flat {value → url} where the keys are
+    // dimension VALUES (e.g. "Black", "Slim Fit", "Vintage Pattern"). The dimension
+    // those values belong to is NOT necessarily the primary dimension we picked
+    // for the eBay listing's role priority. On real listings the image-driving
+    // dim can be color, size, style, pattern, fit_type, or any compound — it's
+    // whatever Amazon chose to put swatches on. The old code blindly looked up
+    // swatchImgMap[pv] where pv was a primaryDim value, which silently produced
+    // 0 matches whenever the image dim != primary dim, then fell back to a
+    // round-robin gallery slice that gave every variant essentially random images.
+    //
+    // Fix: detect the image dim by counting how many keys in swatchImgMap match
+    // each variation's values. The variation with the highest match count is the
+    // dim Amazon actually uses for image variation. If detection fails (no swatch
+    // map at all, or no variation matches), fall back to primaryDim as before.
+    const _normVal = s => String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    const _detectImageDim = () => {
+      const swatchKeys = Object.keys(swatchImgMap);
+      if (!swatchKeys.length) return null;
+      const swatchKeysNorm = swatchKeys.map(_normVal);
+      let best = null, bestScore = 0;
+      for (const dim of effectiveDims) {
+        if (!dim?.values?.length) continue;
+        let score = 0;
+        for (const v of dim.values) {
+          const vn = _normVal(v);
+          if (!vn) continue;
+          // Direct match (or substring — handles compound swatch alts like "Black 2-Pack" matching "Black")
+          if (swatchKeysNorm.some(sk => sk === vn || sk.includes(vn) || vn.includes(sk))) score++;
+        }
+        // Require at least 2 matches OR >=50% coverage to count as "this dim drives images"
+        const coverage = score / dim.values.length;
+        const qualifies = score >= 2 || (score >= 1 && coverage >= 0.5);
+        if (qualifies && score > bestScore) {
+          best = dim;
+          bestScore = score;
+        }
+      }
+      if (best) console.log(`[images] detected image dim: "${best.name}" (${bestScore}/${best.values.length} swatch matches)`);
+      else      console.log(`[images] no clear image dim from ${swatchKeys.length} swatches — defaulting to primary "${primaryDim?.name}"`);
+      return best;
+    };
+    const imageDim = _detectImageDim() || primaryDim;
+    const imageDimVals = imageDim.values || primaryVals;
+    // Build a normalized swatch lookup so values like "Black 2x6" still find "Black"
+    const _swatchByNorm = {};
+    for (const [k, v] of Object.entries(swatchImgMap)) {
+      const kn = _normVal(k);
+      if (kn && !_swatchByNorm[kn]) _swatchByNorm[kn] = v;
+    }
+    const _findSwatch = val => {
+      const vn = _normVal(val);
+      if (!vn) return null;
+      if (_swatchByNorm[vn]) return _swatchByNorm[vn];
+      // Try substring matches (compound swatch alts)
+      for (const [kn, url] of Object.entries(_swatchByNorm)) {
+        if (kn.includes(vn) || vn.includes(kn)) return url;
+      }
+      return null;
+    };
+
+    // Build per-image-dim image map (was: per-primary-dim, hardcoded)
     const colorImgMap = {};
-    for (const pv of primaryVals) colorImgMap[pv] = swatchImgMap[pv] ? [swatchImgMap[pv]] : [];
-    // Fetch images for primaries that don't have swatch images
-    const needImg = primaryVals.filter(pv => !colorImgMap[pv]);
+    for (const iv of imageDimVals) {
+      const swatch = _findSwatch(iv);
+      colorImgMap[iv] = swatch ? [swatch] : [];
+    }
+    // Fetch images for image-dim values that don't have swatch images.
+    // Look up an ASIN whose combo includes this image-dim value (could be on
+    // either side of the | delimiter since image dim isn't always primary).
+    const needImg = imageDimVals.filter(iv => !colorImgMap[iv]?.length);
     if (needImg.length) {
       // Pass 1: use asinImgCache (already extracted during price fetch — free, no extra requests)
-      for (const pv of needImg) {
-        const _pvAsin = primaryToAsins[pv]?.[0]
-          || Object.entries(comboAsin).find(([k]) => k.split('|')[0] === pv)?.[1];
-        if (_pvAsin && asinImgCache[_pvAsin]) colorImgMap[pv] = asinImgCache[_pvAsin]; // now array
+      for (const iv of needImg) {
+        // Find any combo whose key contains this image-dim value
+        const ivn = _normVal(iv);
+        const _ivAsin = Object.entries(comboAsin).find(([k]) => {
+          const parts = k.split('|').map(_normVal);
+          return parts.some(p => p === ivn);
+        })?.[1];
+        if (_ivAsin && asinImgCache[_ivAsin]) colorImgMap[iv] = asinImgCache[_ivAsin];
       }
-      // Pass 2: fetch pages only for primaries still missing images
-      const stillNeedImg = needImg.filter(pv => !colorImgMap[pv]?.length);
+      // Pass 2: fetch pages only for image-dim values still missing images
+      const stillNeedImg = needImg.filter(iv => !colorImgMap[iv]?.length);
       if (stillNeedImg.length) {
-        await Promise.all(stillNeedImg.slice(0, 8).map(async pv => {
-          const asin = primaryToAsins[pv]?.[0]
-            || Object.entries(comboAsin).find(([k]) => k.split('|')[0] === pv)?.[1];
+        await Promise.all(stillNeedImg.slice(0, 8).map(async iv => {
+          const ivn = _normVal(iv);
+          const asin = Object.entries(comboAsin).find(([k]) => {
+            const parts = k.split('|').map(_normVal);
+            return parts.some(p => p === ivn);
+          })?.[1];
           if (!asin) return;
           const h = await fetchPage(`https://www.amazon.com/dp/${asin}`, ua);
-          if (h) { const imgs = extractAllImages(h); if (imgs.length) colorImgMap[pv] = imgs; }
+          if (h) { const imgs = extractAllImages(h); if (imgs.length) colorImgMap[iv] = imgs; }
         }));
       }
     }
-    // Fallback: assign from full hiRes pool for colors still missing images
+    // Fallback: assign from full hiRes pool for image-dim values still missing
     let fi = 0;
     const imgPool = allHiRes.length > 0 ? allHiRes : product.images;
-    for (const pv of primaryVals) {
-      if (!colorImgMap[pv]?.length) colorImgMap[pv] = [imgPool[fi++ % Math.max(1, imgPool.length)] || ''];
+    for (const iv of imageDimVals) {
+      if (!colorImgMap[iv]?.length) colorImgMap[iv] = [imgPool[fi++ % Math.max(1, imgPool.length)] || ''];
     }
 
     // product.images stays as the default color's 12 photos (set by extractVariantImages earlier)
@@ -2208,8 +2281,12 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
     product.sizePrices    = sizePrices;
     product.comboPrices   = comboPrices;
     product.comboShipping = comboShipping; // per-ASIN Amazon shipping cost
-    product.variationImages[primaryDim.name] = Object.fromEntries(
-      primaryVals.map(pv => [pv, Array.isArray(colorImgMap[pv]) ? colorImgMap[pv] : (colorImgMap[pv] ? [colorImgMap[pv]] : [])]).filter(([,imgs]) => imgs.length)
+    // Store variationImages under the DETECTED image dim, not blindly under primaryDim.
+    // imageDim was set above by _detectImageDim() — it's whichever variation Amazon's
+    // swatch alts actually match. Storing under the wrong dim is the root cause of
+    // wrong-image bugs on style/pattern/fit_type listings.
+    product.variationImages[imageDim.name] = Object.fromEntries(
+      imageDimVals.map(iv => [iv, Array.isArray(colorImgMap[iv]) ? colorImgMap[iv] : (colorImgMap[iv] ? [colorImgMap[iv]] : [])]).filter(([,imgs]) => imgs.length)
     );
     // Store per-ASIN images so push can map images to exact (Fit_type+Color) combos
     // Each unique ASIN has its own images; for 3-dim listings multiple combos share an ASIN
@@ -2223,6 +2300,10 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
     product._primaryDimName   = primaryDim.name;
     product._secondaryDimName = secondaryDim?.name || null;
     product._extraDimNames    = _extraDims.map(d => d.name); // all extra dims beyond primary+secondary
+    // Store the detected image-driving dim name explicitly. push and rebuild-photos
+    // use this to know which variationImages map to read from. Falls back to
+    // primaryDim.name when detection found no clear winner.
+    product._imageDimName     = imageDim.name;
     // FIX: store listing type so buildVariants can make correct qty decisions
     product._isFullyMultiAsin = isFullyMultiAsin;
     // Store OOS ASINs from sortedDimValues — survives even when comboAsin is empty (dtaMap blocked)
@@ -2382,11 +2463,21 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
     const prim = product.variations?.find(v => v.name === (primaryGroup?.name || product._primaryDimName));
     return _normalizeImgMap(prim?.images || {});
   })();
+  // Build the per-variant image map. PRIORITY: read from product._imageDimName
+  // first (set by the scraper based on which dim Amazon's swatches actually
+  // matched), then primaryDim, then the legacy 'Color' key. The old code went
+  // 'Color' → primary which was wrong for any listing whose images vary by
+  // style/pattern/fit_type/size.
+  const _imgDimName = product._imageDimName || primaryGroup?.name || product._primaryDimName;
   const imgMap = Object.assign(
     {},
+    // Lowest priority: legacy 'Color' fallback (kept for old products without _imageDimName)
     _normalizeImgMap(product.variationImages?.['Color'] || {}),
+    // Mid priority: primary dim's map (in case the scraper guessed wrong about image dim)
     primaryGroup ? _normalizeImgMap(product.variationImages?.[primaryGroup.name] || {}) : {},
-    _aeVarImgs, // AliExpress color swatch images
+    // Highest priority: explicit image dim from the new scraper detection
+    _imgDimName ? _normalizeImgMap(product.variationImages?.[_imgDimName] || {}) : {},
+    _aeVarImgs, // AliExpress color swatch images (highest, hand-set)
   );
 
   // FULLY-MULTI-ASIN: no fallback maps needed — blocked combos get qty=0 directly.
