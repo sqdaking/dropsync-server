@@ -4461,7 +4461,7 @@ async function pushExisting(pid, _overrides = {}) {
     if (productToPost.asin && !p.asin) p.asin = productToPost.asin;
     if (productToPost.parentAsin && !p.parentAsin) p.parentAsin = productToPost.parentAsin;
     if (d.skuToAsin && Object.keys(d.skuToAsin).length) p.skuToAsin = d.skuToAsin; // save for revise
-    markDirty(p.id); save(); renderProducts();
+    markDirty(p.id); save(); renderProducts(); renderDrafts();
     toast(d.duplicate ? `✅ Already listed on eBay (ID ${d.listingId}) — moved to Listed.` : `🎉 Live on eBay!`, d.duplicate ? 'info' : 'success');
     addLog('push', `Listed: ${p.title.slice(0,50)}`, `eBay ID ${p.ebayListingId}`, { productId: p.id, ebayId: p.ebayListingId });
     // Auto-promote at 2% fixed ad rate (fire-and-forget)
@@ -4469,7 +4469,7 @@ async function pushExisting(pid, _overrides = {}) {
       const _proTok = await ensureToken().catch(()=>null);
       if (_proTok) promoteListingAtRate(_proTok, d.listingId).catch(e => console.warn('[push] promote:', e.message));
     }
-  } catch (e) { toast(e.message, 'error', 6000); }
+  } catch (e) { console.error('[pushExisting] caught:', e); toast(e.message, 'error', 6000); }
 }
 
 
