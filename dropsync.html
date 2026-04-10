@@ -5010,29 +5010,37 @@ async function _amazonRelayTick() {
     console.log(`[amazon-relay] fetching job ${job.id}: ${job.url}`);
     let html = null, err = null;
     try {
-      // Fetch Amazon directly. Browser context = user's residential IP +
-      // any cookies they have for amazon.com (auto-included on cross-origin
-      // when credentials='include' AND server allows it). Even without
-      // cookies, the residential IP alone gets us past the bot block.
-      const ar = await fetch(job.url, {
-        method: 'GET',
-        credentials: 'include', // send amazon.com cookies if user has any
-        headers: {
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache',
-        },
-        // mode default = cors. If amazon.com responds without CORS headers
-        // we'll get an opaque response and html stays empty — that's the
-        // CORS limitation. The Claude in Chrome extension can fetch
-        // cross-origin without CORS via host_permissions; this code path
-        // assumes that environment OR a same-origin proxy.
-      });
-      if (ar.ok) {
-        html = await ar.text();
-        if (!html || html.length < 1000) { err = 'response too small'; html = null; }
+      // Prefer the Tampermonkey CORS-bypass bridge if installed.
+      // The userscript exposes window.__dropsyncRelayFetch which uses
+      // GM_xmlhttpRequest under the hood — runs outside the page's
+      // security context so amazon.com's missing CORS headers don't
+      // matter. Falls back to plain fetch (will hit CORS, but kept
+      // so the code works for users who haven't installed the script
+      // — they get clear console errors).
+      if (typeof window.__dropsyncRelayFetch === 'function') {
+        const ar = await window.__dropsyncRelayFetch(job.url);
+        if (ar.ok && ar.text) {
+          html = ar.text;
+          if (!html || html.length < 1000) { err = 'response too small'; html = null; }
+        } else {
+          err = `HTTP ${ar.status}`;
+        }
       } else {
-        err = `HTTP ${ar.status}`;
+        const ar = await fetch(job.url, {
+          method: 'GET',
+          credentials: 'include',
+          headers: {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+          },
+        });
+        if (ar.ok) {
+          html = await ar.text();
+          if (!html || html.length < 1000) { err = 'response too small'; html = null; }
+        } else {
+          err = `HTTP ${ar.status}`;
+        }
       }
     } catch(e) {
       err = e.message || 'fetch failed';
