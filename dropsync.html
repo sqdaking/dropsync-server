@@ -4986,11 +4986,15 @@ async function pushAll() {
   let ok = 0, failed = 0, skipped = 0;
   toast(`Pushing ${drafts.length} drafts to eBay…`, 'info', 4000);
 
-  // Parallel push with concurrency cap of 2 (was 3 — caused Railway crashes
-  // twice during large pushes because 3 parallel scrape+push flows plus the
-  // worker rotation saturated CPU). Push lock pauses the worker for the
-  // entire operation, so even at 2 we get a clean CPU lane.
-  const CONCURRENCY = 2;
+  // Parallel push with concurrency cap of 4. Safe now that the crash fix
+  // (40e33f6) is deployed AND the push lock (d8d1bda) pauses the worker for
+  // the duration of the push. I/O-bound flows, not CPU-bound — 4 parallel
+  // scrapes + eBay API calls on Pro tier is well under the ceiling.
+  const CONCURRENCY = 4;
+  // Pre-warm eBay token once — every parallel worker calling ensureToken
+  // independently serializes on the refresh mutex. Warming it up-front
+  // lets all 4 workers proceed in parallel from call 1.
+  try { await ensureToken(); } catch(e) {}
   try {
   let active = 0;
   const _pushOne = async (p) => {
@@ -4998,9 +5002,18 @@ async function pushAll() {
     try {
       const token = await ensureToken();
 
-      // Auto-scrape fresh data if images are missing
+      // Auto-scrape fresh data if images are missing OR draft is stale.
+      // Fresh bulk-imported drafts already have complete data from the import
+      // scrape — re-scraping adds 3-8s per draft for zero new information.
+      // Gate: only rescrape if no images, OR draft is >2h old, OR no comboPrices.
       let productToPost = { ...p };
-      if (!productToPost.images?.length && productToPost.sourceUrl) {
+      const _draftAgeH = productToPost.createdAt
+        ? (Date.now() - new Date(productToPost.createdAt).getTime()) / 3600000
+        : 999;
+      const _hasFreshData = productToPost.images?.length >= 2
+        && _draftAgeH < 2
+        && Object.keys(productToPost.comboPrices || {}).length > 0;
+      if (!_hasFreshData && productToPost.sourceUrl) {
         try {
           const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
