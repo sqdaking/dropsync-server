@@ -51,6 +51,19 @@ async function initDB() {
       );
       CREATE INDEX IF NOT EXISTS logs_created_idx ON logs(created_at DESC);
       CREATE INDEX IF NOT EXISTS logs_type_idx ON logs(type);
+      CREATE TABLE IF NOT EXISTS relay_queue (
+        id SERIAL PRIMARY KEY,
+        url TEXT NOT NULL,
+        asin TEXT,
+        status TEXT NOT NULL DEFAULT 'pending', -- pending | claimed | done | failed
+        html TEXT,
+        error TEXT,
+        requested_at TIMESTAMPTZ DEFAULT NOW(),
+        claimed_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS relay_queue_status_idx ON relay_queue(status, requested_at);
+      CREATE INDEX IF NOT EXISTS relay_queue_url_idx ON relay_queue(url);
     `);
     console.log('[DB] Schema ready');
   } finally {
@@ -245,9 +258,85 @@ function dbToProduct(row) {
   };
 }
 
+// ── Relay queue ──────────────────────────────────────────────────────────────
+// Browser-relayed Amazon fetches. The push handler enqueues a URL it needs
+// fetched, then awaits a result row. A browser tab polls /api/relay/needs,
+// claims the job, fetches Amazon from its residential IP + cookies, then
+// POSTs the HTML back to /api/relay/submit which marks the job done.
+//
+// Lifecycle: pending -> claimed -> (done | failed)
+// Stale claimed jobs (> 60s old) get returned to pending so a different
+// browser session can try them.
+async function enqueueRelayFetch(url, asin) {
+  // Dedup: if there's already a pending/claimed job for the same URL within
+  // the last 60s, return that ID instead of creating a new one. Push and
+  // sync often want the same ASIN within a few seconds.
+  const existing = await pool.query(
+    `SELECT id FROM relay_queue
+     WHERE url=$1 AND status IN ('pending','claimed')
+       AND requested_at > NOW() - INTERVAL '60 seconds'
+     ORDER BY id DESC LIMIT 1`, [url]);
+  if (existing.rows[0]) return existing.rows[0].id;
+  const r = await pool.query(
+    `INSERT INTO relay_queue(url, asin, status) VALUES($1, $2, 'pending') RETURNING id`,
+    [url, asin || null]);
+  return r.rows[0].id;
+}
+
+async function claimNextRelayJob() {
+  // Atomically grab the oldest pending job and mark it claimed. Use
+  // SKIP LOCKED so multiple concurrent pollers don't get the same row.
+  // Also auto-recover stale claims (claimed > 60s ago).
+  await pool.query(
+    `UPDATE relay_queue SET status='pending', claimed_at=NULL
+     WHERE status='claimed' AND claimed_at < NOW() - INTERVAL '60 seconds'`);
+  const r = await pool.query(
+    `UPDATE relay_queue SET status='claimed', claimed_at=NOW()
+     WHERE id = (
+       SELECT id FROM relay_queue WHERE status='pending'
+       ORDER BY requested_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+     )
+     RETURNING id, url, asin`);
+  return r.rows[0] || null;
+}
+
+async function submitRelayResult(id, html, error) {
+  await pool.query(
+    `UPDATE relay_queue
+     SET status=$2, html=$3, error=$4, completed_at=NOW()
+     WHERE id=$1`,
+    [id, error ? 'failed' : 'done', html || null, error || null]);
+}
+
+async function getRelayJob(id) {
+  const r = await pool.query(`SELECT * FROM relay_queue WHERE id=$1`, [id]);
+  return r.rows[0] || null;
+}
+
+// Poll the queue until the job is done/failed or timeout. Returns html or null.
+async function awaitRelayResult(id, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const job = await getRelayJob(id);
+    if (!job) return null;
+    if (job.status === 'done')   return job.html;
+    if (job.status === 'failed') return null;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return null; // timeout — caller falls back to direct fetch
+}
+
+async function cleanupOldRelayJobs() {
+  // Drop jobs older than 1 hour to keep table lean
+  await pool.query(`DELETE FROM relay_queue WHERE requested_at < NOW() - INTERVAL '1 hour'`);
+}
+
 module.exports = {
   pool, initDB,
   getSetting, setSetting, getAllSettings,
+  // Relay
+  enqueueRelayFetch, claimNextRelayJob, submitRelayResult,
+  awaitRelayResult, getRelayJob, cleanupOldRelayJobs,
   upsertProduct, getProducts, getProduct, updateProductSync,
   getProductsForSync, countProducts,
   addLog, getLogs, countLogs,

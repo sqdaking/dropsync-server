@@ -4935,13 +4935,129 @@ async function toggleBrowserRelay() {
   // Relay is always on — this just pauses/resumes the tick cycle
   if (_relayTimer) {
     stopBrowserRelay();
+    stopAmazonFetchRelay();
     toast('⏸ Browser Relay paused — Amazon fetches will fall back to the server (may get blocked)', 'warn', 5000);
   } else {
     S.browserRelay = true; save();
     startBrowserRelay();
+    startAmazonFetchRelay();
     toast('▶️ Browser Relay resumed — browser fetches Amazon, server only updates eBay', 'success', 4000);
   }
   renderSettings();
+}
+
+// ── Amazon page fetcher relay ────────────────────────────────────────────────
+// Polls /api/relay/needs every 2s. When the server has an Amazon URL it
+// needs scraped, this fetches it from the BROWSER context (residential IP +
+// real cookies + real browser fingerprint = ~95%+ success vs ~25% from
+// Railway) and POSTs the HTML back. The server's fetchPage() awaits the
+// result before falling back to direct.
+//
+// Throttle: enforce min 1500ms between fetches so we don't burn the user's
+// own residential IP. ~40 fetches/min ceiling — well under what a normal
+// browsing session does, spreads safely across the day.
+let _amazonRelayTimer = null;
+let _amazonRelayInflight = false;
+let _amazonRelayLastFetch = 0;
+let _amazonRelayHeartbeat = null;
+let _amazonRelayStats = { hits: 0, fails: 0, started: 0 };
+
+async function startAmazonFetchRelay() {
+  if (_amazonRelayTimer) return;
+  _amazonRelayStats.started = Date.now();
+  console.log('[amazon-relay] starting — will poll /api/relay/needs every 2s');
+  // Heartbeat tells the server we're alive so ebay.js fetchPage knows
+  // to route Amazon URLs through the relay queue instead of going direct.
+  const _heartbeat = async () => {
+    try {
+      await fetch(`${S.serverUrl}/api/relay/heartbeat`, { method: 'POST' });
+    } catch(e) {}
+  };
+  await _heartbeat();
+  _amazonRelayHeartbeat = setInterval(_heartbeat, 30000);
+  _amazonRelayTick();
+}
+
+function stopAmazonFetchRelay() {
+  if (_amazonRelayTimer) { clearTimeout(_amazonRelayTimer); _amazonRelayTimer = null; }
+  if (_amazonRelayHeartbeat) { clearInterval(_amazonRelayHeartbeat); _amazonRelayHeartbeat = null; }
+  console.log('[amazon-relay] stopped');
+}
+
+async function _amazonRelayTick() {
+  if (!S.browserRelay) { stopAmazonFetchRelay(); return; }
+  if (_amazonRelayInflight) {
+    _amazonRelayTimer = setTimeout(_amazonRelayTick, 1000);
+    return;
+  }
+  _amazonRelayInflight = true;
+  try {
+    // Poll for next pending job
+    const r = await fetch(`${S.serverUrl}/api/relay/needs`);
+    if (!r.ok) throw new Error(`needs fetch ${r.status}`);
+    const job = await r.json();
+    if (job.empty) {
+      // No work — poll again in 2s
+      _amazonRelayInflight = false;
+      _amazonRelayTimer = setTimeout(_amazonRelayTick, 2000);
+      return;
+    }
+    // Throttle: enforce min 1500ms gap between actual Amazon fetches
+    const sinceLast = Date.now() - _amazonRelayLastFetch;
+    if (sinceLast < 1500) await new Promise(res => setTimeout(res, 1500 - sinceLast));
+    _amazonRelayLastFetch = Date.now();
+
+    console.log(`[amazon-relay] fetching job ${job.id}: ${job.url}`);
+    let html = null, err = null;
+    try {
+      // Fetch Amazon directly. Browser context = user's residential IP +
+      // any cookies they have for amazon.com (auto-included on cross-origin
+      // when credentials='include' AND server allows it). Even without
+      // cookies, the residential IP alone gets us past the bot block.
+      const ar = await fetch(job.url, {
+        method: 'GET',
+        credentials: 'include', // send amazon.com cookies if user has any
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache',
+        },
+        // mode default = cors. If amazon.com responds without CORS headers
+        // we'll get an opaque response and html stays empty — that's the
+        // CORS limitation. The Claude in Chrome extension can fetch
+        // cross-origin without CORS via host_permissions; this code path
+        // assumes that environment OR a same-origin proxy.
+      });
+      if (ar.ok) {
+        html = await ar.text();
+        if (!html || html.length < 1000) { err = 'response too small'; html = null; }
+      } else {
+        err = `HTTP ${ar.status}`;
+      }
+    } catch(e) {
+      err = e.message || 'fetch failed';
+    }
+
+    // Submit result
+    await fetch(`${S.serverUrl}/api/relay/submit`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: job.id, html, error: err }),
+    });
+    if (err) {
+      _amazonRelayStats.fails++;
+      console.warn(`[amazon-relay] job ${job.id} failed: ${err}`);
+    } else {
+      _amazonRelayStats.hits++;
+      console.log(`[amazon-relay] ✓ job ${job.id} (${html.length} bytes)`);
+    }
+  } catch(e) {
+    console.warn('[amazon-relay] tick error:', e.message);
+  }
+  _amazonRelayInflight = false;
+  // Immediately poll again — there might be another pending job. Throttle
+  // is enforced at the actual Amazon fetch, not at the polling level.
+  _amazonRelayTimer = setTimeout(_amazonRelayTick, 200);
 }
 
 // Auto-start relay on page load if it was enabled
@@ -4949,6 +5065,7 @@ function _maybeStartRelay() {
   if (S.browserRelay && S.token && S.serverUrl) {
     console.log('[relay] Auto-starting browser relay (was enabled)');
     startBrowserRelay();
+    startAmazonFetchRelay();
   }
 }
 
@@ -8071,6 +8188,7 @@ function renderSettings() {
   if (!_relayTimer) {
     S.browserRelay = true; save();
     startBrowserRelay();
+    startAmazonFetchRelay();
     console.log('[relay] auto-started — browser fetches Amazon, server is fallback only');
   }
   _maybeStartRelay();

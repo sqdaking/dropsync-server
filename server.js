@@ -206,7 +206,53 @@ app.post('/api/logs/bulk', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Worker / Sync status ──────────────────────────────────────────────────────
+// ── Browser relay ─────────────────────────────────────────────────────────────
+// The browser tab acts as a residential-IP fetch proxy for Amazon URLs that
+// Railway's IP gets blocked on. ebay.js fetchPage enqueues a job, the
+// browser polls /needs and claims it, fetches Amazon directly, POSTs the HTML
+// back to /submit. Heartbeat tells the server whether to use relay at all.
+
+let _relayHeartbeatTs = 0;
+
+app.post('/api/relay/heartbeat', (req, res) => {
+  _relayHeartbeatTs = Date.now();
+  res.json({ ok: true, ts: _relayHeartbeatTs });
+});
+
+// Server-side helper used by ebay.js to decide whether to use relay
+app.get('/api/relay/status', (req, res) => {
+  const ageSec = _relayHeartbeatTs ? (Date.now() - _relayHeartbeatTs) / 1000 : 999999;
+  res.json({ alive: ageSec < 60, ageSec, lastHeartbeat: _relayHeartbeatTs });
+});
+
+// Browser polls this. Returns next pending job or { empty: true }.
+app.get('/api/relay/needs', async (req, res) => {
+  try {
+    _relayHeartbeatTs = Date.now(); // polling counts as heartbeat too
+    const job = await db.claimNextRelayJob();
+    if (!job) return res.json({ empty: true });
+    res.json({ id: job.id, url: job.url, asin: job.asin });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Browser POSTs the fetched HTML (or error)
+app.post('/api/relay/submit', async (req, res) => {
+  try {
+    const { id, html, error } = req.body;
+    if (!id) return res.status(400).json({ error: 'id required' });
+    await db.submitRelayResult(id, html, error);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Cleanup old jobs every 5 min
+setInterval(() => db.cleanupOldRelayJobs().catch(() => {}), 5 * 60 * 1000);
+
+// Expose isRelayAlive() to other modules via app.locals
+app.locals.isRelayAlive = () => (Date.now() - _relayHeartbeatTs) < 60000;
+app.locals.relayDb = db; // ebay.js will read this for enqueue/await
+
+
 app.get('/api/worker/status', async (req, res) => {
   try {
     const lastRun     = await db.getSetting('last_sync_run');
@@ -352,6 +398,20 @@ app.get('/api/amazon', async (req, res) => {
 // ── eBay API handler — all actions run in-process on Railway ────────────────
 const handleEbay = require('./ebay');
 app.all('/api/ebay', handleEbay);
+
+// Inject the relay handle into ebay.js so fetchPage() can route Amazon URLs
+// through the browser-fetched queue when a tab is alive. Without this wire,
+// fetchPage falls back to direct fetch behavior (current pre-relay behavior).
+if (typeof handleEbay.setRelayHandle === 'function') {
+  handleEbay.setRelayHandle({
+    isAlive: () => app.locals.isRelayAlive(),
+    db: {
+      enqueueRelayFetch: db.enqueueRelayFetch,
+      awaitRelayResult:  db.awaitRelayResult,
+    },
+  });
+  console.log('[Server] relay handle wired into ebay.js fetchPage');
+}
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function start() {

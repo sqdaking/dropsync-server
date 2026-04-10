@@ -34,6 +34,13 @@ const UA_LIST = [
 const randUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 
 // ── Amazon page fetcher: direct + proxy fallbacks ─────────────────────────────
+// Module-level handle to the browser relay (set by server.js at boot via
+// setRelayHandle). When the browser tab is alive, fetchPage tries the relay
+// first for amazon.com URLs — residential IP + real cookies = ~95% success
+// vs ~25% from Railway IP. Falls back to direct fetch on relay timeout/miss.
+let _relayHandle = null; // { isAlive: () => bool, db: { enqueueRelayFetch, awaitRelayResult } }
+function setRelayHandle(h) { _relayHandle = h; }
+
 async function fetchPage(url, ua, maxAttempts) {
   const isBlocked = (html) => {
     if (!html || html.length < 1000) return true;
@@ -51,6 +58,27 @@ async function fetchPage(url, ua, maxAttempts) {
 
   const asin = url.match(/\/dp\/([A-Z0-9]{10})/)?.[1];
   const _asinTag = asin ? ` [${asin}]` : '';
+
+  // ── RELAY FIRST: try browser-fetched HTML before burning a direct attempt ──
+  // Only for amazon.com URLs (the only domain that gets blocked) and only
+  // when a browser tab is actively heartbeating. The relay enqueues the URL,
+  // a browser tab claims it, fetches Amazon from a residential IP, POSTs
+  // the HTML back. We await up to 25s. If the relay times out or returns
+  // blocked HTML, we fall through to the existing direct-fetch logic below.
+  if (_relayHandle && _relayHandle.isAlive() && /amazon\.(com|co\.uk|de|ca)/.test(url)) {
+    try {
+      const jobId = await _relayHandle.db.enqueueRelayFetch(url, asin);
+      const html = await _relayHandle.db.awaitRelayResult(jobId, 25000);
+      if (html && !isBlocked(html)) {
+        console.log(`[fetch] relay hit${_asinTag} (${html.length}b)`);
+        return html;
+      }
+      if (html) console.log(`[fetch] relay returned blocked HTML${_asinTag} — falling back to direct`);
+      else      console.log(`[fetch] relay timeout${_asinTag} — falling back to direct`);
+    } catch(e) {
+      console.warn(`[fetch] relay error${_asinTag}: ${e.message} — falling back to direct`);
+    }
+  }
 
   // Vary Accept-Language + platform per request to avoid uniform fingerprint
   const _langList = ['en-US,en;q=0.9', 'en-US,en;q=0.8,fr;q=0.5', 'en-GB,en;q=0.9', 'en-US,en;q=0.9,es;q=0.7', 'en-US,en;q=0.9,de;q=0.5'];
@@ -2829,6 +2857,37 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
     const bIn = b.qty > 0 ? 0 : 1;
     return aIn - bIn;
   });
+  // FINAL DEDUP: mkSku only adds a hash suffix when the raw exceeds maxSuffix.
+  // Two variants whose normalized values collide to the same short string both
+  // return `prefix+raw` with no hash → identical SKUs → eBay rejects the entire
+  // group with errorId 25724 "Duplicate SKUs found in the list". Walk the final
+  // list and rename any collision by appending an index. Preserves the prefix
+  // length budget by trimming the original SKU enough to fit the index suffix.
+  const _seenSkus = new Set();
+  let _renamed = 0;
+  for (const v of variants) {
+    if (!_seenSkus.has(v.sku)) {
+      _seenSkus.add(v.sku);
+      continue;
+    }
+    // Collision — append _2, _3, ... until unique. Trim original if needed
+    // so the result still fits within 50 chars.
+    const _SKU_MAX = 50;
+    let _idx = 2;
+    let _newSku;
+    do {
+      const _suffix = '_' + _idx;
+      const _maxBase = _SKU_MAX - _suffix.length;
+      const _base = v.sku.length > _maxBase ? v.sku.slice(0, _maxBase) : v.sku;
+      _newSku = _base + _suffix;
+      _idx++;
+    } while (_seenSkus.has(_newSku) && _idx < 1000);
+    console.warn(`[buildVariants] dedup collision: "${v.sku}" → "${_newSku}"`);
+    v.sku = _newSku;
+    _seenSkus.add(_newSku);
+    _renamed++;
+  }
+  if (_renamed > 0) console.log(`[buildVariants] renamed ${_renamed} colliding SKU${_renamed>1?'s':''}`);
   return variants.slice(0, 100);
 }
 
@@ -9153,4 +9212,5 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports.AE_DEPT_URLS = AE_DEPT_URLS;
   module.exports.wsScrapeProduct   = wsScrapeProduct;
   module.exports.wsExtractListings = wsExtractListings;
+  module.exports.setRelayHandle    = setRelayHandle;
 }
