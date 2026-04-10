@@ -4935,137 +4935,13 @@ async function toggleBrowserRelay() {
   // Relay is always on — this just pauses/resumes the tick cycle
   if (_relayTimer) {
     stopBrowserRelay();
-    stopAmazonFetchRelay();
     toast('⏸ Browser Relay paused — Amazon fetches will fall back to the server (may get blocked)', 'warn', 5000);
   } else {
     S.browserRelay = true; save();
     startBrowserRelay();
-    startAmazonFetchRelay();
     toast('▶️ Browser Relay resumed — browser fetches Amazon, server only updates eBay', 'success', 4000);
   }
   renderSettings();
-}
-
-// ── Amazon page fetcher relay ────────────────────────────────────────────────
-// Polls /api/relay/needs every 2s. When the server has an Amazon URL it
-// needs scraped, this fetches it from the BROWSER context (residential IP +
-// real cookies + real browser fingerprint = ~95%+ success vs ~25% from
-// Railway) and POSTs the HTML back. The server's fetchPage() awaits the
-// result before falling back to direct.
-//
-// Throttle: enforce min 1500ms between fetches so we don't burn the user's
-// own residential IP. ~40 fetches/min ceiling — well under what a normal
-// browsing session does, spreads safely across the day.
-let _amazonRelayTimer = null;
-let _amazonRelayInflight = false;
-let _amazonRelayLastFetch = 0;
-let _amazonRelayHeartbeat = null;
-let _amazonRelayStats = { hits: 0, fails: 0, started: 0 };
-
-async function startAmazonFetchRelay() {
-  if (_amazonRelayTimer) return;
-  _amazonRelayStats.started = Date.now();
-  console.log('[amazon-relay] starting — will poll /api/relay/needs every 2s');
-  // Heartbeat tells the server we're alive so ebay.js fetchPage knows
-  // to route Amazon URLs through the relay queue instead of going direct.
-  const _heartbeat = async () => {
-    try {
-      await fetch(`${S.serverUrl}/api/relay/heartbeat`, { method: 'POST' });
-    } catch(e) {}
-  };
-  await _heartbeat();
-  _amazonRelayHeartbeat = setInterval(_heartbeat, 30000);
-  _amazonRelayTick();
-}
-
-function stopAmazonFetchRelay() {
-  if (_amazonRelayTimer) { clearTimeout(_amazonRelayTimer); _amazonRelayTimer = null; }
-  if (_amazonRelayHeartbeat) { clearInterval(_amazonRelayHeartbeat); _amazonRelayHeartbeat = null; }
-  console.log('[amazon-relay] stopped');
-}
-
-async function _amazonRelayTick() {
-  if (!S.browserRelay) { stopAmazonFetchRelay(); return; }
-  if (_amazonRelayInflight) {
-    _amazonRelayTimer = setTimeout(_amazonRelayTick, 1000);
-    return;
-  }
-  _amazonRelayInflight = true;
-  try {
-    // Poll for next pending job
-    const r = await fetch(`${S.serverUrl}/api/relay/needs`);
-    if (!r.ok) throw new Error(`needs fetch ${r.status}`);
-    const job = await r.json();
-    if (job.empty) {
-      // No work — poll again in 2s
-      _amazonRelayInflight = false;
-      _amazonRelayTimer = setTimeout(_amazonRelayTick, 2000);
-      return;
-    }
-    // Throttle: enforce min 1500ms gap between actual Amazon fetches
-    const sinceLast = Date.now() - _amazonRelayLastFetch;
-    if (sinceLast < 1500) await new Promise(res => setTimeout(res, 1500 - sinceLast));
-    _amazonRelayLastFetch = Date.now();
-
-    console.log(`[amazon-relay] fetching job ${job.id}: ${job.url}`);
-    let html = null, err = null;
-    try {
-      // Prefer the Tampermonkey CORS-bypass bridge if installed.
-      // The userscript exposes window.__dropsyncRelayFetch which uses
-      // GM_xmlhttpRequest under the hood — runs outside the page's
-      // security context so amazon.com's missing CORS headers don't
-      // matter. Falls back to plain fetch (will hit CORS, but kept
-      // so the code works for users who haven't installed the script
-      // — they get clear console errors).
-      if (typeof window.__dropsyncRelayFetch === 'function') {
-        const ar = await window.__dropsyncRelayFetch(job.url);
-        if (ar.ok && ar.text) {
-          html = ar.text;
-          if (!html || html.length < 1000) { err = 'response too small'; html = null; }
-        } else {
-          err = `HTTP ${ar.status}`;
-        }
-      } else {
-        const ar = await fetch(job.url, {
-          method: 'GET',
-          credentials: 'include',
-          headers: {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache',
-          },
-        });
-        if (ar.ok) {
-          html = await ar.text();
-          if (!html || html.length < 1000) { err = 'response too small'; html = null; }
-        } else {
-          err = `HTTP ${ar.status}`;
-        }
-      }
-    } catch(e) {
-      err = e.message || 'fetch failed';
-    }
-
-    // Submit result
-    await fetch(`${S.serverUrl}/api/relay/submit`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: job.id, html, error: err }),
-    });
-    if (err) {
-      _amazonRelayStats.fails++;
-      console.warn(`[amazon-relay] job ${job.id} failed: ${err}`);
-    } else {
-      _amazonRelayStats.hits++;
-      console.log(`[amazon-relay] ✓ job ${job.id} (${html.length} bytes)`);
-    }
-  } catch(e) {
-    console.warn('[amazon-relay] tick error:', e.message);
-  }
-  _amazonRelayInflight = false;
-  // Immediately poll again — there might be another pending job. Throttle
-  // is enforced at the actual Amazon fetch, not at the polling level.
-  _amazonRelayTimer = setTimeout(_amazonRelayTick, 200);
 }
 
 // Auto-start relay on page load if it was enabled
@@ -5073,7 +4949,6 @@ function _maybeStartRelay() {
   if (S.browserRelay && S.token && S.serverUrl) {
     console.log('[relay] Auto-starting browser relay (was enabled)');
     startBrowserRelay();
-    startAmazonFetchRelay();
   }
 }
 
@@ -5111,15 +4986,11 @@ async function pushAll() {
   let ok = 0, failed = 0, skipped = 0;
   toast(`Pushing ${drafts.length} drafts to eBay…`, 'info', 4000);
 
-  // Parallel push with concurrency cap of 4. Safe now that the crash fix
-  // (40e33f6) is deployed AND the push lock (d8d1bda) pauses the worker for
-  // the duration of the push. I/O-bound flows, not CPU-bound — 4 parallel
-  // scrapes + eBay API calls on Pro tier is well under the ceiling.
-  const CONCURRENCY = 4;
-  // Pre-warm eBay token once — every parallel worker calling ensureToken
-  // independently serializes on the refresh mutex. Warming it up-front
-  // lets all 4 workers proceed in parallel from call 1.
-  try { await ensureToken(); } catch(e) {}
+  // Parallel push with concurrency cap of 2 (was 3 — caused Railway crashes
+  // twice during large pushes because 3 parallel scrape+push flows plus the
+  // worker rotation saturated CPU). Push lock pauses the worker for the
+  // entire operation, so even at 2 we get a clean CPU lane.
+  const CONCURRENCY = 2;
   try {
   let active = 0;
   const _pushOne = async (p) => {
@@ -5127,18 +4998,9 @@ async function pushAll() {
     try {
       const token = await ensureToken();
 
-      // Auto-scrape fresh data if images are missing OR draft is stale.
-      // Fresh bulk-imported drafts already have complete data from the import
-      // scrape — re-scraping adds 3-8s per draft for zero new information.
-      // Gate: only rescrape if no images, OR draft is >2h old, OR no comboPrices.
+      // Auto-scrape fresh data if images are missing
       let productToPost = { ...p };
-      const _draftAgeH = productToPost.createdAt
-        ? (Date.now() - new Date(productToPost.createdAt).getTime()) / 3600000
-        : 999;
-      const _hasFreshData = productToPost.images?.length >= 2
-        && _draftAgeH < 2
-        && Object.keys(productToPost.comboPrices || {}).length > 0;
-      if (!_hasFreshData && productToPost.sourceUrl) {
+      if (!productToPost.images?.length && productToPost.sourceUrl) {
         try {
           const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -8196,7 +8058,6 @@ function renderSettings() {
   if (!_relayTimer) {
     S.browserRelay = true; save();
     startBrowserRelay();
-    startAmazonFetchRelay();
     console.log('[relay] auto-started — browser fetches Amazon, server is fallback only');
   }
   _maybeStartRelay();
