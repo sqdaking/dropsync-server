@@ -2197,6 +2197,12 @@ async function bulkPushAll() {
   if (!S.token) { toast('Connect eBay in Settings first', 'error'); return; }
   if (BULK.pushing) return;
   BULK.pushing = true;
+  // Pause the worker for the entire bulk push — prevents Railway CPU contention
+  // between concurrent bulk-push API calls and the per-minute sync rotation that
+  // caused two crashes during large pushes. _releasePushLock in finally block
+  // (and the auto-expire heartbeat below) guarantees we can never deadlock.
+  _setPushLock(true);
+  _startPushLockHeartbeat();
   renderBulk();
 
   const toPush = [...BULK.queue]; // snapshot
@@ -2278,6 +2284,8 @@ async function bulkPushAll() {
   }
 
   BULK.pushing = false;
+  _setPushLock(false);
+  _stopPushLockHeartbeat();
   if (pushed > 0) {
     bulkLog(`🎉 Published ${pushed} listings! Click "Fetch Next 25 Deals" for a fresh batch with no duplicates.`, 'success');
     toast(`🎉 ${pushed} listings live on eBay!`, 'success', 5000);
@@ -2584,7 +2592,7 @@ async function eiImportSelected() {
       breadcrumbs: [],
       variations: [], variationImages: {},
       hasVariations: false,
-      quantity: l.quantity || 1,
+      quantity: 1, // FORCE 1 — do NOT inherit eBay's availableQuantity. Importing from eBay used to read l.quantity which preserved whatever was set on the listing (sometimes 23, 41, even 70), causing smartSync to push those wild values to every variant. Dropshipping needs qty=1 for safety.
       inStock: true,
       status: 'listed',
       ebaySku: l.ebaySku || '',
@@ -4487,8 +4495,10 @@ async function pushSelectedNow() {
   if (!selected.length) { toast('Select drafts first', 'warn', 2000); return; }
   if (!confirm(`Push ${selected.length} draft${selected.length>1?'s':''} to eBay immediately? Each will be published without review.`)) return;
   _setPushLock(true);
+  _startPushLockHeartbeat();
   toast(`⚡ Pushing ${selected.length} draft${selected.length>1?'s':''} now…`, 'info', 3000);
   let ok = 0, fail = 0;
+  try {
   for (const pid of selected) {
     const p = S.products?.find(x => x.id === pid);
     if (!p) continue;
@@ -4501,9 +4511,12 @@ async function pushSelectedNow() {
     }
     await new Promise(r => setTimeout(r, 500)); // small gap between pushes
   }
-  S._selectedIds = new Set();
-  save(); renderDrafts();
-  _setPushLock(false);
+  } finally {
+    S._selectedIds = new Set();
+    save(); renderDrafts();
+    _setPushLock(false);
+    _stopPushLockHeartbeat();
+  }
   toast(`⚡ Done — ${ok} pushed${fail ? ', ' + fail + ' failed' : ''}`, ok ? 'success' : 'error', 4000);
 }
 
@@ -4791,9 +4804,35 @@ async function _setPushLock(locked) {
   if (!S.serverUrl) return;
   fetch(`${S.serverUrl}/api/settings/bulk`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ push_lock: locked ? 'true' : 'false' }),
+    body: JSON.stringify({
+      push_lock: locked ? 'true' : 'false',
+      push_lock_at: locked ? String(Date.now()) : '0',
+    }),
   }).catch(() => {});
 }
+
+// Heartbeat — keeps push_lock alive during long bulk pushes. If the tab crashes
+// or closes, the heartbeat stops, push_lock_at ages past 90s, and the worker's
+// expire check (in worker.js) treats it as stale and resumes automatically.
+// Prevents the "forever-frozen worker" deadlock the user hit twice today.
+let _pushLockHeartbeat = null;
+function _startPushLockHeartbeat() {
+  if (_pushLockHeartbeat) return;
+  _pushLockHeartbeat = setInterval(() => _setPushLock(true), 30000);
+}
+function _stopPushLockHeartbeat() {
+  if (_pushLockHeartbeat) { clearInterval(_pushLockHeartbeat); _pushLockHeartbeat = null; }
+}
+// Safety: release lock on tab close / navigate away
+window.addEventListener('beforeunload', () => {
+  if (_pushLockHeartbeat) {
+    _stopPushLockHeartbeat();
+    navigator.sendBeacon?.(`${S.serverUrl}/api/settings/bulk`, new Blob(
+      [JSON.stringify({ push_lock: 'false', push_lock_at: '0' })],
+      { type: 'application/json' }
+    ));
+  }
+});
 
 async function toggleWorkerPause() {
   if (!S.serverUrl) { toast('Railway server URL not set in Settings', 'error'); return; }
@@ -4943,12 +4982,16 @@ async function pushAll() {
   if (btn) { btn.disabled = true; btn.innerHTML = '<span style="display:inline-flex;align-items:center;gap:5px"><div class="spinner" style="width:11px;height:11px"></div> Pushing…</span>'; }
 
   _setPushLock(true);
+  _startPushLockHeartbeat();
   let ok = 0, failed = 0, skipped = 0;
   toast(`Pushing ${drafts.length} drafts to eBay…`, 'info', 4000);
 
-  // Parallel push with concurrency cap of 3
-  // eBay rate limit is per-day not per-second — 3 concurrent is safe and ~3× faster
-  const CONCURRENCY = 3;
+  // Parallel push with concurrency cap of 2 (was 3 — caused Railway crashes
+  // twice during large pushes because 3 parallel scrape+push flows plus the
+  // worker rotation saturated CPU). Push lock pauses the worker for the
+  // entire operation, so even at 2 we get a clean CPU lane.
+  const CONCURRENCY = 2;
+  try {
   let active = 0;
   const _pushOne = async (p) => {
     if (p.status === 'listed' && p.ebayListingId) { skipped++; return; }
@@ -5040,7 +5083,10 @@ async function pushAll() {
   await Promise.all(_workers);
 
   save(); renderDrafts();
-  _setPushLock(false);
+  } finally {
+    _setPushLock(false);
+    _stopPushLockHeartbeat();
+  }
   const parts = [`✅ Pushed ${ok}/${drafts.length}`];
   if (failed)  parts.push(`${failed} failed`);
   if (skipped) parts.push(`${skipped} skipped`);

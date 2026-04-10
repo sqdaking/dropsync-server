@@ -324,23 +324,42 @@ function cleanAmazonTitle(title, allDimValues) {
 // eBay has ONE page for ALL variants → title must be neutral
 function neutralizeTitle(title, product) {
   if (!title) return title;
-  let t = title + '';
+  const _original = title + '';
+  let t = _original;
 
-  // 1. Strip brand name from start — handle array (Amazon aspects) or string
+  // 1. Strip brand name from start — handle array (Amazon aspects) or string.
+  // Use fuzzy normalization so "BLACK+DECKER" matches "Black & Decker" in the title
+  // (Amazon stores brand with + but writes title with & — different formatting).
   const _rawBrand = product?.aspects?.Brand || product?.aspects?.['Brand Name'] || product?.brand || '';
   const brand = (Array.isArray(_rawBrand) ? _rawBrand[0] : _rawBrand || '').trim();
+  const _normForBrand = s => String(s||'').toLowerCase().replace(/[\s\+\-&]+/g, '');
+  const brandNorm = _normForBrand(brand);
   if (brand && brand.length > 1 && brand.toLowerCase() !== 'unbranded') {
+    // Try strict match first
     const brandEsc = brand.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    t = t.replace(new RegExp(`^${brandEsc}[\\s\\-–:,]+`, 'i'), '');
+    const _stricMatch = t.match(new RegExp(`^${brandEsc}[\\s\\-–:,]+`, 'i'));
+    if (_stricMatch) {
+      t = t.slice(_stricMatch[0].length);
+    } else if (brandNorm.length >= 4) {
+      // Fuzzy: try matching the first 1-4 words of the title against the normalized brand
+      const _ws = t.split(/\s+/);
+      for (let nw = Math.min(4, _ws.length); nw >= 1; nw--) {
+        const candidate = _ws.slice(0, nw).join(' ');
+        if (_normForBrand(candidate) === brandNorm) {
+          // Strip the candidate + any trailing separator
+          t = t.slice(candidate.length).replace(/^[\s\-–:,]+/, '');
+          break;
+        }
+      }
+    }
   }
 
   // 1b. Auto-detect unlisted brand at start (only if aspects.Brand didn't already strip one)
-  const _brandWasStripped = brand && brand.length > 1 && t !== (title + '');
+  const _brandWasStripped = brand && brand.length > 1 && t !== _original;
   if (!_brandWasStripped) {
     const COMMON_STARTS = new Set(['women','womens','mens','men','girls','boys','kids','baby',
       'plus','size','new','for','the','and','one','two','set','pack','case','high','low',
       'long','short','black','white','red','blue','pink','purple','green','gray','grey','navy']);
-    // Brand word: starts with capital, no apostrophe suffix, not a common garment word
     const _isBrandWord = w => w.length >= 3 && w.length <= 15 && /^[A-Z]/.test(w)
       && !/'s?$/.test(w) && !COMMON_STARTS.has(w.toLowerCase());
     const _ws = t.split(/\s+/);
@@ -355,39 +374,117 @@ function neutralizeTitle(title, product) {
     }
   }
 
-  // 2. Collect all variation values from the product to strip from title
+  // 2. Build the comprehensive strip set: every variation value from this product.
+  // We use the actual variations data so we never strip a word that isn't a variant
+  // for THIS product (avoids butchering "Black & Decker" when Black is a real color).
   const varValues = new Set();
+  const hasColorDim = (product?.variations || []).some(vg => /color|colour/i.test(vg.name || ''));
+  const hasSizeDim  = (product?.variations || []).some(vg => /size|length|width/i.test(vg.name || ''));
+  const hasStyleDim = (product?.variations || []).some(vg => /style|pattern|fit/i.test(vg.name || ''));
   for (const vg of (product?.variations || [])) {
     for (const v of (vg.values || [])) {
       const val = (v.value || '').trim();
-      if (val && val.length > 1) varValues.add(val.toLowerCase());
+      if (!val || val.length < 2) continue;
+      varValues.add(val.toLowerCase());
     }
   }
-  // Strip variation values appearing at end after separator (", Black" / "- Large" / " | Red")
-  for (const val of varValues) {
-    const esc = val.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // After comma/dash/pipe at end
-    t = t.replace(new RegExp('[,\\s]+[\\-–|]?\\s*' + esc + '\\s*$', 'i'), '');
-    // Bare value at very end
-    t = t.replace(new RegExp('\\b' + esc + '\\s*$', 'i'), '').trim();
+
+  // Helper: regex-escape a string
+  const _esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // 3. Strip parenthesized chunks that contain ANY variation value or generic
+  // descriptor. "(Beige, 9x12)", "(4-Pack)", "(Queen, Pink)" all gone.
+  t = t.replace(/\s*[\(\[]([^\)\]]{1,80})[\)\]]/g, (full, inner) => {
+    const innerLower = inner.toLowerCase();
+    // Strip if any full variation value appears inside
+    for (const val of varValues) {
+      if (val.length >= 3 && innerLower.includes(val)) return ' ';
+    }
+    // Strip if it looks like a pack count, dimension, or generic color/size
+    if (/\b\d+\s*[-]?\s*(pack|count|piece|pcs?|set|ct)\b/i.test(inner)) return ' ';
+    if (/\b\d+(?:\.\d+)?\s*['"]?\s*[xX×]\s*\d+/.test(inner)) return ' '; // 9x12, 3.28x7.05
+    if (/\b\d+(?:\.\d+)?\s*(?:inch|in|ft|cm|mm|m|"|')\b/i.test(inner)) return ' ';
+    if (/\b(small|medium|large|x-?large|xl|xxl|2xl|3xl|4xl|5xl|one size|plus size|petite|tall|regular|queen|king|twin|full|cal king|california king)\b/i.test(inner)) return ' ';
+    if (/\b(black|white|red|blue|green|yellow|pink|purple|orange|brown|gray|grey|beige|navy|teal|gold|silver|ivory|cream|tan|charcoal|coral|burgundy|wine|mint|lavender|nude|khaki|multicolor|floral|leopard|striped|plaid|solid|brushed|matte|satin|polished|brass|nickel|chrome|copper|bronze)\b/i.test(inner)) return ' ';
+    return full; // keep — not variation-related
+  });
+
+  // 4. Strip pack-count phrases anywhere in the title.
+  // Handles: "2 Pack", "10-Pack", "[2-Pack]", "Pack of 4", "Set of 6", "12 Count", "30 Pcs"
+  t = t.replace(/\b\d+\s*[-]?\s*(?:pack|packs|count|counts|piece|pieces|pcs?|set|sets|ct|qty)\b/gi, ' ');
+  t = t.replace(/\b(?:pack|set|box|bag|bundle|case)\s*of\s*\d+\b/gi, ' ');
+
+  // 5. Strip dimension strings anywhere: "9x12", "60x80x12", `5"x3"`, "3.28 FT x 7.05 FT",
+  // "5 Inch", "128mm", "2x3 ft", `2'x3'`. We're aggressive — these are almost always variant data.
+  t = t.replace(/\b\d+(?:\.\d+)?\s*['"]?\s*[xX×]\s*\d+(?:\.\d+)?\s*['"]?(?:\s*[xX×]\s*\d+(?:\.\d+)?\s*['"]?)?(?:\s*(?:ft|in|inch|cm|mm|m))?\b/gi, ' ');
+  t = t.replace(/\b\d+(?:\.\d+)?\s*(?:inch|inches|in|ft|feet|cm|mm|m)\b/gi, ' ');
+  t = t.replace(/\b\d+(?:\.\d+)?\s*["']/g, ' '); // bare 5", 3'
+
+  // 6. Strip variation values ANYWHERE in title (not just end). Word-boundary
+  // matching so "Black" doesn't strip "Blackberry". Sorted by length DESC so
+  // "Brushed Nickel" matches before "Nickel" alone. We strip ONLY full
+  // variation values, not individual words within them — splitting "Nugget Black"
+  // into "nugget" + "black" would butcher product names like "Nugget Ice Maker"
+  // where the brand/product type appears at the start of every variation value.
+  // The backstop in step 7 handles standalone color/material words separately.
+  const _sortedVarValues = [...varValues].sort((a, b) => b.length - a.length);
+  for (const val of _sortedVarValues) {
+    if (val.length < 3) continue;
+    const esc = _esc(val);
+    t = t.replace(new RegExp('\\b' + esc + '\\b', 'gi'), ' ');
   }
 
-  // 3. Strip compound variant suffixes like "Red / XX-Large" at end
-  t = t.replace(/[,\s]+[\-\u2013/|]?\s*(Red|Black|Blue|White|Pink|Purple|Gray|Grey|Green|Yellow|Brown|Orange|Navy|Teal|Beige|Ivory|Cream|Coral|Lavender|Mint|Burgundy|Gold|Silver|Multicolor|Floral|Leopard|Striped|Plaid|Solid)\s*[/|]?\s*(XXS|XS|X-Small|Small|Medium|Large|X-Large|XL|XX-Large|XXL|2XL|3XL|4XL|5XL|One Size|Plus Size)?\s*$/gi, '');
+  // 7. Backstop strip: standalone generic color/size/material words if the
+  // product HAS that dimension. Catches values that weren't in varValues
+  // because Amazon's title uses synonyms (e.g., title says "Crimson" but
+  // variation list calls it "Red").
+  if (hasColorDim) {
+    t = t.replace(/\b(?:black|white|ivory|cream|red|crimson|scarlet|blue|navy|royal|teal|turquoise|aqua|cyan|green|olive|forest|emerald|sage|mint|lime|yellow|gold|mustard|amber|orange|coral|peach|salmon|pink|rose|fuchsia|magenta|purple|violet|lavender|lilac|plum|brown|tan|beige|nude|khaki|chocolate|brick|rust|burgundy|wine|maroon|gray|grey|charcoal|silver|chrome|nickel|brass|bronze|copper|natural|clear|translucent|multicolor|multi[- ]color|floral|leopard|zebra|striped|plaid|solid|polka dot|tie dye|camo|camouflage)\b/gi, ' ');
+    t = t.replace(/\b(?:brushed|matte|satin|glossy|polished|metallic|frosted|distressed|vintage|antique)\s+(?=[a-z])/gi, ' ');
+  }
+  if (hasSizeDim) {
+    t = t.replace(/\b(?:xxs|xs|x-?small|small|medium|large|x-?large|xl|xx-?large|xxl|2xl|3xl|4xl|5xl|6xl|one size|plus size|petite|tall|regular|queen|king|twin xl|twin|full|cal king|california king)\b/gi, ' ');
+  }
 
-  // 4. Strip standalone color/size at end — loop to catch chained suffixes like "- Black, Small"
-  const VARIANT_SUFFIX = /[,\s]+[\-\u2013|]?\s*(XXS|XS|X-Small|Small|Medium|Large|X-Large|XL|XX-Large|XXL|2XL|3XL|4XL|5XL|6XL|One Size|Plus Size|Regular|Petite|Tall|Black|White|Ivory|Cream|Red|Blue|Green|Yellow|Pink|Purple|Orange|Brown|Gray|Grey|Charcoal|Beige|Nude|Navy|Teal|Turquoise|Lavender|Mint|Coral|Burgundy|Wine|Rust|Camel|Tan|Khaki|Multicolor|Multi-color|Floral|Leopard|Zebra|Striped|Plaid|Solid|Clear|Gold|Silver|Rose Gold|Bronze|Copper|Natural|Translucent)\s*$/gi;
-  let _prev;
-  do { _prev = t; t = t.replace(VARIANT_SUFFIX, '').replace(/[,\s]+[\-\u2013/|]+\s*$/, '').trim(); } while (t !== _prev);
+  // 8. Strip year (Amazon adds "2025"/"2026" for SEO)
+  t = t.replace(/\s+20(2[3-9]|[3-9]\d)\b/g, ' ');
 
-  // 5. Strip dimension strings at end like "60x80x12"
-  t = t.replace(/\s+\d+[xX]\d+(?:[xX]\d+)?\s*$/, '');
+  // 9. Cleanup: collapse spaces, fix punctuation, remove orphans
+  t = t.replace(/\(\s*\)|\[\s*\]/g, ' ');         // empty parens/brackets
+  // Strip orphan single chars between spaces — leftovers from stripped pack/dim
+  // patterns like "1/5 Pack" → "1/ " or "3 FT x 7 FT" → " x ".
+  t = t.replace(/(?:^|\s)[xX×\/](?=\s|$)/g, ' ');
+  t = t.replace(/(?:^|\s)\d+\s*[\/\-]\s*(?=\s|$)/g, ' '); // "1/" or "1-" leftover
+  // Strip orphan operators at very start — happens when a compound brand like
+  // "Black & Decker" had "Black" stripped as a variation value, leaving "& Decker"
+  t = t.replace(/^[\s,\-–|:&\+]+/, '');
+  // Strip "Size" if it's left orphaned (e.g., "King Size Pillow" → "Size Pillow"
+  // when King got stripped). Only strip when surrounded by other words on both sides.
+  if (hasSizeDim) {
+    t = t.replace(/^\s*size\s+/i, '');
+    t = t.replace(/\s+size\s+/gi, ' ');
+  }
+  t = t.replace(/\s*,\s*,+/g, ',');               // collapse multi-commas
+  t = t.replace(/\s*[-–|:]\s*[-–|:]+/g, ' - ');   // collapse multi-separators
+  t = t.replace(/[,\s]+([,)\]])/g, '$1');         // ", )" → ")"
+  t = t.replace(/([(\[])[,\s]+/g, '$1');          // "(, " → "("
+  t = t.replace(/^[\s,\-–|:]+|[\s,\-–|:]+$/g, ''); // strip leading/trailing punct
+  t = t.replace(/\s+/g, ' ').trim();
 
-  // 6. Strip year "2026" / "2025" anywhere in title (Amazon adds for SEO)
-  t = t.replace(/\s+20(2[3-9]|[3-9]\d)\b/g, '');
-
-  // 7. Clean up leftover punctuation/spaces
-  t = t.replace(/[,\-\u2013|:]+$/, '').replace(/\s{2,}/g, ' ').trim();
+  // 10. SAFETY: if we butchered the title down to <15 chars or <3 words,
+  // fall back to a less aggressive version (just brand-stripped). Better to
+  // ship a noisy title than a meaningless one.
+  if (t.length < 15 || t.split(/\s+/).filter(Boolean).length < 3) {
+    console.warn(`[neutralizeTitle] aggressive strip left "${t}" — falling back`);
+    // Fall back to just brand-strip + suffix-strip
+    let fb = _original;
+    if (brand && brand.length > 1 && brand.toLowerCase() !== 'unbranded') {
+      fb = fb.replace(new RegExp(`^${_esc(brand)}[\\s\\-–:,]+`, 'i'), '');
+    }
+    fb = fb.replace(/[,\s]+[\-–|]?\s*\([^)]+\)\s*$/g, '').trim();
+    fb = fb.replace(/[,\s]+[\-–|]?\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s*$/g, '').trim();
+    return fb;
+  }
 
   return t;
 }
@@ -4294,9 +4391,15 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       // ── Post-publish revise: set correct per-variant prices + quantities ─────
       // Uses comboPrices from fresh scrape — every variant gets its exact price.
       // bulk_update_price_quantity is the lightest API call: no inventory item PUT needed.
+      // CRITICAL: declared OUTSIDE the try block so the offerIdCache builder
+      // below at line ~4436 can read it. Previous version had it inside the try
+      // and crashed the entire Node process with `ReferenceError: _ppOfferMap is
+      // not defined` because const has block scope. Two Railway crashes during
+      // bulk push were both this exact line. Initialize empty so the ref is safe
+      // even if the post-publish revise block throws.
+      const _ppOfferMap = {}; // sku → { offerId, price, qty }
       try {
         // Get all offer IDs for published SKUs
-        const _ppOfferMap = {}; // sku → offerId
         for (let _ppi = 0; _ppi < variants.length; _ppi += 20) {
           await Promise.all(variants.slice(_ppi, _ppi + 20).map(async v => {
             try {

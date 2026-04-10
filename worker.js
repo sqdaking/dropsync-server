@@ -305,11 +305,23 @@ async function runForever() {
       }
 
       // ── Push lock — frontend is pushing a listing, hold off ──────────────────
+      // The frontend sends a heartbeat every 30s via push_lock_at. If the tab
+      // crashes or closes without releasing the lock, push_lock_at ages past
+      // 90s and we treat it as stale and resume. Prevents the "frozen worker"
+      // deadlock that previously required manual intervention via Settings.
       const _pushLock = (await db.getSetting('push_lock')) === 'true';
       if (_pushLock) {
-        console.log('[Worker] Push in progress — waiting 10s');
-        await sleep(10000);
-        continue;
+        const _pushLockAt = parseInt(await db.getSetting('push_lock_at') || '0') || 0;
+        const _ageMs = _pushLockAt > 0 ? (Date.now() - _pushLockAt) : 0;
+        if (_pushLockAt === 0 || _ageMs < 90000) {
+          console.log(`[Worker] Push in progress (lock age ${(_ageMs/1000).toFixed(0)}s) — waiting 10s`);
+          await sleep(10000);
+          continue;
+        }
+        // Stale — heartbeat stopped > 90s ago, frontend probably crashed/closed
+        console.warn(`[Worker] Push lock stale (age ${(_ageMs/1000).toFixed(0)}s) — auto-releasing`);
+        await db.setSetting('push_lock', 'false');
+        await db.setSetting('push_lock_at', '0');
       }
 
       // ── Priority: process frontend edit+sync requests immediately ─────────────
