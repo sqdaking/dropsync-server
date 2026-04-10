@@ -376,6 +376,9 @@ async function loadProductsFromRailway() {
         ...rp,
         // Keep local rich data that Railway may have stripped or never stored
         ebayListingId: rp.ebayListingId || local?.ebayListingId || null,
+        sourceUrl:     rp.sourceUrl     || local?.sourceUrl     || null,
+        asin:          rp.asin          || local?.asin          || null,
+        parentAsin:    rp.parentAsin    || local?.parentAsin    || null,
         images:        (rp.images?.length ? rp.images : null) || local?.images || [],
         bullets:       rp.bullets?.length ? rp.bullets : (local?.bullets || []),
         variations:    rp.variations?.length ? rp.variations : (local?.variations || []),
@@ -4453,6 +4456,10 @@ async function pushExisting(pid, _overrides = {}) {
     }
     p.status = 'listed'; p.ebaySku = d.sku; p.ebayListingId = d.listingId; p.ebayOfferId = d.offerId || ''; p.pushedAt = new Date().toISOString(); p._noOffers = false;
     p.lastSynced = new Date().toISOString();
+    // Defensive: ensure sourceUrl + asin survive the push (orphan bug guard)
+    if (productToPost.sourceUrl && !p.sourceUrl) p.sourceUrl = productToPost.sourceUrl;
+    if (productToPost.asin && !p.asin) p.asin = productToPost.asin;
+    if (productToPost.parentAsin && !p.parentAsin) p.parentAsin = productToPost.parentAsin;
     if (d.skuToAsin && Object.keys(d.skuToAsin).length) p.skuToAsin = d.skuToAsin; // save for revise
     markDirty(p.id); save(); renderProducts();
     toast(d.duplicate ? `✅ Already listed on eBay (ID ${d.listingId}) — moved to Listed.` : `🎉 Live on eBay!`, d.duplicate ? 'info' : 'success');
