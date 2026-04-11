@@ -160,24 +160,25 @@ async function fetchPage(url, ua, maxAttempts) {
     ...(extra || {}),
   });
 
-  // Direct attempts — HARD CAP AT 1.
-  // Retrying a blocked direct fetch with different UA/referer/cookies from
-  // the same Railway IP almost never unblocks (Amazon's block is on the IP,
-  // not the signature). Each wasted attempt burns egress, time, and looks
-  // more botty. One shot — if blocked, bail to the caller which either
-  // force-OOSes the variant (safe) or falls back to stored data.
-  // The relay path above (browser tab) is the only retry that actually helps,
-  // and it ran before this code. The `maxAttempts` arg from callers is now
-  // ignored for the direct path — intentional.
-  const _maxAttempts = 1;
-  const delays = [0];
+  // Direct attempts with increasing delays and varied URL/UA/referer combos.
+  // Note: an earlier optimization tried to cap this at 1 attempt because the
+  // server-side browser relay was supposed to carry most Amazon fetches. But
+  // the frontend poller for /api/relay/needs isn't wired into dropsync.html,
+  // so this direct path is the ONLY path today. Keep the retries — a blocked
+  // first attempt often unblocks on attempt 3-4 with a different UA/referer.
+  // Callers can still pass maxAttempts=1 (and smartSync per-ASIN does) to
+  // opt out when they'd rather fail fast.
+  const _maxAttempts = maxAttempts || 5;
+  const delays = [0, 1000, 2500, 5000, 10000];
   for (let i = 0; i < _maxAttempts; i++) {
     if (i > 0) await sleep(delays[i]);
     try {
       const uaIdx = (Date.now() + i * 7) % UA_LIST.length;
       const tryUrl = urlVariants[i % urlVariants.length];
       const referer = referers[i % referers.length];
-      const extra = undefined;
+      const extra = i === 3 ? { 'Cookie': 'session-id=000-0000000-0000000; i18n-prefs=USD; lc-main=en_US' }
+                  : i === 4 ? { 'Cookie': 'i18n-prefs=USD', 'X-Forwarded-For': '' }
+                  : undefined;
       const r = await fetch(tryUrl, {
         headers: makeHeaders(UA_LIST[uaIdx|0], referer, extra),
         redirect: 'follow',
@@ -187,11 +188,11 @@ async function fetchPage(url, ua, maxAttempts) {
         // ok fetch logged by caller's batch summary — suppress here to save log lines
         return html;
       }
-      console.warn(`[fetch] direct attempt ${i+1} blocked (${html.length}b)${_asinTag} — bailing (no retry)`);
+      console.warn(`[fetch] direct attempt ${i+1} blocked (${html.length}b)${_asinTag}`);
     } catch(e) { console.warn(`[fetch] direct attempt ${i+1} error: ${e.message}${_asinTag}`); }
   }
 
-  console.warn(`[fetch] direct blocked, no retry${_asinTag} — qty=0 (no price data)`);
+  console.warn(`[fetch] ALL strategies failed${_asinTag} — qty=0 (no price data)`);
   return '';
 }
 
