@@ -8727,7 +8727,10 @@ function aeScrapeProduct(html, aeId) {
   // Strategy 1: window.runParams (aliexpress.com server-rendered pages)
   const rpIdx = html.indexOf('window.runParams');
   if (rpIdx >= 0) {
-    const rpSlice = html.slice(rpIdx, rpIdx + 5000);
+    // Slice to end of html — skuPriceList JSON is often >100KB; the old 5000-char
+    // window made the brace counter fail and silently fall through to DOM strategy,
+    // so multi-variation listings never picked up combos.
+    const rpSlice = html.slice(rpIdx);
     const eqIdx = rpSlice.indexOf('=');
     if (eqIdx >= 0) {
       // Count braces to extract the object
@@ -8778,6 +8781,7 @@ function _aeParseFromRunParams(data, aeId, html) {
   for (const s of (sp?.props || [])) { if (s.attrName && s.attrValue) aspects[s.attrName] = s.attrValue; }
 
   const variations = [], comboPrices = {}, comboInStock = {};
+  const variationImages = {}; // dimName → { valueName: imageUrl } — top-level for downstream
   // Build prop→valueId→name lookup for normalizing skuPropIds → "Color|Size" keys
   const _propDims = {}; // propId → { name, valueMap: {valueId → displayName} }
   if (sm?.productSKUPropertyList?.length) {
@@ -8792,7 +8796,11 @@ function _aeParseFromRunParams(data, aeId, html) {
       });
       _propDims[String(prop.skuPropertyId || '')] = { name: dimName, valueMap };
       const varObj = { name: dimName, values: values.map(v => v.name), images: {} };
-      if (/color|colour/i.test(dimName)) varObj.images = Object.fromEntries(values.filter(v=>v.image).map(v=>[v.name, v.image]));
+      if (/color|colour/i.test(dimName)) {
+        varObj.images = Object.fromEntries(values.filter(v=>v.image).map(v=>[v.name, v.image]));
+        // Also propagate to top-level variationImages so downstream eBay push picks it up
+        variationImages[dimName] = varObj.images;
+      }
       variations.push(varObj);
     }
 
@@ -8828,6 +8836,7 @@ function _aeParseFromRunParams(data, aeId, html) {
     ebayTitle: title.replace(/[^a-zA-Z0-9 ,&\-().']/g,' ').replace(/\s+/g,' ').trim().slice(0,80),
     price, images, aeShipping, deliveryDays: 21,
     aspects, hasVariations: variations.length > 0, variations, comboPrices, comboInStock,
+    variationImages,
     comboAsin: {}, // no ASIN concept on AliExpress
     sizePrices: {},
     _isFullyMultiAsin: false,
@@ -8924,7 +8933,30 @@ function _aeParseFromDom(html, aeId) {
 
   const hasVariations = variations.length > 0;
 
-  console.log(`[aeParseFromDom] ${aeId}: "${title.slice(0,40)}" $${price} vars=${variations.map(v=>v.name+':'+v.values.length).join(',')}`);
+  // ── Synthesize combo data from base price ────────────────────────────────
+  // The .us SPA doesn't expose per-combo prices in the static HTML without
+  // clicking each one in the live React app. Without synthesizing combos here,
+  // downstream sees comboPrices={} and falls back to a single-variant listing,
+  // losing all the dimensions we just parsed. Apply the base buy-box price to
+  // every (primary, secondary) combo and assume in-stock — this matches what
+  // AE typically shows in its UI before any combo selection anyway.
+  const _comboPrices  = {};
+  const _comboInStock = {};
+  if (hasVariations && price > 0) {
+    const _primVar = variations.find(v => /color|colour/i.test(v.name)) || variations[0];
+    const _secVar  = variations.find(v => v !== _primVar);
+    const primVals = _primVar?.values || [''];
+    const secVals  = _secVar?.values  || [''];
+    for (const pv of primVals) {
+      for (const sv of secVals) {
+        const key = `${pv}|${sv}`;
+        _comboPrices[key]  = price;
+        _comboInStock[key] = true;
+      }
+    }
+  }
+
+  console.log(`[aeParseFromDom] ${aeId}: "${title.slice(0,40)}" $${price} vars=${variations.map(v=>v.name+':'+v.values.length).join(',')} combos=${Object.keys(_comboPrices).length}`);
 
   const _primVarDom = variations.find(v => /color|colour/i.test(v.name)) || variations[0];
   const _secVarDom  = variations.find(v => v !== _primVarDom);
@@ -8933,8 +8965,8 @@ function _aeParseFromDom(html, aeId) {
     ebayTitle: title.replace(/[^a-zA-Z0-9 ,&\-().']/g,' ').replace(/\s+/g,' ').trim().slice(0,80),
     price, images, aeShipping, deliveryDays: 21,
     aspects, hasVariations, variations,
-    comboPrices: {}, // per-combo prices not available from DOM without clicking each combo
-    comboInStock: {}, comboAsin: {}, sizePrices: {},
+    comboPrices: _comboPrices, // synthesized from base price (DOM strategy can't get per-combo)
+    comboInStock: _comboInStock, comboAsin: {}, sizePrices: {},
     _isFullyMultiAsin: false,
     _primaryDimName:   _primVarDom?.name || null,
     _secondaryDimName: _secVarDom?.name  || null,
@@ -9064,6 +9096,17 @@ function wsScrapeProduct(html, sourceUrl, wsSettings = {}) {
   const bullets = Array.isArray(tpl.highlights) ? tpl.highlights.filter(Boolean) : [];
 
   // ── Variations from variationMembership ───────────────────────────────────
+  // IMPORTANT: WebstaurantStore's variationGroups do NOT represent orthogonal
+  // axes (color × size) of one product like Amazon does. Each variationGroupItem
+  // is a separate sibling product page in the same family, with its own price,
+  // stock, and image. The previous implementation cross-multiplied two groups
+  // into a fake matrix, producing combos that don't exist as real SKUs and
+  // assigning the same price to every cell in a row.
+  //
+  // Correct approach: flatten ALL sibling items from ALL groups into a single
+  // "Option" dimension where each value = one real sibling product. Each value
+  // carries its own real price, stock, and image. This produces an honest
+  // multi-variation eBay listing without invented SKUs.
   const varGroups = tpl.variationMembership?.variationGroups || [];
   const variations = [];
   const comboPrices = {};
@@ -9073,57 +9116,36 @@ function wsScrapeProduct(html, sourceUrl, wsSettings = {}) {
   let _secondaryDimName = null;
 
   if (varGroups.length > 0) {
-    // Use first group as primary, second as secondary (if present)
-    const primGroup = varGroups[0];
-    const secGroup  = varGroups[1] || null;
-    _primaryDimName   = primGroup.optionName || 'Option';
-    _secondaryDimName = secGroup?.optionName || null;
-
+    // Use the first group's optionName as the dimension label, fall back to "Option"
+    _primaryDimName = varGroups[0].optionName || 'Option';
     const primVarImages = {};
-
-    // Build primary dimension values from variationGroupItems
-    const primItems = primGroup.variationGroupItems || [];
     const primValues = [];
-    for (const item of primItems) {
-      const vText = item.variationText || item.displayText || '';
-      if (!vText) continue;
-      const vPrice   = parseFloat(item.productPrice?.price || price || 0);
-      const vStock   = item.isInStock !== false;
-      const vImg     = wsImageUrl(item.seoImage || item.thumbnail || '');
-      if (vImg) primVarImages[vText] = [vImg];
-      primValues.push({ value: vText, price: vPrice, inStock: vStock, enabled: vStock });
+    const seenLabels = new Set();
 
-      if (secGroup) {
-        // Cross with secondary group items (assume all combos exist — WS usually has full matrix)
-        for (const sItem of (secGroup.variationGroupItems || [])) {
-          const sText  = sItem.variationText || sItem.displayText || '';
-          if (!sText) continue;
-          const sPrice  = parseFloat(sItem.productPrice?.price || vPrice || price);
-          const sStock  = sItem.isInStock !== false;
-          const comboKey = `${vText}|${sText}`;
-          // Use the more specific price — if item matches current product, use tpl price
-          comboPrices[comboKey]  = sPrice > 0 ? sPrice : vPrice;
-          comboInStock[comboKey] = vStock && sStock;
-        }
-      } else {
-        // Single dimension: key = "value|"
+    // Walk every group, every item — sibling products in the family
+    for (const group of varGroups) {
+      for (const item of (group.variationGroupItems || [])) {
+        const vText = (item.variationText || item.displayText || '').trim();
+        if (!vText || seenLabels.has(vText)) continue;
+        seenLabels.add(vText);
+
+        const vPrice = parseFloat(item.productPrice?.price || price || 0);
+        const vStock = item.isInStock !== false;
+        const vImg   = wsImageUrl(item.seoImage || item.thumbnail || '');
+        if (vImg) primVarImages[vText] = [vImg];
+
+        primValues.push({ value: vText, price: vPrice, inStock: vStock, enabled: vStock });
+
+        // Single-dimension combo key format: "value|"
         const comboKey = `${vText}|`;
         comboPrices[comboKey]  = vPrice;
         comboInStock[comboKey] = vStock;
       }
     }
-    variations.push({ name: _primaryDimName, values: primValues });
-    variationImages[_primaryDimName] = primVarImages;
 
-    if (secGroup) {
-      const secItems  = secGroup.variationGroupItems || [];
-      const secValues = secItems.map(item => ({
-        value:   item.variationText || item.displayText || '',
-        price:   parseFloat(item.productPrice?.price || price || 0),
-        inStock: item.isInStock !== false,
-        enabled: item.isInStock !== false,
-      })).filter(v => v.value);
-      if (secValues.length) variations.push({ name: _secondaryDimName, values: secValues });
+    if (primValues.length > 0) {
+      variations.push({ name: _primaryDimName, values: primValues });
+      variationImages[_primaryDimName] = primVarImages;
     }
   }
 
