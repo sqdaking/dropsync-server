@@ -956,13 +956,15 @@ async function fetchAmazonInBrowser(url) {
     console.log(`[browserFetch] direct blocked (expected) — trying proxies`);
   }
 
-  // Attempt 2: CORS proxies — add random delay to avoid rate limiting
+  // Attempt 2: CORS proxies — codetabs first (empirically the most reliable
+  // for Amazon), others as fallback in case codetabs has a bad window.
+  // Add random delay to avoid rate limiting.
   await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
   const proxies = [
+    () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
     () => S.serverUrl ? fetch(`${S.serverUrl}/api/amazon?url=${encodeURIComponent(cleanUrl)}`).then(r => { if(!r.ok) throw new Error('status '+r.status); return r.text(); }) : Promise.reject(new Error('no serverUrl')),
     () => fetch(`https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`,{headers:{'Accept':'text/html'}}).then(r=>r.text()),
     () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
-    () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
   ];
 
   for (let i = 0; i < proxies.length; i++) {
@@ -4396,76 +4398,14 @@ async function pushExisting(pid, _overrides = {}) {
     // Hard cap variants before push — belt-and-suspenders with import-time cap
     capCombos(p);
 
-    // ── Fetch Amazon in browser first (residential IP) → send as clientHtml to scraper ──
+    // Push directly with the draft's stored data — no re-scrape.
+    // The draft was built from a scrape at import time and db.js snapshots
+    // the full product into the JSONB `data` column. Re-scraping here was
+    // hitting Amazon via CORS-blocked direct fetch + dead public proxies,
+    // making push slow/unreliable. The worker's sync rotation reconciles
+    // price/qty drift within the next rotation window, so any stale field
+    // self-corrects automatically.
     let productToPost = { ...p };
-    if (productToPost.sourceUrl) {
-      toast('🔍 Fetching product from Amazon…', 'info', 3000);
-      try {
-        // Browser fetch first — scraper uses clientHtml so the server never touches Amazon
-        let clientHtml = null;
-        const _bFetch = await fetchAmazonInBrowser(productToPost.sourceUrl).catch(() => null);
-        if (_bFetch === '__EXTENSION__') {
-          clientHtml = window._extensionScrapeResult?.html || null;
-        } else if (_bFetch && _bFetch.length > 5000) {
-          clientHtml = _bFetch;
-        }
-
-        const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: productToPost.sourceUrl, clientHtml })
-        });
-        if (!sr.ok) { const et=await sr.text().catch(()=>''); console.warn('[push] scrape failed ('+sr.status+') — using cached data'); throw new Error('_SCRAPE_FAILED'); }
-      const sd = await safeJson(sr);
-        const scraped = sd.product || sd;
-        if (scraped.title || scraped.images?.length) {
-          // Merge all scraped fields — overwrite stale cached data
-          productToPost = {
-            ...productToPost,
-            images:          scraped.images?.length    ? scraped.images          : productToPost.images,
-            price:           scraped.price             || productToPost.price,
-            cost:            scraped.price             || productToPost.cost,
-            bullets:         scraped.bullets?.length   ? scraped.bullets         : productToPost.bullets,
-            description:     scraped.description       || productToPost.description,
-            variations:      scraped.variations?.length? scraped.variations      : productToPost.variations,
-            variationImages: scraped.variationImages   || productToPost.variationImages,
-            hasVariations:   scraped.hasVariations     ?? productToPost.hasVariations,
-            parentAsin:      scraped.parentAsin        || productToPost.parentAsin,
-            comboAsin:       scraped.comboAsin         || productToPost.comboAsin,
-            comboInStock:    scraped.comboInStock       || productToPost.comboInStock,
-            sizePrices:      scraped.sizePrices        || productToPost.sizePrices,
-            comboPrices:     scraped.comboPrices       || productToPost.comboPrices,
-            aspects:         scraped.aspects           || productToPost.aspects,
-            breadcrumbs:     scraped.breadcrumbs       || productToPost.breadcrumbs,
-            asinImages:      scraped.asinImages        || productToPost.asinImages, // ← key for rebuild-photos
-            _primaryDimName:   scraped._primaryDimName   || productToPost._primaryDimName,
-            _secondaryDimName: scraped._secondaryDimName || productToPost._secondaryDimName,
-            _extraDimNames:    scraped._extraDimNames    || productToPost._extraDimNames,
-            _pricesFailed:     scraped._pricesFailed,
-            inStock:           scraped.inStock         ?? productToPost.inStock,
-          };
-          // Warn if prices failed on fresh scrape — use cached prices instead of blocking
-          if (scraped._pricesFailed) {
-            console.warn('[push] fresh scrape prices blocked — using cached combo prices');
-            productToPost.comboPrices = p.comboPrices || productToPost.comboPrices;
-            productToPost._pricesFailed = false;
-          }
-          // Persist ALL image data back to localStorage — this is what rebuild-photos needs
-          p.images = productToPost.images;
-          p.price  = productToPost.price;
-          p.cost   = productToPost.cost;
-          if (scraped.asinImages)          p.asinImages       = scraped.asinImages;   // per-ASIN images for ALL dims
-          if (scraped.variations?.length)  p.variations       = scraped.variations;
-          if (scraped.variationImages)     p.variationImages  = scraped.variationImages;
-          if (scraped.comboAsin)           p.comboAsin        = scraped.comboAsin;
-          if (scraped.comboInStock)        p.comboInStock     = scraped.comboInStock;
-          if (scraped.comboPrices)         p.comboPrices      = scraped.comboPrices;
-          if (scraped._primaryDimName)     p._primaryDimName  = scraped._primaryDimName;
-          if (scraped._secondaryDimName)   p._secondaryDimName= scraped._secondaryDimName;
-          if (scraped._extraDimNames)      p._extraDimNames   = scraped._extraDimNames;
-          save();
-        }
-      } catch(e) { console.warn('[pushExisting] scrape failed, proceeding with cached data:', e.message); }
-    }
 
     const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
