@@ -3756,6 +3756,49 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   if (!product.hasVariations && !product.price && !product.cost && !product.myPrice)
     return res.status(400).json({ error: 'No price — re-import from the Import tab first.' });
 
+  // ── SINGLE-COMBO COLLAPSE ──────────────────────────────────────────────────
+  // Some products come out of the scraper flagged as multi-variation (with
+  // dim names like "Color"/"Size" populated) but with zero or one real combo.
+  // Examples: Amazon products that have a variation picker UI on the page but
+  // only one actual SKU; AliExpress DOM parses where combo synthesis produced
+  // a single (pVal, sVal) pair; Webstaurant items with a one-entry variation
+  // family. eBay's Inventory API rejects multi-variation listings with <2
+  // variants outright, so the push silently fails.
+  //
+  // Fix: count real, priced combos. If <2, force single-variant mode by
+  // wiping all the multi-variation fields. The downstream payload builder
+  // sees a clean single-variant product and pushes it as a regular fixed-
+  // price listing. This applies to all sources (Amazon/AE/WS) so any future
+  // scraper edge case producing the same shape gets handled too.
+  if (product.hasVariations) {
+    const _combos = product.comboPrices || {};
+    const _inStock = product.comboInStock || {};
+    const _realCombos = Object.keys(_combos).filter(k => {
+      const p = parseFloat(_combos[k]) || 0;
+      if (p <= 0) return false;
+      if (_inStock[k] === false) return false;
+      return true;
+    });
+    if (_realCombos.length < 2) {
+      console.log(`[push] collapsing to single-variant: hasVariations=true but only ${_realCombos.length} real combo(s) — dims were ${product._primaryDimName || 'none'}/${product._secondaryDimName || 'none'}`);
+      // Promote the single combo's price to top-level if base price is missing
+      if (!product.price && _realCombos.length === 1) {
+        product.price = parseFloat(_combos[_realCombos[0]]) || product.price || 0;
+      }
+      product.hasVariations    = false;
+      product.variations       = [];
+      product.variationImages  = {};
+      product.comboPrices      = {};
+      product.comboInStock     = {};
+      product.comboAsin        = {};
+      product.sizePrices       = {};
+      product._primaryDimName  = null;
+      product._secondaryDimName = null;
+      product._extraDimNames   = [];
+      product._isFullyMultiAsin = false;
+    }
+  }
+
   // ── PRE-PUSH CLEANUP: delete any existing inventory for this SKU ────────────
   // Instead of returning early on duplicate, wipe clean and re-push fresh.
   // This ensures prices/images/variants are always current on re-push.
