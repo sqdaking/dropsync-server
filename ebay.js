@@ -2703,9 +2703,13 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
     if (isAE && noComboPrices) {
       return comboInStock[key] !== false; // use AE qty-based stock if available, else true
     }
-    // Amazon: no price = can't sell
-    const hasPrice = comboPrices[key] > 0;
-    if (!hasPrice) return false;
+    // Amazon: zero-price variants used to be rejected here, which deleted them
+    // from the listing entirely. New rule: Amazon always wins. A zero-price
+    // variant means "scrape didn't get a price this time (block/OOS)" — we
+    // KEEP it in the listing with qty=0 so next sync can recover it to qty=1
+    // once Amazon returns a real price. Downstream code at the eBay-row build
+    // step already handles price=0 → qty=0 correctly (see comments there).
+    // Only hard-reject phantom combos that don't exist on Amazon at all.
     return true;
   }
 
@@ -6768,10 +6772,16 @@ module.exports = async (req, res) => {
       // preserved as-is — touching them with cost=0 would OOS every variant beyond the
       // first 100 on every worker cycle. The worker never advances asinOffset, so without
       // this guard a 900-ASIN listing would flip 800 variants to qty=0 forever.
+      // NOTE: _skippedNoBatch and _haveFreshPrice used to drive an "accuracy
+      // guard" that skipped variants whose ASIN was outside the current fetch
+      // batch. That guard is gone — the new rule is "Amazon wins when it has
+      // a price, otherwise leave eBay alone" and the guard is unnecessary.
+      // The empty array/set below are kept only so any stale references
+      // elsewhere don't blow up.
       const _haveFreshPrice = new Set(uniqueAsins.filter(a => asinPrice[a] !== undefined));
+      const _skippedNoBatch = [];
 
       const updates = [];
-      const _skippedNoBatch = [];
       const _orphanedSkus = [];
       for (const [sku, offer] of Object.entries(offerMap)) {
         let asin = null;
@@ -6805,49 +6815,45 @@ module.exports = async (req, res) => {
         if (!asin && uniqueAsins.length === 1) asin = uniqueAsins[0];
 
         // If still no ASIN match — this is an ORPHAN variant: it exists on eBay but
-        // no longer corresponds to any ASIN on the current Amazon parent page. This
-        // commonly happens when Amazon consolidates/removes colors or sizes. The old
-        // behavior was to `continue` and preserve whatever stale price was there,
-        // which meant orphan variants would keep selling at wrong prices indefinitely
-        // (e.g. a 2'x6' runner priced at $278.71 because historical sync assigned
-        // the 10'x14' cost by accident). Force qty=0 so the variant is un-sellable,
-        // keep the existing price (eBay requires > 0). The user can re-push to drop
-        // orphans entirely, or the variant will simply stop being offered.
+        // no longer corresponds to any ASIN on the current Amazon parent page.
+        // Rule: Amazon always wins. Since we have no fresh Amazon price for this
+        // variant, we don't write ANY price to eBay — omit pricingSummary entirely
+        // and send qty=0 only. This preserves whatever eBay currently has (so the
+        // user can fix it manually without being overwritten with $1.00 or stale
+        // data). Orphans stay qty=0 until next sync finds a real ASIN mapping.
         if (!asin) {
           _orphanedSkus.push(sku);
-          const preservePrice = offer.currentPrice > 0 ? offer.currentPrice : 1;
-          console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match on current Amazon parent), forcing qty=0 price=$${preservePrice}`);
+          console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match), forcing qty=0 (price untouched)`);
           updates.push({
             offerId:           offer.offerId,
             sku,
             availableQuantity: 0,
-            price:             { value: preservePrice.toFixed(2), currency: 'USD' },
+            // NO price field — omitted intentionally so eBay keeps its current price
             _orphan:           true,
           });
           continue;
         }
 
-        // ── ACCURACY GUARD ─────────────────────────────────────────────────────
-        // If the matched ASIN is outside the current fetch batch, skip entirely.
-        // Preserves the variant's existing qty + price rather than OOSing it.
-        if (!_haveFreshPrice.has(asin)) {
-          _skippedNoBatch.push(sku);
-          continue;
-        }
-
+        // ── RULE: Amazon always wins ─────────────────────────────────────────
+        // Amazon has a price → eBay gets qty=1 with markup'd price.
+        // Amazon has no price (0, blocked, OOS) → eBay gets qty=0, no price
+        // touched. We DO NOT read eBay's current state, skip by batch, or
+        // reconcile with offer.currentPrice. Simple, deterministic, Amazon
+        // is the source of truth.
         const cost      = asinPrice[asin] || 0;
-        const inStock   = asinInStock[asin] !== false;
         const ebayPrice = cost > 0 ? applyMk(cost) : 0;
-        const qty       = (inStock && ebayPrice > 0) ? defaultQty : 0;
-        const putPrice  = ebayPrice > 0 ? ebayPrice : (offer.currentPrice > 0 ? offer.currentPrice : 1);
+        const qty       = ebayPrice > 0 ? defaultQty : 0;
 
-        console.log(`[smartSync] ${sku.slice(-20)} asin=${asin||'?'} $${cost} → eBay $${putPrice.toFixed(2)} qty=${qty}`);
-        updates.push({
+        const _pushObj = {
           offerId:           offer.offerId,
           sku,
           availableQuantity: qty,
-          price:             { value: putPrice.toFixed(2), currency: 'USD' },
-        });
+        };
+        if (ebayPrice > 0) {
+          _pushObj.price = { value: ebayPrice.toFixed(2), currency: 'USD' };
+        }
+        console.log(`[smartSync] ${sku.slice(-20)} asin=${asin||'?'} $${cost} → eBay ${ebayPrice > 0 ? '$'+ebayPrice.toFixed(2) : '(price unchanged)'} qty=${qty}`);
+        updates.push(_pushObj);
       }
       if (_skippedNoBatch.length > 0) {
         console.log(`[smartSync] preserved ${_skippedNoBatch.length} variants whose ASIN is outside this batch (will be touched on a later cycle when asinOffset advances)`);
@@ -6869,7 +6875,12 @@ module.exports = async (req, res) => {
             const gr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, { headers: auth });
             if (!gr.ok) { failCount++; return; }
             const offerBody = await gr.json();
-            offerBody.pricingSummary = { price };
+            // Only update pricingSummary when the caller provided a fresh price.
+            // Orphan updates omit `price` entirely — we preserve eBay's existing
+            // pricingSummary by not touching it. Never overwrite with undefined.
+            if (price && price.value) {
+              offerBody.pricingSummary = { price };
+            }
             offerBody.availableQuantity = availableQuantity;
             delete offerBody.offerId; delete offerBody.status; delete offerBody.listing;
             delete offerBody.marketplaceId; delete offerBody.offerState;
@@ -6878,7 +6889,8 @@ module.exports = async (req, res) => {
             });
             if (pr.ok || pr.status === 204) {
               okCount++;
-              console.log(`[smartSync] ✓ ${(sku||offerId).slice(-18)} qty=${availableQuantity} $${price.value}`);
+              const _priceLabel = price?.value ? `$${price.value}` : '(price unchanged)';
+              console.log(`[smartSync] ✓ ${(sku||offerId).slice(-18)} qty=${availableQuantity} ${_priceLabel}`);
             } else {
               failCount++;
               const e = await pr.text().catch(() => '');
@@ -6889,16 +6901,19 @@ module.exports = async (req, res) => {
         if (i + 10 < updates.length) await sleep(150);
       }
       // Sync inventory item quantity to match offer — prevents OOS showing on eBay
-      // even when offer qty=1, because eBay uses inventory item qty as the source of truth
+      // even when offer qty=1, because eBay uses inventory item qty as the source of truth.
+      // We reconcile in BOTH directions: qty=0 updates too, so a sold-out variant that
+      // comes back in stock via Amazon gets its inventory item qty restored to match.
       if (okCount > 0) {
-        const _itemUpdates = updates.filter(u => u.availableQuantity > 0); // only need to fix in-stock
+        const _itemUpdates = updates.filter(u => !u._orphan); // skip orphans, reconcile everything else
+        let _invOk = 0, _invFail = 0;
         for (let _qi = 0; _qi < _itemUpdates.length; _qi += 5) {
           await Promise.all(_itemUpdates.slice(_qi, _qi + 5).map(async ({ sku, availableQuantity }) => {
             try {
               const _ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, { headers: auth });
-              if (!_ir.ok) return;
+              if (!_ir.ok) { _invFail++; console.warn(`[smartSync] inv GET ${sku.slice(-20)} ${_ir.status}`); return; }
               const _id = await _ir.json().catch(() => ({}));
-              if (!_id.condition) return;
+              if (!_id.condition) { _invFail++; console.warn(`[smartSync] inv ${sku.slice(-20)} missing condition, skipped`); return; }
               const _ib = {
                 condition: _id.condition,
                 product: _id.product || {},
@@ -6906,15 +6921,22 @@ module.exports = async (req, res) => {
               };
               if (_id.conditionId) _ib.conditionId = _id.conditionId;
               if (_id.packageWeightAndSize) _ib.packageWeightAndSize = _id.packageWeightAndSize;
-              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+              const _pr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
                 method: 'PUT', headers: auth, body: JSON.stringify(_ib),
               });
-            } catch(_qe) {}
+              if (_pr.ok || _pr.status === 204) {
+                _invOk++;
+              } else {
+                _invFail++;
+                const _et = await _pr.text().catch(() => '');
+                console.warn(`[smartSync] inv PUT ${sku.slice(-20)} ${_pr.status}: ${_et.slice(0,150)}`);
+              }
+            } catch(_qe) { _invFail++; console.warn(`[smartSync] inv PUT ${sku.slice(-20)} error: ${_qe.message}`); }
           }));
           if (_qi + 5 < _itemUpdates.length) await sleep(100);
         }
         if (_itemUpdates.length > 0)
-          console.log(`[smartSync] synced inventory item qtys: ${_itemUpdates.length} SKUs`);
+          console.log(`[smartSync] inventory item qty reconcile: ${_invOk} ok, ${_invFail} failed (of ${_itemUpdates.length})`);
       }
 
       console.log(`[smartSync] done — ${okCount} ok, ${failCount} failed`);
