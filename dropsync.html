@@ -159,6 +159,52 @@ label{display:block;font-size:11px;font-weight:700;color:var(--text3);margin-bot
 
 function $(id) { return document.getElementById(id); }
 
+// ── capCombos: hard cap on variants per listing (egress control) ─────────────
+// A single Amazon parent can have 900+ ASINs. Every sync pass would fetch each
+// of those ASINs to check price/stock — that's the biggest chunk of our egress.
+// Hard-cap at 50 at import time, lockstep-trim every adjacent field that keys
+// off comboAsin, and never revisit the decision. The 50 are deterministic
+// (first 50 in iteration order) so re-imports of the same product pick the
+// same set and we don't accidentally list duplicates on eBay.
+const COMBO_CAP = 50;
+function capCombos(p, max = COMBO_CAP) {
+  if (!p || !p.comboAsin || typeof p.comboAsin !== 'object') return p;
+  const keys = Object.keys(p.comboAsin);
+  if (keys.length <= max) return p;
+  const keep = new Set(keys.slice(0, max));
+  const trim = obj => {
+    if (!obj || typeof obj !== 'object') return obj;
+    const out = {};
+    for (const k of Object.keys(obj)) if (keep.has(k)) out[k] = obj[k];
+    return out;
+  };
+  p.comboAsin     = trim(p.comboAsin);
+  p.comboPrices   = trim(p.comboPrices);
+  p.comboInStock  = trim(p.comboInStock);
+  p.sizePrices    = trim(p.sizePrices);
+  // asinImages / variationImages are keyed by ASIN (value), not combo key — cap
+  // by membership in the kept ASIN set.
+  const keptAsins = new Set(Object.values(p.comboAsin));
+  const trimByAsin = obj => {
+    if (!obj || typeof obj !== 'object') return obj;
+    const out = {};
+    for (const k of Object.keys(obj)) if (keptAsins.has(k)) out[k] = obj[k];
+    return out;
+  };
+  if (p.asinImages)      p.asinImages      = trimByAsin(p.asinImages);
+  if (p.variationImages) p.variationImages = trimByAsin(p.variationImages);
+  // variations is usually an array of variant rows — filter to kept combo keys.
+  // Heuristic: if a row has a .key/.comboKey that matches a kept key, keep it.
+  if (Array.isArray(p.variations)) {
+    p.variations = p.variations.filter(v => {
+      const k = v?.key || v?.comboKey || v?.combo || null;
+      return !k || keep.has(k);
+    });
+  }
+  console.log(`[capCombos] ${keys.length} → ${keep.size} variants (${p.asin || p.parentAsin || '?'})`);
+  return p;
+}
+
 const KEY     = 'ds_settings'; // Only stores settings+token, never products
 const KEY_V2  = 'ds_v2';       // Legacy key (migrated on load)
 const DEFAULT_STATE = {
@@ -2174,6 +2220,7 @@ async function bulkFetchDeals(dept) {
           _dept: p._dept || dept || 'other',
         };
 
+        capCombos(prod);
         BULK.queue.push(prod);
         if (!S.products) S.products=[];
         S.products.push(prod);
@@ -2252,6 +2299,7 @@ async function bulkPushAll() {
 
     try {
       const token = await ensureToken();
+      capCombos(p); // hard cap variants before push
       const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
@@ -2278,6 +2326,8 @@ async function bulkPushAll() {
       save();
       renderBulk();
       addLog('push', `Bulk listed: ${(p.ebayTitle||p.title).slice(0,45)}`, `eBay ID ${d.listingId}`, {productId:p.id, ebayId:d.listingId});
+      // Auto-promote at server-default 2% fixed ad rate (fire-and-forget)
+      if (d.listingId) promoteListingAtRate(token, d.listingId).catch(e => console.warn('[bulkPush] promote:', e.message));
       bulkLog(`✓ ${p.asin} → eBay ${d.listingId}`, 'success');
       pushed++;
     } catch(e) {
@@ -4339,6 +4389,9 @@ async function pushExisting(pid, _overrides = {}) {
   }
   try {
     const token = await ensureToken();
+
+    // Hard cap variants before push — belt-and-suspenders with import-time cap
+    capCombos(p);
 
     // ── Fetch Amazon in browser first (residential IP) → send as clientHtml to scraper ──
     let productToPost = { ...p };

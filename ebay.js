@@ -8,6 +8,34 @@ if (typeof fetch === 'undefined') {
 // DropSync AI Agent — Amazon → eBay Dropshipping Backend
 // Clean architecture: per-ASIN prices+images, AI category detection, auto policies
 
+// ── ASIN price cache (egress control) ────────────────────────────────────────
+// Per-ASIN price/stock fetches are the biggest chunk of sync egress. When two
+// listings share an ASIN (multipack of same product, re-listed hot item,
+// overlapping variants), they'd each do their own fetchPage — wasted bytes.
+// This module-level cache lets the second, third, … callers short-circuit to
+// the cached value. TTL = 6h, which is way shorter than Amazon's typical price
+// churn for dropshipping-relevant items and way longer than one worker
+// rotation, so consecutive sync cycles skip the fetch entirely.
+const ASIN_PRICE_CACHE = new Map(); // asin → { price, inStock, ts }
+const ASIN_PRICE_TTL_MS = 6 * 60 * 60 * 1000;
+function _cachedAsinPrice(asin) {
+  const e = ASIN_PRICE_CACHE.get(asin);
+  if (!e) return null;
+  if (Date.now() - e.ts > ASIN_PRICE_TTL_MS) {
+    ASIN_PRICE_CACHE.delete(asin);
+    return null;
+  }
+  return e;
+}
+function _storeAsinPrice(asin, price, inStock) {
+  ASIN_PRICE_CACHE.set(asin, { price, inStock, ts: Date.now() });
+  // Soft cap — prevent unbounded growth on huge catalogs
+  if (ASIN_PRICE_CACHE.size > 5000) {
+    const oldest = [...ASIN_PRICE_CACHE.entries()].sort((a,b) => a[1].ts - b[1].ts).slice(0, 1000);
+    for (const [k] of oldest) ASIN_PRICE_CACHE.delete(k);
+  }
+}
+
 const SCOPES = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment https://api.ebay.com/oauth/api_scope/sell.marketing';
 
 function getEbayUrls() {
@@ -6280,7 +6308,21 @@ module.exports = async (req, res) => {
       // successful scrape, so we use those to build the ASIN list and proceed
       // to per-ASIN fetching. Only genuinely-unreachable ASINs end up as
       // force-OOS via the fetchFailed path in STEP 2.
-      const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
+      //
+      // EGRESS OPT: when the caller already sends body.comboAsin (worker always
+      // does since we cap variants at import), skip the 2MB parent fetch
+      // entirely — every downstream code path is already guarded with `if
+      // (html)` for the "parent blocked" fallback, so setting html=null is
+      // indistinguishable from Amazon blocking the page. Saves ~2MB egress per
+      // sync per product.
+      const _haveStoredCombos = body.comboAsin && typeof body.comboAsin === 'object'
+        && Object.keys(body.comboAsin).length > 0;
+      const html = _haveStoredCombos
+        ? null
+        : await fetchPage(sourceUrl, randUA()).catch(() => null);
+      if (_haveStoredCombos) {
+        console.log(`[smartSync] skipping parent fetch — using stored comboAsin (${Object.keys(body.comboAsin).length} variants)`);
+      }
       const _parentHtmlOk = !!(html && html.length >= 5000);
 
       // Extract unique ASINs from the parent page's dimensionToAsinMap.
@@ -6321,7 +6363,7 @@ module.exports = async (req, res) => {
       // ── Progressive slicing — 100 ASINs per cycle ─────────────────────────────
       // Large products (147, 900 ASINs) spread across multiple sync cycles.
       // Frontend stores asinOffset, sends it each cycle, resets when all done.
-      const ASIN_BATCH_SIZE = 100;
+      const ASIN_BATCH_SIZE = 50;
       const asinOffset = parseInt(body.asinOffset || 0);
       const _slice = allUniqueAsins.slice(asinOffset, asinOffset + ASIN_BATCH_SIZE);
       const uniqueAsins = _slice.length ? _slice : allUniqueAsins; // fallback to all if offset wrong
@@ -6349,6 +6391,15 @@ module.exports = async (req, res) => {
         let fetchOk = 0, fetchFail = 0;
         for (let i = 0; i < uniqueAsins.length; i += BATCH) {
           await Promise.all(uniqueAsins.slice(i, i + BATCH).map(async (asin, bi) => {
+            // Cache hit — skip the fetch entirely (egress win)
+            const _cached = _cachedAsinPrice(asin);
+            if (_cached) {
+              asinPrice[asin]   = _cached.price;
+              asinInStock[asin] = _cached.inStock;
+              if (_cached.price > 0) fetchOk++; else fetchFail++;
+              console.log(`[smartSync] ${asin} → $${_cached.price} inStock=${_cached.inStock} (cached)`);
+              return;
+            }
             await sleep(bi * 150);
             // 2 attempts max — blocked ASINs get force-OOSed this cycle and
             // re-tried next cycle, so we don't waste time retrying here.
@@ -6365,6 +6416,9 @@ module.exports = async (req, res) => {
             const oos   = isAmazonOOS(h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '');
             asinPrice[asin]   = price;
             asinInStock[asin] = !oos && price > 0;
+            // Only cache successful fetches — don't cache blocked/OOS since
+            // those may be transient Amazon blocks, not real state.
+            if (price > 0) _storeAsinPrice(asin, price, !oos && price > 0);
             console.log(`[smartSync] ${asin} → $${price} inStock=${!oos}`);
             fetchOk++;
           }));

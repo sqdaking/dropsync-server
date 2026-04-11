@@ -314,12 +314,20 @@ async function getRelayJob(id) {
 }
 
 // Poll the queue until the job is done/failed or timeout. Returns html or null.
+// After a successful read, we immediately null out the html column so the big
+// payload doesn't sit in Postgres waiting for cleanupOldRelayJobs an hour later.
+// Big egress win: a 2MB HTML blob gets written once, read once, then dropped.
 async function awaitRelayResult(id, timeoutMs = 30000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const job = await getRelayJob(id);
     if (!job) return null;
-    if (job.status === 'done')   return job.html;
+    if (job.status === 'done') {
+      const html = job.html;
+      // Fire-and-forget — don't block the caller on this cleanup write
+      pool.query(`UPDATE relay_queue SET html=NULL WHERE id=$1`, [id]).catch(() => {});
+      return html;
+    }
     if (job.status === 'failed') return null;
     await new Promise(r => setTimeout(r, 500));
   }

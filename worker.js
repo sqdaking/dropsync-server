@@ -114,53 +114,16 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       console.log(`[Worker]   rebuilt skuToAsin: ${Object.keys(skuToAsin).length} entries`);
     }
 
-    // Step 1: Scrape Amazon for fresh data (in-process)
+    // Step 1: Parent re-scrape — REMOVED (egress control).
+    // Variants are capped at 50 at import time and frozen. There's no reason
+    // to re-scrape the Amazon parent page every sync cycle to discover new
+    // combos — we intentionally don't want new ones. Per-ASIN price/stock
+    // fetches in smartSync are what actually update eBay, and smartSync now
+    // uses body.comboAsin directly when present (no parent fetch needed).
+    // If you ever need to refresh variant structure for a listing, re-import
+    // or use the Workshop rebuild path. Previous scrape block removed; all
+    // downstream _scraped?.x || product.x fallbacks resolve to product.x.
     let _scraped = null;
-    try {
-      const _sd = await callEbay({ action: 'scrape', url: product.sourceUrl });
-      if (_sd.ok && _sd.data?.success && _sd.data?.product?.comboAsin) {
-        _scraped = _sd.data.product;
-        const _nC = Object.keys(_scraped.comboAsin || {}).length;
-        const _nP = Object.values(_scraped.comboPrices || {}).filter(Boolean).length;
-        console.log(`[Worker]   scraped: ${_nC} combos, ${_nP} prices`);
-        // Rebuild skuToAsin from fresh comboAsin
-        const _pfx2 = sku + '-';
-        const _MAX2  = 50;
-        const _sl2   = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
-        const _mk2   = parts => {
-          const raw = parts.map(_sl2).filter(Boolean).join('_');
-          const max = _MAX2 - _pfx2.length;
-          if (raw.length <= max) return _pfx2 + raw;
-          const hash = raw.split('').reduce((h,c) => ((h<<5)-h+c.charCodeAt(0))|0, 0);
-          return _pfx2 + raw.slice(0, max-9) + '_' + (hash>>>0).toString(16).toUpperCase().padStart(8,'0');
-        };
-        const _fS2A = {};
-        for (const [key, asin] of Object.entries(_scraped.comboAsin)) {
-          const [pv, sv] = key.split('|');
-          const parts = [pv, sv].filter(Boolean);
-          if (parts.length) _fS2A[_mk2(parts)] = asin;
-        }
-        if (Object.keys(_fS2A).length > 0) {
-          skuToAsin = _fS2A;
-          console.log(`[Worker]   refreshed skuToAsin: ${Object.keys(skuToAsin).length} entries`);
-        }
-        // Save fresh data back to DB — sync_pending: false must be explicit to avoid re-queuing
-        await db.upsertProduct({
-          ...product,
-          sync_pending:      false,
-          comboAsin:         _scraped.comboAsin         || product.comboAsin,
-          comboPrices:       _scraped.comboPrices       || product.comboPrices,
-          comboInStock:      _scraped.comboInStock      || product.comboInStock,
-          variations:        _scraped.variations        || product.variations,
-          _primaryDimName:   _scraped._primaryDimName   || product._primaryDimName,
-          _secondaryDimName: _scraped._secondaryDimName || product._secondaryDimName,
-        });
-      } else {
-        console.log(`[Worker]   scrape blocked — using cached data`);
-      }
-    } catch(_se) {
-      console.warn(`[Worker]   scrape error: ${_se.message}`);
-    }
 
     // Step 2: smartSync with fresh scraped data (in-process)
     const _resp = await callEbay({
