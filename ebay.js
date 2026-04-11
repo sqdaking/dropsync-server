@@ -176,7 +176,12 @@ function isAmazonOOS(buyBoxHtml) {
   if (tl.includes('out of stock')) return true;                 // #4: generic (covers "Temporarily out of stock")
   if (tl.includes('temporarily out of stock')) return true;     // #5: explicit temp OOS
   if (t.includes('Join the waitlist')) return true;             // #6: waitlist = OOS
-  if (tl.includes('see all available options')) return true;    // #7: variant has no buy box = OOS
+  // REMOVED rule #7 ("see all available options"): this string appears in
+  // Amazon's standard variant-picker UI on most multi-variant listings,
+  // even when the buy-box variant is fully in stock. Matching it caused
+  // every multi-variant product to be flagged OOS → qty=0 on eBay despite
+  // sync correctly extracting prices. Use the absence-of-add-to-cart
+  // signal at rule #8 instead, which is much more specific.
   if (tl.includes('see all buying options') && !t.includes('add-to-cart-button')) return true; // #8: no direct buy = OOS
   return false;
 }
