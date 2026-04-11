@@ -6314,21 +6314,7 @@ module.exports = async (req, res) => {
       // successful scrape, so we use those to build the ASIN list and proceed
       // to per-ASIN fetching. Only genuinely-unreachable ASINs end up as
       // force-OOS via the fetchFailed path in STEP 2.
-      //
-      // EGRESS OPT: when the caller already sends body.comboAsin (worker always
-      // does since we cap variants at import), skip the 2MB parent fetch
-      // entirely — every downstream code path is already guarded with `if
-      // (html)` for the "parent blocked" fallback, so setting html=null is
-      // indistinguishable from Amazon blocking the page. Saves ~2MB egress per
-      // sync per product.
-      const _haveStoredCombos = body.comboAsin && typeof body.comboAsin === 'object'
-        && Object.keys(body.comboAsin).length > 0;
-      const html = _haveStoredCombos
-        ? null
-        : await fetchPage(sourceUrl, randUA()).catch(() => null);
-      if (_haveStoredCombos) {
-        console.log(`[smartSync] skipping parent fetch — using stored comboAsin (${Object.keys(body.comboAsin).length} variants)`);
-      }
+      const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
       const _parentHtmlOk = !!(html && html.length >= 5000);
 
       // Extract unique ASINs from the parent page's dimensionToAsinMap.
