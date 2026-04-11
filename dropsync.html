@@ -2209,7 +2209,7 @@ async function bulkPushAll() {
   renderBulk();
 
   const toPush = [...BULK.queue]; // snapshot
-  let pushed=0, failed=0;
+  let pushed=0, failed=0, skipped=0;
 
   for (let i=0; i<toPush.length; i++) {
     const p = toPush[i];
@@ -2276,6 +2276,7 @@ async function bulkPushAll() {
       }
       BULK.queue = BULK.queue.filter(x=>x.id!==p.id);
       save();
+      renderBulk();
       addLog('push', `Bulk listed: ${(p.ebayTitle||p.title).slice(0,45)}`, `eBay ID ${d.listingId}`, {productId:p.id, ebayId:d.listingId});
       bulkLog(`✓ ${p.asin} → eBay ${d.listingId}`, 'success');
       pushed++;
