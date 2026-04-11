@@ -414,32 +414,12 @@ async function runForever() {
     }
 
     // Adaptive spacing between revises to avoid Amazon rate limiting.
-    // Pace = milliseconds between revise STARTS (not ends). Subtracts the
-    // actual work time so a slow product doesn't double-pace. Tunable via
-    // the `sync_pace_ms` DB setting without a redeploy.
-    //
-    // Target-window math (serial, concurrency=1):
-    //   pace 17000ms → 10k listings ~= 48h rotation
-    //   pace 26000ms → 10k listings ~= 72h rotation
-    //   pace 35000ms → 10k listings ~= 97h rotation (safest)
-    // With concurrency N, divide the rotation time by N.
-    //
-    // Lower pace = faster rotations but more concurrent Amazon pressure.
-    // Higher pace = gentler on Amazon, more headroom before blocks.
-    // Default 30000 (~83h @ concurrency 1, ~28h @ concurrency 3) — safely
-    // inside 72h when parallelized even a little.
+    // Target: ~60s between revise starts — gives Amazon IP cooldown time.
     const _reviseDuration = Date.now() - _reviseStart;
-    let _minGap = 30000;
-    try {
-      const _paceRaw = await db.getSetting('sync_pace_ms');
-      const _paceNum = parseInt(_paceRaw);
-      if (Number.isFinite(_paceNum) && _paceNum >= 0 && _paceNum <= 600000) {
-        _minGap = _paceNum;
-      }
-    } catch(_e) { /* fall through to default */ }
+    const _minGap = 60000; // 60s minimum between revise starts
     const _remaining = _minGap - _reviseDuration;
     if (_remaining > 0) {
-      console.log(`[Worker] Spacing: waiting ${(_remaining/1000).toFixed(0)}s (revise took ${(_reviseDuration/1000).toFixed(0)}s, pace=${_minGap}ms)`);
+      console.log(`[Worker] Spacing: waiting ${(_remaining/1000).toFixed(0)}s (revise took ${(_reviseDuration/1000).toFixed(0)}s)`);
       await sleep(_remaining);
     }
   }

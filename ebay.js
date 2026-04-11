@@ -8,34 +8,6 @@ if (typeof fetch === 'undefined') {
 // DropSync AI Agent — Amazon → eBay Dropshipping Backend
 // Clean architecture: per-ASIN prices+images, AI category detection, auto policies
 
-// ── ASIN price cache (egress control) ────────────────────────────────────────
-// Per-ASIN price/stock fetches are the biggest chunk of sync egress. When two
-// listings share an ASIN (multipack of same product, re-listed hot item,
-// overlapping variants), they'd each do their own fetchPage — wasted bytes.
-// This module-level cache lets the second, third, … callers short-circuit to
-// the cached value. TTL = 6h, which is way shorter than Amazon's typical price
-// churn for dropshipping-relevant items and way longer than one worker
-// rotation, so consecutive sync cycles skip the fetch entirely.
-const ASIN_PRICE_CACHE = new Map(); // asin → { price, inStock, ts }
-const ASIN_PRICE_TTL_MS = 6 * 60 * 60 * 1000;
-function _cachedAsinPrice(asin) {
-  const e = ASIN_PRICE_CACHE.get(asin);
-  if (!e) return null;
-  if (Date.now() - e.ts > ASIN_PRICE_TTL_MS) {
-    ASIN_PRICE_CACHE.delete(asin);
-    return null;
-  }
-  return e;
-}
-function _storeAsinPrice(asin, price, inStock) {
-  ASIN_PRICE_CACHE.set(asin, { price, inStock, ts: Date.now() });
-  // Soft cap — prevent unbounded growth on huge catalogs
-  if (ASIN_PRICE_CACHE.size > 5000) {
-    const oldest = [...ASIN_PRICE_CACHE.entries()].sort((a,b) => a[1].ts - b[1].ts).slice(0, 1000);
-    for (const [k] of oldest) ASIN_PRICE_CACHE.delete(k);
-  }
-}
-
 const SCOPES = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment https://api.ebay.com/oauth/api_scope/sell.marketing';
 
 function getEbayUrls() {
@@ -160,14 +132,8 @@ async function fetchPage(url, ua, maxAttempts) {
     ...(extra || {}),
   });
 
-  // Direct attempts with increasing delays and varied URL/UA/referer combos.
-  // Note: an earlier optimization tried to cap this at 1 attempt because the
-  // server-side browser relay was supposed to carry most Amazon fetches. But
-  // the frontend poller for /api/relay/needs isn't wired into dropsync.html,
-  // so this direct path is the ONLY path today. Keep the retries — a blocked
-  // first attempt often unblocks on attempt 3-4 with a different UA/referer.
-  // Callers can still pass maxAttempts=1 (and smartSync per-ASIN does) to
-  // opt out when they'd rather fail fast.
+  // Direct attempts with increasing delays and varied URL/UA/referer combos
+  // maxAttempts=1 for ASIN batch fetches: fail fast, use size-price fallback instead of wasting budget
   const _maxAttempts = maxAttempts || 5;
   const delays = [0, 1000, 2500, 5000, 10000];
   for (let i = 0; i < _maxAttempts; i++) {
@@ -2703,13 +2669,9 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
     if (isAE && noComboPrices) {
       return comboInStock[key] !== false; // use AE qty-based stock if available, else true
     }
-    // Amazon: zero-price variants used to be rejected here, which deleted them
-    // from the listing entirely. New rule: Amazon always wins. A zero-price
-    // variant means "scrape didn't get a price this time (block/OOS)" — we
-    // KEEP it in the listing with qty=0 so next sync can recover it to qty=1
-    // once Amazon returns a real price. Downstream code at the eBay-row build
-    // step already handles price=0 → qty=0 correctly (see comments there).
-    // Only hard-reject phantom combos that don't exist on Amazon at all.
+    // Amazon: no price = can't sell
+    const hasPrice = comboPrices[key] > 0;
+    if (!hasPrice) return false;
     return true;
   }
 
@@ -6359,7 +6321,7 @@ module.exports = async (req, res) => {
       // ── Progressive slicing — 100 ASINs per cycle ─────────────────────────────
       // Large products (147, 900 ASINs) spread across multiple sync cycles.
       // Frontend stores asinOffset, sends it each cycle, resets when all done.
-      const ASIN_BATCH_SIZE = 50;
+      const ASIN_BATCH_SIZE = 100;
       const asinOffset = parseInt(body.asinOffset || 0);
       const _slice = allUniqueAsins.slice(asinOffset, asinOffset + ASIN_BATCH_SIZE);
       const uniqueAsins = _slice.length ? _slice : allUniqueAsins; // fallback to all if offset wrong
@@ -6387,15 +6349,6 @@ module.exports = async (req, res) => {
         let fetchOk = 0, fetchFail = 0;
         for (let i = 0; i < uniqueAsins.length; i += BATCH) {
           await Promise.all(uniqueAsins.slice(i, i + BATCH).map(async (asin, bi) => {
-            // Cache hit — skip the fetch entirely (egress win)
-            const _cached = _cachedAsinPrice(asin);
-            if (_cached) {
-              asinPrice[asin]   = _cached.price;
-              asinInStock[asin] = _cached.inStock;
-              if (_cached.price > 0) fetchOk++; else fetchFail++;
-              console.log(`[smartSync] ${asin} → $${_cached.price} inStock=${_cached.inStock} (cached)`);
-              return;
-            }
             await sleep(bi * 150);
             // 2 attempts max — blocked ASINs get force-OOSed this cycle and
             // re-tried next cycle, so we don't waste time retrying here.
@@ -6412,9 +6365,6 @@ module.exports = async (req, res) => {
             const oos   = isAmazonOOS(h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '');
             asinPrice[asin]   = price;
             asinInStock[asin] = !oos && price > 0;
-            // Only cache successful fetches — don't cache blocked/OOS since
-            // those may be transient Amazon blocks, not real state.
-            if (price > 0) _storeAsinPrice(asin, price, !oos && price > 0);
             console.log(`[smartSync] ${asin} → $${price} inStock=${!oos}`);
             fetchOk++;
           }));
@@ -6772,16 +6722,10 @@ module.exports = async (req, res) => {
       // preserved as-is — touching them with cost=0 would OOS every variant beyond the
       // first 100 on every worker cycle. The worker never advances asinOffset, so without
       // this guard a 900-ASIN listing would flip 800 variants to qty=0 forever.
-      // NOTE: _skippedNoBatch and _haveFreshPrice used to drive an "accuracy
-      // guard" that skipped variants whose ASIN was outside the current fetch
-      // batch. That guard is gone — the new rule is "Amazon wins when it has
-      // a price, otherwise leave eBay alone" and the guard is unnecessary.
-      // The empty array/set below are kept only so any stale references
-      // elsewhere don't blow up.
       const _haveFreshPrice = new Set(uniqueAsins.filter(a => asinPrice[a] !== undefined));
-      const _skippedNoBatch = [];
 
       const updates = [];
+      const _skippedNoBatch = [];
       const _orphanedSkus = [];
       for (const [sku, offer] of Object.entries(offerMap)) {
         let asin = null;
@@ -6815,45 +6759,49 @@ module.exports = async (req, res) => {
         if (!asin && uniqueAsins.length === 1) asin = uniqueAsins[0];
 
         // If still no ASIN match — this is an ORPHAN variant: it exists on eBay but
-        // no longer corresponds to any ASIN on the current Amazon parent page.
-        // Rule: Amazon always wins. Since we have no fresh Amazon price for this
-        // variant, we don't write ANY price to eBay — omit pricingSummary entirely
-        // and send qty=0 only. This preserves whatever eBay currently has (so the
-        // user can fix it manually without being overwritten with $1.00 or stale
-        // data). Orphans stay qty=0 until next sync finds a real ASIN mapping.
+        // no longer corresponds to any ASIN on the current Amazon parent page. This
+        // commonly happens when Amazon consolidates/removes colors or sizes. The old
+        // behavior was to `continue` and preserve whatever stale price was there,
+        // which meant orphan variants would keep selling at wrong prices indefinitely
+        // (e.g. a 2'x6' runner priced at $278.71 because historical sync assigned
+        // the 10'x14' cost by accident). Force qty=0 so the variant is un-sellable,
+        // keep the existing price (eBay requires > 0). The user can re-push to drop
+        // orphans entirely, or the variant will simply stop being offered.
         if (!asin) {
           _orphanedSkus.push(sku);
-          console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match), forcing qty=0 (price untouched)`);
+          const preservePrice = offer.currentPrice > 0 ? offer.currentPrice : 1;
+          console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match on current Amazon parent), forcing qty=0 price=$${preservePrice}`);
           updates.push({
             offerId:           offer.offerId,
             sku,
             availableQuantity: 0,
-            // NO price field — omitted intentionally so eBay keeps its current price
+            price:             { value: preservePrice.toFixed(2), currency: 'USD' },
             _orphan:           true,
           });
           continue;
         }
 
-        // ── RULE: Amazon always wins ─────────────────────────────────────────
-        // Amazon has a price → eBay gets qty=1 with markup'd price.
-        // Amazon has no price (0, blocked, OOS) → eBay gets qty=0, no price
-        // touched. We DO NOT read eBay's current state, skip by batch, or
-        // reconcile with offer.currentPrice. Simple, deterministic, Amazon
-        // is the source of truth.
-        const cost      = asinPrice[asin] || 0;
-        const ebayPrice = cost > 0 ? applyMk(cost) : 0;
-        const qty       = ebayPrice > 0 ? defaultQty : 0;
+        // ── ACCURACY GUARD ─────────────────────────────────────────────────────
+        // If the matched ASIN is outside the current fetch batch, skip entirely.
+        // Preserves the variant's existing qty + price rather than OOSing it.
+        if (!_haveFreshPrice.has(asin)) {
+          _skippedNoBatch.push(sku);
+          continue;
+        }
 
-        const _pushObj = {
+        const cost      = asinPrice[asin] || 0;
+        const inStock   = asinInStock[asin] !== false;
+        const ebayPrice = cost > 0 ? applyMk(cost) : 0;
+        const qty       = (inStock && ebayPrice > 0) ? defaultQty : 0;
+        const putPrice  = ebayPrice > 0 ? ebayPrice : (offer.currentPrice > 0 ? offer.currentPrice : 1);
+
+        console.log(`[smartSync] ${sku.slice(-20)} asin=${asin||'?'} $${cost} → eBay $${putPrice.toFixed(2)} qty=${qty}`);
+        updates.push({
           offerId:           offer.offerId,
           sku,
           availableQuantity: qty,
-        };
-        if (ebayPrice > 0) {
-          _pushObj.price = { value: ebayPrice.toFixed(2), currency: 'USD' };
-        }
-        console.log(`[smartSync] ${sku.slice(-20)} asin=${asin||'?'} $${cost} → eBay ${ebayPrice > 0 ? '$'+ebayPrice.toFixed(2) : '(price unchanged)'} qty=${qty}`);
-        updates.push(_pushObj);
+          price:             { value: putPrice.toFixed(2), currency: 'USD' },
+        });
       }
       if (_skippedNoBatch.length > 0) {
         console.log(`[smartSync] preserved ${_skippedNoBatch.length} variants whose ASIN is outside this batch (will be touched on a later cycle when asinOffset advances)`);
@@ -6875,12 +6823,7 @@ module.exports = async (req, res) => {
             const gr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, { headers: auth });
             if (!gr.ok) { failCount++; return; }
             const offerBody = await gr.json();
-            // Only update pricingSummary when the caller provided a fresh price.
-            // Orphan updates omit `price` entirely — we preserve eBay's existing
-            // pricingSummary by not touching it. Never overwrite with undefined.
-            if (price && price.value) {
-              offerBody.pricingSummary = { price };
-            }
+            offerBody.pricingSummary = { price };
             offerBody.availableQuantity = availableQuantity;
             delete offerBody.offerId; delete offerBody.status; delete offerBody.listing;
             delete offerBody.marketplaceId; delete offerBody.offerState;
@@ -6889,8 +6832,7 @@ module.exports = async (req, res) => {
             });
             if (pr.ok || pr.status === 204) {
               okCount++;
-              const _priceLabel = price?.value ? `$${price.value}` : '(price unchanged)';
-              console.log(`[smartSync] ✓ ${(sku||offerId).slice(-18)} qty=${availableQuantity} ${_priceLabel}`);
+              console.log(`[smartSync] ✓ ${(sku||offerId).slice(-18)} qty=${availableQuantity} $${price.value}`);
             } else {
               failCount++;
               const e = await pr.text().catch(() => '');
@@ -6901,19 +6843,16 @@ module.exports = async (req, res) => {
         if (i + 10 < updates.length) await sleep(150);
       }
       // Sync inventory item quantity to match offer — prevents OOS showing on eBay
-      // even when offer qty=1, because eBay uses inventory item qty as the source of truth.
-      // We reconcile in BOTH directions: qty=0 updates too, so a sold-out variant that
-      // comes back in stock via Amazon gets its inventory item qty restored to match.
+      // even when offer qty=1, because eBay uses inventory item qty as the source of truth
       if (okCount > 0) {
-        const _itemUpdates = updates.filter(u => !u._orphan); // skip orphans, reconcile everything else
-        let _invOk = 0, _invFail = 0;
+        const _itemUpdates = updates.filter(u => u.availableQuantity > 0); // only need to fix in-stock
         for (let _qi = 0; _qi < _itemUpdates.length; _qi += 5) {
           await Promise.all(_itemUpdates.slice(_qi, _qi + 5).map(async ({ sku, availableQuantity }) => {
             try {
               const _ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, { headers: auth });
-              if (!_ir.ok) { _invFail++; console.warn(`[smartSync] inv GET ${sku.slice(-20)} ${_ir.status}`); return; }
+              if (!_ir.ok) return;
               const _id = await _ir.json().catch(() => ({}));
-              if (!_id.condition) { _invFail++; console.warn(`[smartSync] inv ${sku.slice(-20)} missing condition, skipped`); return; }
+              if (!_id.condition) return;
               const _ib = {
                 condition: _id.condition,
                 product: _id.product || {},
@@ -6921,22 +6860,15 @@ module.exports = async (req, res) => {
               };
               if (_id.conditionId) _ib.conditionId = _id.conditionId;
               if (_id.packageWeightAndSize) _ib.packageWeightAndSize = _id.packageWeightAndSize;
-              const _pr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
                 method: 'PUT', headers: auth, body: JSON.stringify(_ib),
               });
-              if (_pr.ok || _pr.status === 204) {
-                _invOk++;
-              } else {
-                _invFail++;
-                const _et = await _pr.text().catch(() => '');
-                console.warn(`[smartSync] inv PUT ${sku.slice(-20)} ${_pr.status}: ${_et.slice(0,150)}`);
-              }
-            } catch(_qe) { _invFail++; console.warn(`[smartSync] inv PUT ${sku.slice(-20)} error: ${_qe.message}`); }
+            } catch(_qe) {}
           }));
           if (_qi + 5 < _itemUpdates.length) await sleep(100);
         }
         if (_itemUpdates.length > 0)
-          console.log(`[smartSync] inventory item qty reconcile: ${_invOk} ok, ${_invFail} failed (of ${_itemUpdates.length})`);
+          console.log(`[smartSync] synced inventory item qtys: ${_itemUpdates.length} SKUs`);
       }
 
       console.log(`[smartSync] done — ${okCount} ok, ${failCount} failed`);
