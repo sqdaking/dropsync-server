@@ -166,43 +166,46 @@ function $(id) { return document.getElementById(id); }
 // off comboAsin, and never revisit the decision. The 50 are deterministic
 // (first 50 in iteration order) so re-imports of the same product pick the
 // same set and we don't accidentally list duplicates on eBay.
+//
+// Safety: the whole function is wrapped in try/catch so any bug NEVER breaks
+// import — worst case we silently skip capping for one product and the
+// pre-push guards in pushExisting/bulkPushAll catch it later.
 const COMBO_CAP = 50;
 function capCombos(p, max = COMBO_CAP) {
-  if (!p || !p.comboAsin || typeof p.comboAsin !== 'object') return p;
-  const keys = Object.keys(p.comboAsin);
-  if (keys.length <= max) return p;
-  const keep = new Set(keys.slice(0, max));
-  const trim = obj => {
-    if (!obj || typeof obj !== 'object') return obj;
-    const out = {};
-    for (const k of Object.keys(obj)) if (keep.has(k)) out[k] = obj[k];
-    return out;
-  };
-  p.comboAsin     = trim(p.comboAsin);
-  p.comboPrices   = trim(p.comboPrices);
-  p.comboInStock  = trim(p.comboInStock);
-  p.sizePrices    = trim(p.sizePrices);
-  // asinImages / variationImages are keyed by ASIN (value), not combo key — cap
-  // by membership in the kept ASIN set.
-  const keptAsins = new Set(Object.values(p.comboAsin));
-  const trimByAsin = obj => {
-    if (!obj || typeof obj !== 'object') return obj;
-    const out = {};
-    for (const k of Object.keys(obj)) if (keptAsins.has(k)) out[k] = obj[k];
-    return out;
-  };
-  if (p.asinImages)      p.asinImages      = trimByAsin(p.asinImages);
-  if (p.variationImages) p.variationImages = trimByAsin(p.variationImages);
-  // variations is usually an array of variant rows — filter to kept combo keys.
-  // Heuristic: if a row has a .key/.comboKey that matches a kept key, keep it.
-  if (Array.isArray(p.variations)) {
-    p.variations = p.variations.filter(v => {
-      const k = v?.key || v?.comboKey || v?.combo || null;
-      return !k || keep.has(k);
-    });
+  try {
+    if (!p || !p.comboAsin || typeof p.comboAsin !== 'object') return p;
+    const keys = Object.keys(p.comboAsin);
+    if (keys.length <= max) return p;
+    const keep = new Set(keys.slice(0, max));
+    const trim = obj => {
+      if (!obj || typeof obj !== 'object') return obj;
+      const out = {};
+      for (const k of Object.keys(obj)) if (keep.has(k)) out[k] = obj[k];
+      return out;
+    };
+    p.comboAsin     = trim(p.comboAsin);
+    p.comboPrices   = trim(p.comboPrices);
+    p.comboInStock  = trim(p.comboInStock);
+    p.sizePrices    = trim(p.sizePrices);
+    // asinImages is keyed by ASIN (value), so trim by kept-ASIN membership.
+    // variationImages is keyed by DIM VALUE (e.g. color name "red", "blue"),
+    // not by ASIN — leave it alone. It's small and safe to over-include.
+    if (p.asinImages) {
+      const keptAsins = new Set(Object.values(p.comboAsin));
+      const out = {};
+      for (const k of Object.keys(p.asinImages)) if (keptAsins.has(k)) out[k] = p.asinImages[k];
+      p.asinImages = out;
+    }
+    // variations is an array of DIMENSION GROUPS, shape [{name, values, images}].
+    // It's not row-per-combo, so there's nothing to filter — leave it alone.
+    // Capping comboAsin alone is enough to cap the effective variant count
+    // downstream (smartSync walks comboAsin, not variations).
+    console.log(`[capCombos] ${keys.length} → ${keep.size} variants (${p.asin || p.parentAsin || '?'})`);
+    return p;
+  } catch(e) {
+    console.warn('[capCombos] failed, passing through uncapped:', e.message);
+    return p;
   }
-  console.log(`[capCombos] ${keys.length} → ${keep.size} variants (${p.asin || p.parentAsin || '?'})`);
-  return p;
 }
 
 const KEY     = 'ds_settings'; // Only stores settings+token, never products
