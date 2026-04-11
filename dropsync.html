@@ -2115,9 +2115,33 @@ async function bulkFetchDeals(dept) {
       if (btnEl) btnEl.innerHTML = `<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> ${i+1}/${products.length}: ${asin}…</span>`;
 
       try {
+        // Try browser-side Amazon fetch first (cuts Railway egress).
+        // fetchAmazonInBrowser tries the Chrome extension, then direct, then
+        // codetabs proxy, etc. Three possible outcomes:
+        //   1. Returns '__EXTENSION__' → extension already parsed everything,
+        //      its data is in window._extensionScrapeResult — send as clientAsinData
+        //   2. Returns an HTML string → send as pageHtml so server parses it
+        //   3. Returns null → fall back to server fetching Amazon itself (current behavior)
+        let _pageHtml = null;
+        let _clientAsinData = null;
+        try {
+          const _bUrl = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
+          const _bRes = await fetchAmazonInBrowser(_bUrl).catch(() => null);
+          if (_bRes === '__EXTENSION__') {
+            _clientAsinData = window._extensionScrapeResult || null;
+          } else if (typeof _bRes === 'string' && _bRes.length > 5000) {
+            _pageHtml = _bRes;
+          }
+        } catch(_be) { /* fall through to server-only path */ }
+
         const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
           method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ url: `https://www.amazon.com/dp/${asin}?th=1`, primeOnly: S.primeOnly || false })
+          body: JSON.stringify({
+            url: `https://www.amazon.com/dp/${asin}?th=1`,
+            primeOnly: S.primeOnly || false,
+            pageHtml: _pageHtml,
+            clientAsinData: _clientAsinData,
+          })
         });
         const sd = await safeJson(sr);
         if (!sd.success || !sd.product?.title) {
