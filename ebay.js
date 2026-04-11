@@ -160,19 +160,24 @@ async function fetchPage(url, ua, maxAttempts) {
     ...(extra || {}),
   });
 
-  // Direct attempts with increasing delays and varied URL/UA/referer combos
-  // maxAttempts=1 for ASIN batch fetches: fail fast, use size-price fallback instead of wasting budget
-  const _maxAttempts = maxAttempts || 5;
-  const delays = [0, 1000, 2500, 5000, 10000];
+  // Direct attempts — HARD CAP AT 1.
+  // Retrying a blocked direct fetch with different UA/referer/cookies from
+  // the same Railway IP almost never unblocks (Amazon's block is on the IP,
+  // not the signature). Each wasted attempt burns egress, time, and looks
+  // more botty. One shot — if blocked, bail to the caller which either
+  // force-OOSes the variant (safe) or falls back to stored data.
+  // The relay path above (browser tab) is the only retry that actually helps,
+  // and it ran before this code. The `maxAttempts` arg from callers is now
+  // ignored for the direct path — intentional.
+  const _maxAttempts = 1;
+  const delays = [0];
   for (let i = 0; i < _maxAttempts; i++) {
     if (i > 0) await sleep(delays[i]);
     try {
       const uaIdx = (Date.now() + i * 7) % UA_LIST.length;
       const tryUrl = urlVariants[i % urlVariants.length];
       const referer = referers[i % referers.length];
-      const extra = i === 3 ? { 'Cookie': 'session-id=000-0000000-0000000; i18n-prefs=USD; lc-main=en_US' }
-                  : i === 4 ? { 'Cookie': 'i18n-prefs=USD', 'X-Forwarded-For': '' }
-                  : undefined;
+      const extra = undefined;
       const r = await fetch(tryUrl, {
         headers: makeHeaders(UA_LIST[uaIdx|0], referer, extra),
         redirect: 'follow',
@@ -182,11 +187,11 @@ async function fetchPage(url, ua, maxAttempts) {
         // ok fetch logged by caller's batch summary — suppress here to save log lines
         return html;
       }
-      console.warn(`[fetch] direct attempt ${i+1} blocked (${html.length}b)${_asinTag}`);
+      console.warn(`[fetch] direct attempt ${i+1} blocked (${html.length}b)${_asinTag} — bailing (no retry)`);
     } catch(e) { console.warn(`[fetch] direct attempt ${i+1} error: ${e.message}${_asinTag}`); }
   }
 
-  console.warn(`[fetch] ALL strategies failed${_asinTag} — qty=0 (no price data)`);
+  console.warn(`[fetch] direct blocked, no retry${_asinTag} — qty=0 (no price data)`);
   return '';
 }
 
