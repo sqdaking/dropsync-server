@@ -4398,14 +4398,79 @@ async function pushExisting(pid, _overrides = {}) {
     // Hard cap variants before push — belt-and-suspenders with import-time cap
     capCombos(p);
 
-    // Push directly with the draft's stored data — no re-scrape.
-    // The draft was built from a scrape at import time and db.js snapshots
-    // the full product into the JSONB `data` column. Re-scraping here was
-    // hitting Amazon via CORS-blocked direct fetch + dead public proxies,
-    // making push slow/unreliable. The worker's sync rotation reconciles
-    // price/qty drift within the next rotation window, so any stale field
-    // self-corrects automatically.
+    // Decide whether to re-scrape before pushing:
+    //   FAST PATH — draft has valid prices → push directly with stored snapshot.
+    //   SAFETY PATH — draft has no prices (was imported during an Amazon block
+    //   window) → re-scrape via fetchAmazonInBrowser + server scraper to fill
+    //   in prices before pushing. This is the ONLY way a priceless draft can
+    //   ever become pushable without the user re-importing.
+    //
+    // "Has valid prices" = either p.price > 0 OR at least one comboPrices entry > 0.
     let productToPost = { ...p };
+    const _hasTopPrice = parseFloat(p.price) > 0 || parseFloat(p.cost) > 0;
+    const _hasComboPrices = p.comboPrices && Object.values(p.comboPrices).some(v => parseFloat(v) > 0);
+    const _needsRescrape = !_hasTopPrice && !_hasComboPrices;
+
+    if (_needsRescrape && productToPost.sourceUrl) {
+      toast('🔍 Draft has no prices — refetching from Amazon…', 'info', 3000);
+      try {
+        // Browser fetch first — scraper uses clientHtml so the server never touches Amazon
+        let clientHtml = null;
+        const _bFetch = await fetchAmazonInBrowser(productToPost.sourceUrl).catch(() => null);
+        if (_bFetch === '__EXTENSION__') {
+          clientHtml = window._extensionScrapeResult?.html || null;
+        } else if (_bFetch && _bFetch.length > 5000) {
+          clientHtml = _bFetch;
+        }
+
+        const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: productToPost.sourceUrl, clientHtml })
+        });
+        if (!sr.ok) throw new Error('_SCRAPE_FAILED');
+        const sd = await safeJson(sr);
+        const scraped = sd.product || sd;
+        if (scraped.title || scraped.images?.length) {
+          // Merge scraped fields into productToPost AND persist back to p
+          productToPost = {
+            ...productToPost,
+            images:          scraped.images?.length    ? scraped.images          : productToPost.images,
+            price:           scraped.price             || productToPost.price,
+            cost:            scraped.price             || productToPost.cost,
+            bullets:         scraped.bullets?.length   ? scraped.bullets         : productToPost.bullets,
+            description:     scraped.description       || productToPost.description,
+            variations:      scraped.variations?.length? scraped.variations      : productToPost.variations,
+            variationImages: scraped.variationImages   || productToPost.variationImages,
+            hasVariations:   scraped.hasVariations     ?? productToPost.hasVariations,
+            parentAsin:      scraped.parentAsin        || productToPost.parentAsin,
+            comboAsin:       scraped.comboAsin         || productToPost.comboAsin,
+            comboInStock:    scraped.comboInStock      || productToPost.comboInStock,
+            sizePrices:      scraped.sizePrices        || productToPost.sizePrices,
+            comboPrices:     scraped.comboPrices       || productToPost.comboPrices,
+            aspects:         scraped.aspects           || productToPost.aspects,
+            breadcrumbs:     scraped.breadcrumbs       || productToPost.breadcrumbs,
+            asinImages:      scraped.asinImages        || productToPost.asinImages,
+            _primaryDimName:   scraped._primaryDimName   || productToPost._primaryDimName,
+            _secondaryDimName: scraped._secondaryDimName || productToPost._secondaryDimName,
+            _extraDimNames:    scraped._extraDimNames    || productToPost._extraDimNames,
+            inStock:           scraped.inStock         ?? productToPost.inStock,
+          };
+          // Cap combos again after merge — fresh scrape may have brought back >50
+          capCombos(productToPost);
+          // Persist to localStorage so next push (or sync) has the data
+          p.images = productToPost.images;
+          p.price  = productToPost.price;
+          p.cost   = productToPost.cost;
+          if (scraped.comboAsin)    p.comboAsin    = productToPost.comboAsin;
+          if (scraped.comboPrices)  p.comboPrices  = productToPost.comboPrices;
+          if (scraped.comboInStock) p.comboInStock = productToPost.comboInStock;
+          if (scraped.variations?.length)  p.variations      = productToPost.variations;
+          if (scraped.variationImages)     p.variationImages = productToPost.variationImages;
+          if (scraped.asinImages)          p.asinImages      = productToPost.asinImages;
+          save();
+        }
+      } catch(e) { console.warn('[pushExisting] rescue rescrape failed:', e.message); }
+    }
 
     const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
