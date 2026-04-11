@@ -3775,6 +3775,56 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   if (!product.hasVariations && !product.price && !product.cost && !product.myPrice)
     return res.status(400).json({ error: 'No price — re-import from the Import tab first.' });
 
+  // ── AMAZON $0 → FORCE QTY 0 (NON-NEGOTIABLE) ───────────────────────────────
+  // Hard rule: if Amazon's scraped cost is 0, the listing publishes at qty=0
+  // and stays unbuyable until the worker revises it back with a real price.
+  // Applies to single-variant AND multi-variation listings, no exceptions.
+  // No "force push" override, no manual cost fallback — Amazon $0 is the
+  // signal that we don't know the real cost right now, and unknown cost means
+  // unbuyable. The worker rotation will fix the qty automatically when
+  // Amazon's price comes back on the next revise pass.
+  //
+  // Mechanism (rather than refusing):
+  //   - Simple/single-variant: set product.inStock = false → simpleQty becomes 0
+  //     downstream. Also bump product.price to a $9.99 placeholder so the
+  //     markup math and eBay's $0.99 minimum-price requirement are satisfied.
+  //     Since qty=0, no buyer can ever transact at the placeholder price.
+  //   - Multi-variant: for every comboPrices entry with cost <= 0, set
+  //     comboInStock[key] = false (downstream isInStock() returns false → qty=0
+  //     for that variant) and bump comboPrices[key] to $9.99 placeholder for
+  //     the same reason. Variants with real Amazon prices are untouched.
+  {
+    const _src = product._source || 'amazon';
+    if (_src === 'amazon') {
+      const PLACEHOLDER = 9.99; // arbitrary > $0.99 (eBay min); never sold because qty=0
+
+      // Simple/single-variant case
+      const _scrapedPrice = parseFloat(product.price) || 0;
+      if (_scrapedPrice <= 0) {
+        console.warn(`[push] AMAZON $0 → forcing OOS for "${(product.title||'').slice(0,60)}" (was product.price=${product.price})`);
+        product.inStock = false;
+        product.price = PLACEHOLDER;
+      }
+
+      // Multi-variant case: zero out any combo whose Amazon cost is 0
+      if (product.comboPrices && typeof product.comboPrices === 'object') {
+        if (!product.comboInStock || typeof product.comboInStock !== 'object') product.comboInStock = {};
+        let _zeroed = 0;
+        for (const [key, rawPrice] of Object.entries(product.comboPrices)) {
+          const p = parseFloat(rawPrice) || 0;
+          if (p <= 0) {
+            product.comboInStock[key] = false;
+            product.comboPrices[key]  = PLACEHOLDER;
+            _zeroed++;
+          }
+        }
+        if (_zeroed > 0) {
+          console.warn(`[push] AMAZON $0 variants → forced ${_zeroed} variant(s) to OOS for "${(product.title||'').slice(0,60)}"`);
+        }
+      }
+    }
+  }
+
   // ── SINGLE-COMBO COLLAPSE ──────────────────────────────────────────────────
   // Some products come out of the scraper flagged as multi-variation (with
   // dim names like "Color"/"Size" populated) but with zero or one real combo.
@@ -4124,23 +4174,23 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   // ── SIMPLE ────────────────────────────────────────────────────────────────
   if (!product.hasVariations || !product.variations?.length) {
     const ebayPrice = applyMk(basePrice);
+    const simpleQty = product.inStock !== false ? defaultQty : 0;
     // ── HARD PRICE FLOOR ─────────────────────────────────────────────────────
-    // Last line of defense: if the computed eBay price is below $1, refuse to
-    // publish. Catches any future code path that bypasses the top-of-handler
-    // cost guard. Never silently coerce to $0.00 — that's how free listings
-    // happen. $1 is the floor because eBay's own minimum is $0.99 and any
-    // genuine sale price below $1 is almost certainly a bug.
-    if (!(ebayPrice >= 1)) {
-      console.warn(`[push/simple] BLOCKED: cost=$${basePrice} → ebayPrice=$${ebayPrice} is below $1 floor — refusing to push`);
+    // Refuse to publish a buyable listing below $1. Skip this check when
+    // qty=0 — a $0 listing with qty=0 is unbuyable and is the intentional
+    // OOS placeholder shape from the Amazon-$0 force-OOS block above.
+    if (simpleQty > 0 && !(ebayPrice >= 1)) {
+      console.warn(`[push/simple] BLOCKED: cost=$${basePrice} → ebayPrice=$${ebayPrice} below $1 floor with qty=${simpleQty} — refusing to publish a buyable $0 listing`);
       return res.status(400).json({
-        error: `Computed eBay price ($${(ebayPrice||0).toFixed(2)}) is below the $1 minimum. Check the markup, handling, and source price — refusing to publish to prevent a $0 listing.`,
+        error: `Computed eBay price ($${(ebayPrice||0).toFixed(2)}) is below the $1 minimum and qty would be ${simpleQty}. Refusing to publish a buyable listing at this price.`,
         code: 'PRICE_TOO_LOW'
       });
     }
-    const finalPrice = ebayPrice.toFixed(2);
-    console.log(`[push/simple] cost=$${basePrice} → $${finalPrice}`);
+    // For OOS (qty=0) listings with 0 ebayPrice, fall back to a $9.99 placeholder
+    // so eBay accepts the offer ($0.99 minimum). Worker will revise on next pass.
+    const finalPrice = (ebayPrice >= 1 ? ebayPrice : 9.99).toFixed(2);
+    console.log(`[push/simple] cost=$${basePrice} → $${finalPrice} (qty=${simpleQty})`);
 
-    const simpleQty = product.inStock !== false ? defaultQty : 0;
     console.log(`[push/simple] inStock=${product.inStock} qty=${simpleQty}`);
     const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(groupSku)}`, {
       method: 'PUT', headers: auth,
@@ -4208,19 +4258,35 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   if (!variants.length) return res.status(400).json({ error: 'No variants could be built — check that the product has valid variation values.' });
 
   // ── HARD PRICE FLOOR (variation path) ────────────────────────────────────
-  // Refuse if ANY variant ended up below the $1 floor. A single $0 variant
-  // in a multi-variation listing is just as dangerous as a $0 simple listing
-  // — buyers can grab the cheap variant. Match the simple-path floor exactly.
+  // Refuse only if a BUYABLE variant (qty > 0) is below $1. Variants at qty=0
+  // (out-of-stock placeholders from the Amazon-$0 force-OOS rule) are allowed
+  // through with placeholder prices because no one can buy them.
   {
-    const _badVariants = variants.filter(v => !(parseFloat(v.price) >= 1));
+    const _badVariants = variants.filter(v => {
+      const _qty = parseInt(v.qty) || 0;
+      const _price = parseFloat(v.price) || 0;
+      return _qty > 0 && _price < 1;
+    });
     if (_badVariants.length) {
-      const _sample = _badVariants.slice(0, 3).map(v => `${v.sku}=$${v.price}`).join(', ');
-      console.warn(`[push/var] BLOCKED: ${_badVariants.length}/${variants.length} variants below $1 floor — refusing to push. Sample: ${_sample}`);
+      const _sample = _badVariants.slice(0, 3).map(v => `${v.sku}=$${v.price}@qty${v.qty}`).join(', ');
+      console.warn(`[push/var] BLOCKED: ${_badVariants.length}/${variants.length} BUYABLE variants below $1 floor. Sample: ${_sample}`);
       return res.status(400).json({
-        error: `${_badVariants.length} of ${variants.length} variants computed below the $1 minimum price (e.g. ${_sample}). Refusing to publish. Check markup, handling, and source prices, then re-push.`,
+        error: `${_badVariants.length} of ${variants.length} variants would publish at qty>0 below the $1 minimum (e.g. ${_sample}). Refusing to publish buyable $0 variants.`,
         code: 'PRICE_TOO_LOW'
       });
     }
+    // Bump any qty=0 variant whose computed price is below $1 to a $9.99
+    // placeholder so eBay accepts the offer. They're unbuyable so price is moot.
+    let _bumped = 0;
+    for (const v of variants) {
+      const _qty = parseInt(v.qty) || 0;
+      const _price = parseFloat(v.price) || 0;
+      if (_qty === 0 && _price < 1) {
+        v.price = '9.99';
+        _bumped++;
+      }
+    }
+    if (_bumped > 0) console.log(`[push/var] bumped ${_bumped} OOS variant(s) to $9.99 placeholder for eBay min-price compliance`);
   }
 
   // Block push if per-variant prices couldn't be verified
