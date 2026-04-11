@@ -760,6 +760,25 @@ function extractPriceFromBuyBox(html) {
              || '';
   if (!core) return null;
 
+  // Priority 0: apex-pricetopay-accessibility-label — Amazon's newer apex
+  // price block puts the actual checkout price as text content of this span:
+  //   <span id="apex-pricetopay-accessibility-label" class="aok-offscreen">$799.99</span>
+  // It's the most reliable extraction point on the page when present (no
+  // whole+fraction joining, no JSON traversal). Try it first across the full
+  // HTML, not just `core` — the apex block sometimes lives outside corePrice.
+  const apexLabel = html.match(/id="apex-pricetopay-accessibility-label"[^>]*>\s*\$?([\d,]+\.?\d*)\s*</);
+  if (apexLabel) {
+    const p = parseFloat(apexLabel[1].replace(/,/g, ''));
+    if (p > 0 && p < 100000) return p;
+  }
+  // Same selector with attributes in different order (defensive)
+  const apexLabelAlt = html.match(/class="aok-offscreen"[^>]*id="apex-pricetopay-accessibility-label"[^>]*>\s*\$?([\d,]+\.?\d*)\s*</)
+                    || html.match(/<span[^>]*aok-offscreen[^>]*pricetopay[^>]*>\s*\$?([\d,]+\.?\d*)\s*</);
+  if (apexLabelAlt) {
+    const p = parseFloat(apexLabelAlt[1].replace(/,/g, ''));
+    if (p > 0 && p < 100000) return p;
+  }
+
   // Priority 1: "priceToPay" — the actual checkout price (discounted if on sale)
   // Pattern: "$35.99 with 5 percent savings" in accessibility label
   const withSavings = core.match(/\$([\d.]+)\s+with\s+\d+\s*percent\s+savings/);
@@ -3799,6 +3818,24 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     }
   }
 
+  // ── HARD COST FLOOR ────────────────────────────────────────────────────────
+  // After the collapse above, a product may end up as single-variant with no
+  // valid cost (e.g. Amazon scraper got price=0 because the item was OOS at
+  // scrape time, or the collapsed combo had no price). Pushing a $0 product
+  // to eBay is dangerous — buyers can grab free listings before we notice.
+  // Refuse the push here with a clear error rather than letting the price
+  // math silently produce $0.00 downstream.
+  if (!product.hasVariations) {
+    const _baseCost = parseFloat(product.price || product.cost || product.myPrice || 0) || 0;
+    if (_baseCost <= 0) {
+      console.warn(`[push] BLOCKED: "${(product.title||'').slice(0,60)}" has no valid base cost (price=${product.price}, cost=${product.cost}, myPrice=${product.myPrice}) — refusing to push at $0`);
+      return res.status(400).json({
+        error: 'Cannot push: no valid price detected for this product. Re-import from the Import tab, or check the source URL — the item may be out of stock or unavailable.',
+        code: 'NO_PRICE'
+      });
+    }
+  }
+
   // ── PRE-PUSH CLEANUP: delete any existing inventory for this SKU ────────────
   // Instead of returning early on duplicate, wipe clean and re-push fresh.
   // This ensures prices/images/variants are always current on re-push.
@@ -4087,7 +4124,20 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   // ── SIMPLE ────────────────────────────────────────────────────────────────
   if (!product.hasVariations || !product.variations?.length) {
     const ebayPrice = applyMk(basePrice);
-    const finalPrice = (ebayPrice > 0 ? ebayPrice : 0).toFixed(2);
+    // ── HARD PRICE FLOOR ─────────────────────────────────────────────────────
+    // Last line of defense: if the computed eBay price is below $1, refuse to
+    // publish. Catches any future code path that bypasses the top-of-handler
+    // cost guard. Never silently coerce to $0.00 — that's how free listings
+    // happen. $1 is the floor because eBay's own minimum is $0.99 and any
+    // genuine sale price below $1 is almost certainly a bug.
+    if (!(ebayPrice >= 1)) {
+      console.warn(`[push/simple] BLOCKED: cost=$${basePrice} → ebayPrice=$${ebayPrice} is below $1 floor — refusing to push`);
+      return res.status(400).json({
+        error: `Computed eBay price ($${(ebayPrice||0).toFixed(2)}) is below the $1 minimum. Check the markup, handling, and source price — refusing to publish to prevent a $0 listing.`,
+        code: 'PRICE_TOO_LOW'
+      });
+    }
+    const finalPrice = ebayPrice.toFixed(2);
     console.log(`[push/simple] cost=$${basePrice} → $${finalPrice}`);
 
     const simpleQty = product.inStock !== false ? defaultQty : 0;
@@ -4156,6 +4206,22 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
 
   const variants = buildVariants({ product, groupSku, applyMk, defaultQty, body });
   if (!variants.length) return res.status(400).json({ error: 'No variants could be built — check that the product has valid variation values.' });
+
+  // ── HARD PRICE FLOOR (variation path) ────────────────────────────────────
+  // Refuse if ANY variant ended up below the $1 floor. A single $0 variant
+  // in a multi-variation listing is just as dangerous as a $0 simple listing
+  // — buyers can grab the cheap variant. Match the simple-path floor exactly.
+  {
+    const _badVariants = variants.filter(v => !(parseFloat(v.price) >= 1));
+    if (_badVariants.length) {
+      const _sample = _badVariants.slice(0, 3).map(v => `${v.sku}=$${v.price}`).join(', ');
+      console.warn(`[push/var] BLOCKED: ${_badVariants.length}/${variants.length} variants below $1 floor — refusing to push. Sample: ${_sample}`);
+      return res.status(400).json({
+        error: `${_badVariants.length} of ${variants.length} variants computed below the $1 minimum price (e.g. ${_sample}). Refusing to publish. Check markup, handling, and source prices, then re-push.`,
+        code: 'PRICE_TOO_LOW'
+      });
+    }
+  }
 
   // Block push if per-variant prices couldn't be verified
   // (all prices identical = Amazon blocked per-ASIN fetches, can't price accurately)
