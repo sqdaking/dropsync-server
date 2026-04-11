@@ -8092,12 +8092,61 @@ module.exports = async (req, res) => {
       if (clientHtml && clientHtml.length > 10000) {
         const parsed = aeScrapeProduct(clientHtml, aeId);
         if (parsed && parsed.price > 0) {
-          console.log(`[aeScrapeProduct] ${aeId} parsed from clientHtml: "${parsed.title?.slice(0,40)}" $${parsed.price}`);
+          console.log(`[aeScrapeProduct] ${aeId} parsed from clientHtml: "${parsed.title?.slice(0,40)}" $${parsed.price} vars=${parsed.variations?.length||0}`);
           return res.json({ success: true, product: parsed });
         }
       }
 
-      // For bulk import: build product from list page hint data (no product page fetch needed)
+      // ── Server fetch for full details (variations, combos, etc.) ────────────
+      // For bulk import we have hintTitle/hintPrice from the list page card, but
+      // hint data alone has no variation info. Fetch the actual product page
+      // server-side so the AE scrapers can extract dimensions. If the fetch
+      // fails (Amazon-style bot block, redirect to login, etc.), fall through
+      // to the hint-only branch below.
+      const _aeUrlsBulk = [
+        `https://www.aliexpress.com/item/${aeId}.html`,
+        `https://www.aliexpress.com/i/${aeId}.html`,
+        `https://www.aliexpress.us/item/${aeId}.html`,
+      ];
+      const _aeHdrsBulk = {
+        'User-Agent': randUA(),
+        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cookie': 'aep_usuc_f=site=glo&c_tp=USD&x_alilg=en&b_locale=en_US; intl_locale=en_US; acs_usuc_f=;',
+        'Referer': 'https://www.google.com/',
+      };
+      let _aeHtmlBulk = null;
+      for (const _aeUrl of _aeUrlsBulk) {
+        if (_aeHtmlBulk) break;
+        for (let a = 0; a < 2 && !_aeHtmlBulk; a++) {
+          try {
+            const r = await fetch(_aeUrl, {
+              headers: { ..._aeHdrsBulk, 'User-Agent': UA_LIST[a % UA_LIST.length] },
+              redirect: 'follow',
+              timeout: 15000,
+            });
+            const h = await r.text();
+            if (!h || h.length < 5000) continue;
+            if (h.includes('window.runParams') && h.includes('skuModule')) { _aeHtmlBulk = h; break; }
+            if (h.includes('sku-item--property') || h.includes('sku-item--skus')) { _aeHtmlBulk = h; break; }
+          } catch(e) { console.warn(`[aeScrapeProduct bulk-fetch] ${aeId} attempt ${a}:`, e.message); }
+        }
+      }
+      if (_aeHtmlBulk) {
+        const parsed = aeScrapeProduct(_aeHtmlBulk, aeId);
+        if (parsed?.price > 0) {
+          // Merge hint data as fallback for any field the parser missed
+          if (!parsed.images?.length && hintImg) {
+            parsed.images = [hintImg.startsWith('//') ? 'https:' + hintImg : hintImg];
+          }
+          if (!parsed.title && hintTitle) parsed.title = hintTitle.trim();
+          console.log(`[aeScrapeProduct] ${aeId} bulk-fetched: "${parsed.title?.slice(0,40)}" $${parsed.price} vars=${parsed.variations?.length||0} combos=${Object.keys(parsed.comboPrices||{}).length}`);
+          return res.json({ success: true, product: parsed });
+        }
+      }
+
+      // For bulk import: fall back to hint data only when product page fetch fails
+      // (rare — usually means AE blocked the IP or the item was removed)
       if (hintTitle && hintPrice > 0) {
         const title = hintTitle.trim();
         const ebayTitle = title.replace(/[^a-zA-Z0-9 ,&\-().'/]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
@@ -8113,50 +8162,12 @@ module.exports = async (req, res) => {
           inStock: true,
           rating: 0,
         };
-        console.log(`[aeScrapeProduct] ${aeId} built from hint: "${title.slice(0,40)}" $${product.price}`);
+        console.log(`[aeScrapeProduct] ${aeId} hint-only fallback (server fetch failed): "${title.slice(0,40)}" $${product.price}`);
         return res.json({ success: true, product });
       }
 
-      // Server-side fetch: try aliexpress.com with global-site cookie to get window.runParams
-      // Use multiple URL patterns — .com may redirect to .us (React SPA) on datacenter US IPs
-      const _aeUrls = [
-        `https://www.aliexpress.com/item/${aeId}.html`,
-        `https://www.aliexpress.com/i/${aeId}.html`,
-      ];
-      const _aeHdrs = {
-        'User-Agent': randUA(),
-        'Accept': 'text/html,application/xhtml+xml,*/*;q=0.9',
-        'Accept-Language': 'en-US,en;q=0.9',
-        // Force global site (glo) to avoid redirect to aliexpress.us React SPA
-        'Cookie': 'aep_usuc_f=site=glo&c_tp=USD&x_alilg=en&b_locale=en_US; intl_locale=en_US; acs_usuc_f=;',
-        'Referer': 'https://www.google.com/',
-      };
-      let _aeHtml = null;
-      for (const _aeUrl of _aeUrls) {
-        for (let a = 0; a < 2 && !_aeHtml; a++) {
-          try {
-            const r = await fetch(_aeUrl, {
-              headers: { ..._aeHdrs, 'User-Agent': UA_LIST[a % UA_LIST.length] },
-              redirect: 'follow', // follow to see what we get
-            });
-            const h = await r.text();
-            if (!h || h.length < 5000) continue;
-            // window.runParams = the old desktop site with full structured data
-            if (h.includes('window.runParams') && h.includes('skuModule')) { _aeHtml = h; break; }
-            // aliexpress.us rendered HTML — has sku-item-- classes
-            if (h.includes('sku-item--property') || h.includes('sku-item--skus')) { _aeHtml = h; break; }
-          } catch(e) { console.warn(`[aeScrapeProduct] fetch error ${a}:`, e.message); }
-        }
-        if (_aeHtml) break;
-      }
-      if (_aeHtml) {
-        const parsed = aeScrapeProduct(_aeHtml, aeId);
-        if (parsed?.price > 0) {
-          console.log(`[aeScrapeProduct] ${aeId} server-fetched: "${parsed.title?.slice(0,40)}" $${parsed.price} vars=${parsed.variations?.length||0}`);
-          return res.json({ success: true, product: parsed });
-        }
-      }
-      console.warn(`[aeScrapeProduct] ${aeId} — server fetch failed or no price`);
+      // (server fetch is now performed above, before the hint fallback)
+      console.warn(`[aeScrapeProduct] ${aeId} — no clientHtml, no hint, no server html`);
       return res.json({ success: false, error: 'Could not fetch product details — missing hint data' });
     }
 
