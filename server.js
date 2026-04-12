@@ -418,7 +418,12 @@ async function start() {
   try {
     await db.initDB();
     console.log('[Server] DB initialized');
-    startWorker();
+    // ── WORKER DISABLED ──────────────────────────────────────────────────────
+    // Hard kill switch — worker does not start. To re-enable, uncomment the
+    // startWorker() line below. Manual sync from the modal still works (calls
+    // the API directly), so listings can be synced one at a time on demand.
+    // startWorker();
+    console.log('[Server] ⛔ Worker is DISABLED (hard kill switch in server.js). Manual sync still works.');
     app.listen(PORT, '0.0.0.0', () => console.log(`[Server] Running on port ${PORT}`));
   } catch(e) {
     console.error('[Server] Failed to start:', e.message);
