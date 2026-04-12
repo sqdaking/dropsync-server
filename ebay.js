@@ -2461,6 +2461,115 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
     // Always store — empty array means sortedDimValues ran with 0 OOS (all combos available)
     // undefined means sortedDimValues never ran (different from 0-OOS)
     product._unavailableAsins = unavailableAsins?.size > 0 ? [...unavailableAsins] : [];
+
+    // ── HARD CAP: 50 ASINs MAX, VISIBLE/REAL ONLY ─────────────────────────────
+    // Per user rule: every multi-variation product is capped at 50 ASINs total.
+    // Combos must be (a) priced, (b) in stock at scrape time, (c) backed by a
+    // real ASIN. Phantom dim combos (Amazon UI shows them but no ASIN exists)
+    // and OOS-at-import combos are dropped entirely so smartSync never sees
+    // them and never tries to fetch them on later cycles. The kept set becomes
+    // the IMMUTABLE variant universe for this product — additions Amazon makes
+    // later are ignored, removals are reflected via OOS in the normal sync flow.
+    {
+      const MAX_ASINS = 50;
+      // Build the "real visible" combo list, ranked by likelihood of being a
+      // good listing variant: in-stock + priced > 0 first, then by ASIN order
+      // for stable selection across runs.
+      const _visibleCombos = Object.entries(product.comboAsin || {})
+        .filter(([key, asin]) => {
+          if (!asin) return false; // no ASIN → phantom combo, drop
+          if (product.comboInStock?.[key] === false) return false; // explicit OOS at import → drop
+          const p = parseFloat(product.comboPrices?.[key]) || 0;
+          if (p <= 0) return false; // no price → can't list, drop
+          return true;
+        });
+
+      // If more than 50 real visible combos exist, take the cheapest 50
+      // (cheapest = most likely to convert; deterministic; user-friendly default)
+      let _kept;
+      if (_visibleCombos.length > MAX_ASINS) {
+        _kept = _visibleCombos
+          .sort((a, b) => (parseFloat(product.comboPrices[a[0]]) || 0) - (parseFloat(product.comboPrices[b[0]]) || 0))
+          .slice(0, MAX_ASINS);
+        console.log(`[scraper] HARD CAP: trimming ${_visibleCombos.length} real combos → ${MAX_ASINS} (cheapest first)`);
+      } else {
+        _kept = _visibleCombos;
+        console.log(`[scraper] kept all ${_visibleCombos.length} real combos (under ${MAX_ASINS} cap)`);
+      }
+
+      const _keepKeys  = new Set(_kept.map(([k]) => k));
+      const _keepAsins = new Set(_kept.map(([, a]) => a));
+
+      // Rebuild comboAsin / comboPrices / comboInStock with only the kept set.
+      const _newComboAsin = {}, _newComboPrices = {}, _newComboInStock = {};
+      for (const [k, a] of _kept) {
+        _newComboAsin[k]    = a;
+        _newComboPrices[k]  = product.comboPrices[k];
+        _newComboInStock[k] = true; // we already filtered to in-stock above
+      }
+      product.comboAsin    = _newComboAsin;
+      product.comboPrices  = _newComboPrices;
+      product.comboInStock = _newComboInStock;
+
+      // Trim variation values too — drop any dim value whose name doesn't
+      // appear in any kept combo key. This keeps the eBay variation dropdown
+      // honest (shows only colors/sizes that have a real kept variant).
+      if (Array.isArray(product.variations)) {
+        // Collect all dim values that appear on the primary/secondary side of any kept key
+        const _keptPrimVals = new Set();
+        const _keptSecVals  = new Set();
+        for (const k of _keepKeys) {
+          const [pVal, sValRaw] = k.split('|');
+          if (pVal) _keptPrimVals.add(pVal);
+          if (sValRaw) _keptSecVals.add(sValRaw.split(' / ')[0]); // strip compound suffix
+        }
+        product.variations = product.variations
+          .map(vg => {
+            const isPrim = vg.name === product._primaryDimName;
+            const isSec  = vg.name === product._secondaryDimName;
+            if (!isPrim && !isSec) return vg; // leave extra dims untouched
+            const _allowed = isPrim ? _keptPrimVals : _keptSecVals;
+            const filtered = (vg.values || []).filter(v => {
+              const vName = typeof v === 'string' ? v : v.value;
+              return _allowed.has(vName);
+            });
+            return { ...vg, values: filtered };
+          })
+          .filter(vg => (vg.values || []).length > 0); // drop dims that ended up empty
+      }
+
+      // Trim variationImages too — drop entries for filtered-out values
+      if (product.variationImages && typeof product.variationImages === 'object') {
+        for (const [dimName, valMap] of Object.entries(product.variationImages)) {
+          if (!valMap || typeof valMap !== 'object') continue;
+          const isPrim = dimName === product._primaryDimName;
+          const isSec  = dimName === product._secondaryDimName;
+          if (!isPrim && !isSec) continue;
+          const _allowed = isPrim ? new Set([...new Set([...Object.keys(_newComboAsin)].map(k => k.split('|')[0]))])
+                                   : new Set([...new Set([...Object.keys(_newComboAsin)].map(k => (k.split('|')[1]||'').split(' / ')[0]))]);
+          for (const valName of Object.keys(valMap)) {
+            if (!_allowed.has(valName)) delete valMap[valName];
+          }
+        }
+      }
+
+      // If after trimming the product has 0 combos, set a flag so callers
+      // can decide what to do:
+      //   - handlePush (first-time push): refuse outright — no point listing
+      //     a product with zero buyable variants
+      //   - smartSync (existing listing): mark every variant qty=0 but keep
+      //     the listing alive so it can recover when Amazon comes back
+      // The scraper itself doesn't know which context it's running in, so it
+      // just exposes the fact via _zeroVariantsAfterCap and lets the callers
+      // do the right thing.
+      if (Object.keys(_newComboAsin).length === 0) {
+        console.warn(`[scraper] HARD CAP: 0 real combos after filter — flagging _zeroVariantsAfterCap`);
+        product._zeroVariantsAfterCap = true;
+        // Keep hasVariations + variations as scraped — sync needs them to
+        // know which existing eBay variants to mark OOS. Push will refuse
+        // before that matters.
+      }
+    }
   }
 
   console.log(`[scrapeAmazonProduct] "${product.title?.slice(0,50)}" price=$${product.price} imgs=${product.images.length} hasVar=${product.hasVariations}`);
@@ -3775,6 +3884,20 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     return res.status(400).json({ error: 'No images — re-import from the Import tab first.' });
   if (!product.hasVariations && !product.price && !product.cost && !product.myPrice)
     return res.status(400).json({ error: 'No price — re-import from the Import tab first.' });
+
+  // ── ZERO-VARIANTS GUARD (first-time push) ──────────────────────────────────
+  // If the scraper's HARD CAP filter dropped every variant — every combo was
+  // either OOS, missing a price, or had no real ASIN — there's nothing to
+  // list. Refuse the push outright. This is the import-time path. (Sync of an
+  // existing listing handles this differently in smartSync — it keeps the
+  // listing alive and marks all variants OOS.)
+  if (product._zeroVariantsAfterCap) {
+    console.warn(`[push] BLOCKED: scraper trim left 0 real variants for "${(product.title||'').slice(0,60)}" — refusing first-time push`);
+    return res.status(400).json({
+      error: 'Cannot push: this Amazon product has no in-stock priced variants right now. Every color/size is either out of stock or missing a price. Wait for restock or pick a different product.',
+      code: 'ZERO_VARIANTS_AFTER_CAP'
+    });
+  }
 
   // ── AMAZON $0 → FORCE QTY 0 (NON-NEGOTIABLE) ───────────────────────────────
   // Hard rule: if Amazon's scraped cost is 0, the listing publishes at qty=0
@@ -6499,10 +6622,12 @@ module.exports = async (req, res) => {
         });
       }
 
-      // ── Progressive slicing — 100 ASINs per cycle ─────────────────────────────
-      // Large products (147, 900 ASINs) spread across multiple sync cycles.
+      // ── Progressive slicing — 50 ASINs per cycle ─────────────────────────────
+      // Capped at 50 per user rule (was 100). Smaller batches = lower per-cycle
+      // load on Amazon (less rate-limit triggering) and faster cycle turnaround,
+      // at the cost of more cycles for very large listings (1000+ variations).
       // Frontend stores asinOffset, sends it each cycle, resets when all done.
-      const ASIN_BATCH_SIZE = 100;
+      const ASIN_BATCH_SIZE = 50;
       const asinOffset = parseInt(body.asinOffset || 0);
       const _slice = allUniqueAsins.slice(asinOffset, asinOffset + ASIN_BATCH_SIZE);
       const uniqueAsins = _slice.length ? _slice : allUniqueAsins; // fallback to all if offset wrong
@@ -6554,9 +6679,10 @@ module.exports = async (req, res) => {
         console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1} done: ${fetchOk} ok, ${fetchFail} blocked (force-OOS) ──`);
       }
 
-      // Pick best price (use first in-stock ASIN price as fallback for any unpriced variant)
-      const _bestCost  = uniqueAsins.map(a => asinPrice[a]).find(p => p > 0) || 0;
-      const _bestEbay  = _bestCost > 0 ? applyMk(_bestCost) : 0;
+      // (removed _bestCost / _bestEbay sibling-price fallback — per user rule
+      // each variant must use its OWN ASIN's fresh Amazon price or go qty=0,
+      // never inherit a price from a different variant. Keeping these defined
+      // would risk future code accidentally wiring them in as a fallback.)
 
       // ── STEP 3: Get variant SKUs + offer IDs ─────────────────────────────────
       const skuToAsin      = body.skuToAsin     || {};
@@ -6950,7 +7076,10 @@ module.exports = async (req, res) => {
         // orphans entirely, or the variant will simply stop being offered.
         if (!asin) {
           _orphanedSkus.push(sku);
-          const preservePrice = offer.currentPrice > 0 ? offer.currentPrice : 1;
+          // eBay rejects prices at or below their per-category minimum (often $1.00 strict).
+          // Use the existing offer price if it's safely above the minimum, otherwise
+          // use a $9.99 placeholder. qty=0 below ensures the placeholder is unbuyable.
+          const preservePrice = offer.currentPrice > 1.00 ? offer.currentPrice : 9.99;
           console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match on current Amazon parent), forcing qty=0 price=$${preservePrice}`);
           updates.push({
             offerId:           offer.offerId,
@@ -6973,8 +7102,24 @@ module.exports = async (req, res) => {
         const cost      = asinPrice[asin] || 0;
         const inStock   = asinInStock[asin] !== false;
         const ebayPrice = cost > 0 ? applyMk(cost) : 0;
-        const qty       = (inStock && ebayPrice > 0) ? defaultQty : 0;
-        const putPrice  = ebayPrice > 0 ? ebayPrice : (offer.currentPrice > 0 ? offer.currentPrice : 1);
+        let qty         = (inStock && ebayPrice > 0) ? defaultQty : 0;
+        // eBay rejects prices at or below their per-category minimum (often $1.00 strict).
+        // Three cases for putPrice:
+        //   1. Real ebayPrice from a real Amazon cost → use it
+        //   2. Existing offer price > $1.00 → preserve it (still > min)
+        //   3. Otherwise → $9.99 placeholder
+        // ENFORCE qty=0 whenever we use the placeholder so no buyer can transact
+        // at a fake price. This is the user's non-negotiable rule applied here.
+        let putPrice;
+        if (ebayPrice > 0) {
+          putPrice = ebayPrice;
+        } else if (offer.currentPrice > 1.00) {
+          putPrice = offer.currentPrice;
+          qty = 0; // no real Amazon price → unbuyable, regardless of what inStock said
+        } else {
+          putPrice = 9.99;
+          qty = 0; // placeholder → unbuyable, non-negotiable
+        }
 
         console.log(`[smartSync] ${sku.slice(-20)} asin=${asin||'?'} $${cost} → eBay $${putPrice.toFixed(2)} qty=${qty}`);
         updates.push({
@@ -6994,6 +7139,25 @@ module.exports = async (req, res) => {
       // ── STEP 5: Update all variants ──────────────────────────────────────────
       console.log(`[smartSync] updating ${updates.length} variants…`);
       let okCount = 0, failCount = 0;
+      // Track failure reasons so we know whether failures are rate limits, stale
+      // offers, auth issues, or malformed bodies. Without this, failures are
+      // invisible and we can't tell why eBay didn't apply qty updates.
+      const _failReasons = { get429: 0, get4xx: 0, get5xx: 0, getNet: 0,
+                             put429: 0, put4xx: 0, put5xx: 0, putNet: 0 };
+
+      // Helper: fetch with one retry on 429 (eBay rate-limit), backing off ~1.5s.
+      // Most "silent" failures we've been seeing are 429s during the 10-parallel
+      // burst. A single retry catches the vast majority.
+      async function _fetchRetry(url, opts) {
+        let r;
+        try { r = await fetch(url, opts); } catch(e) { return { ok: false, status: 0, _net: e.message }; }
+        if (r.status === 429) {
+          await sleep(1500);
+          try { r = await fetch(url, opts); } catch(e) { return { ok: false, status: 0, _net: e.message, _retried: true }; }
+          r._retried = true;
+        }
+        return r;
+      }
 
       // PUT /offer/{id} per variant — updates price + qty directly on the offer
       // No inventory item bulk update — it overwrites product data and breaks group association (25604)
@@ -7001,14 +7165,23 @@ module.exports = async (req, res) => {
       for (let i = 0; i < updates.length; i += 10) {
         await Promise.all(updates.slice(i, i + 10).map(async ({ offerId, sku, availableQuantity, price }) => {
           try {
-            const gr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, { headers: auth });
-            if (!gr.ok) { failCount++; return; }
+            const gr = await _fetchRetry(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, { headers: auth });
+            if (!gr.ok) {
+              failCount++;
+              if (gr._net)              _failReasons.getNet++;
+              else if (gr.status === 429) _failReasons.get429++;
+              else if (gr.status >= 500)  _failReasons.get5xx++;
+              else                        _failReasons.get4xx++;
+              const _retag = gr._retried ? ' (after 429-retry)' : '';
+              console.warn(`[smartSync] GET offer ${(sku||offerId).slice(-18)} ${gr.status || 'NETERR'}${_retag}: ${(gr._net||'').slice(0,80)}`);
+              return;
+            }
             const offerBody = await gr.json();
             offerBody.pricingSummary = { price };
             offerBody.availableQuantity = availableQuantity;
             delete offerBody.offerId; delete offerBody.status; delete offerBody.listing;
             delete offerBody.marketplaceId; delete offerBody.offerState;
-            const pr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, {
+            const pr = await _fetchRetry(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, {
               method: 'PUT', headers: auth, body: JSON.stringify(offerBody),
             });
             if (pr.ok || pr.status === 204) {
@@ -7016,12 +7189,28 @@ module.exports = async (req, res) => {
               console.log(`[smartSync] ✓ ${(sku||offerId).slice(-18)} qty=${availableQuantity} $${price.value}`);
             } else {
               failCount++;
-              const e = await pr.text().catch(() => '');
-              console.warn(`[smartSync] PUT offer ${offerId} ${pr.status}: ${e.slice(0,120)}`);
+              if (pr._net)               _failReasons.putNet++;
+              else if (pr.status === 429) _failReasons.put429++;
+              else if (pr.status >= 500)  _failReasons.put5xx++;
+              else                        _failReasons.put4xx++;
+              const e = pr._net || await pr.text().catch(() => '');
+              const _retag = pr._retried ? ' (after 429-retry)' : '';
+              console.warn(`[smartSync] PUT offer ${(sku||offerId).slice(-18)} ${pr.status || 'NETERR'}${_retag}: ${e.slice(0,140)}`);
             }
-          } catch(e) { failCount++; }
+          } catch(e) {
+            failCount++;
+            _failReasons.putNet++;
+            console.warn(`[smartSync] update threw for ${(sku||offerId).slice(-18)}: ${e.message}`);
+          }
         }));
-        if (i + 10 < updates.length) await sleep(150);
+        if (i + 10 < updates.length) await sleep(250); // was 150ms — bumped to ease eBay rate limit
+      }
+
+      // Log failure breakdown so we can see what's actually going wrong
+      if (failCount > 0) {
+        const _bd = Object.entries(_failReasons).filter(([,n]) => n > 0)
+                          .map(([k,n]) => `${k}=${n}`).join(' ');
+        console.warn(`[smartSync] failure breakdown: ${_bd}`);
       }
       // Sync inventory item quantity to match offer — prevents OOS showing on eBay
       // even when offer qty=1, because eBay uses inventory item qty as the source of truth

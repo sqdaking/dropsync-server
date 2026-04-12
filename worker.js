@@ -90,6 +90,21 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       result.status = 'skipped_oos'; return result;
     }
 
+    // ── POST-PUSH COOLDOWN ────────────────────────────────────────────────────
+    // Skip products that were pushed/repushed within the last 15 minutes. The
+    // push action already scraped fresh Amazon data and wrote correct prices
+    // and qtys to eBay — re-running smartSync seconds later does the same work
+    // for no information gain (Amazon prices don't change in 15 minutes) and
+    // wastes Amazon-fetch budget that's better spent on stale listings.
+    const COOLDOWN_MS = 15 * 60 * 1000;
+    const _pushedAt = product.pushedAt ? Date.parse(product.pushedAt) : 0;
+    if (_pushedAt && (Date.now() - _pushedAt) < COOLDOWN_MS) {
+      const _ageMin = Math.round((Date.now() - _pushedAt) / 60000);
+      console.log(`[Worker]   skipping recently-pushed (${_ageMin}m ago, cooldown 15m): "${(product.title||'').slice(0,40)}"`);
+      result.status = 'skipped_cooldown';
+      return result;
+    }
+
     console.log(`[Worker] → "${(product.title||'').slice(0,50)}"`);
 
     // Rebuild skuToAsin from comboAsin if missing (old listings pushed before skuToAsin was tracked)
