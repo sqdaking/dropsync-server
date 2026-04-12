@@ -90,17 +90,25 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       result.status = 'skipped_oos'; return result;
     }
 
-    // ── POST-PUSH COOLDOWN ────────────────────────────────────────────────────
-    // Skip products that were pushed/repushed within the last 15 minutes. The
-    // push action already scraped fresh Amazon data and wrote correct prices
-    // and qtys to eBay — re-running smartSync seconds later does the same work
-    // for no information gain (Amazon prices don't change in 15 minutes) and
-    // wastes Amazon-fetch budget that's better spent on stale listings.
-    const COOLDOWN_MS = 15 * 60 * 1000;
-    const _pushedAt = product.pushedAt ? Date.parse(product.pushedAt) : 0;
-    if (_pushedAt && (Date.now() - _pushedAt) < COOLDOWN_MS) {
-      const _ageMin = Math.round((Date.now() - _pushedAt) / 60000);
-      console.log(`[Worker]   skipping recently-pushed (${_ageMin}m ago, cooldown 15m): "${(product.title||'').slice(0,40)}"`);
+    // ── POST-PUSH / POST-SYNC COOLDOWN ────────────────────────────────────────
+    // Skip products that were pushed OR synced recently. The user's expectation
+    // is "one sync per click, then leave it alone" — without this, the worker
+    // immediately re-syncs every product on its next rotation, hammering Amazon
+    // and burning through eBay's per-item 250-call daily limit.
+    //
+    // 6 hour default → each listing gets at most ~4 sync passes per day, well
+    // under eBay's 250 calls/item limit (a 50-variant listing uses ~100 calls
+    // per sync, so 4 syncs = 400 — acceptable margin).
+    const COOLDOWN_MS = 6 * 60 * 60 * 1000;
+    const _pushedAt = product.pushedAt     ? Date.parse(product.pushedAt)     : 0;
+    const _syncedAt = product.lastSyncedAt ? Date.parse(product.lastSyncedAt)
+                    : product.lastSynced   ? Date.parse(product.lastSynced)
+                    : 0;
+    const _lastTouchedAt = Math.max(_pushedAt, _syncedAt);
+    if (_lastTouchedAt && (Date.now() - _lastTouchedAt) < COOLDOWN_MS) {
+      const _ageMin = Math.round((Date.now() - _lastTouchedAt) / 60000);
+      const _src = _syncedAt > _pushedAt ? 'synced' : 'pushed';
+      console.log(`[Worker]   skipping recently-${_src} (${_ageMin}m ago, cooldown 6h): "${(product.title||'').slice(0,40)}"`);
       result.status = 'skipped_cooldown';
       return result;
     }
@@ -160,9 +168,12 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
           console.log(`[Worker]   refreshed skuToAsin: ${Object.keys(skuToAsin).length} entries`);
         }
         // Save fresh data back to DB — sync_pending: false must be explicit to avoid re-queuing
+        // lastSyncedAt powers the cooldown so the worker doesn't immediately re-sync
+        // a product that just finished syncing (one cycle = one sync per product, period).
         await db.upsertProduct({
           ...product,
           sync_pending:      false,
+          lastSyncedAt:      new Date().toISOString(),
           comboAsin:         _scraped.comboAsin         || product.comboAsin,
           comboPrices:       _scraped.comboPrices       || product.comboPrices,
           comboInStock:      _scraped.comboInStock      || product.comboInStock,
