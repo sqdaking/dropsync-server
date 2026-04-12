@@ -6088,39 +6088,20 @@ async function openRevisePreview(pid) {
   // Pre-render variation images (will update when sub-tab is opened)
   setTimeout(() => rpRenderVarImages(), 100);
 
-  // Fetch eBay live data + Amazon scrape in parallel
+  // Edit opens with cached data only — NO automatic API calls.
+  // To fetch fresh Amazon data, user must click "🔄 Refresh Amazon" explicitly.
+  // To fetch live eBay data, user must click sync. This avoids burning Amazon
+  // rate-limit budget and eBay's per-item 250-call/day cap on every modal open.
   const markup   = parseFloat(markupEl?.value || S.markup || 23);
   const handling = parseFloat(handlingEl?.value || S.handlingCost || 2);
 
   try {
-    setStatus('Fetching eBay data + scraping Amazon…');
+    setStatus('Loaded from cache · click 🔄 Refresh Amazon for live data');
 
     const [ebayResult, tradingResult, scrapeResult] = await Promise.allSettled([
-      // Fetch live eBay inventory (qty + pricingSummary per variant)
-      (async () => {
-        if (!S.serverUrl || !S.token) return null;
-        const token = await ensureToken();
-        const r = await fetch(`${S.serverUrl}/api/ebay?action=debugInventory`, {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ access_token: token, ebaySku: p.ebaySku, ebayListingId: p.ebayListingId || '', ebayOfferId: p.ebayOfferId || '' })
-        });
-        return r.ok ? r.json() : null;
-      })(),
-      // Fetch ACTUAL listing prices via Trading API GetItem
-      (async () => {
-        if (!p.ebayListingId || !S.serverUrl) return null;
-        const token = await ensureToken();
-        const r = await fetch(`${S.serverUrl}/api/ebay?action=getTradingItem`, {
-          method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ access_token: token, itemId: p.ebayListingId })
-        });
-        return r.ok ? r.json() : null;
-      })(),
-      // Scrape Amazon
-      fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
-        method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ url: p.sourceUrl })
-      }).then(r => r.json()).catch(() => null)
+      Promise.resolve(null), // was: debugInventory fetch
+      Promise.resolve(null), // was: getTradingItem fetch
+      Promise.resolve(null), // was: scrape fetch
     ]);
 
     // Process eBay live data (inventory API - qty)
@@ -6242,7 +6223,7 @@ async function openRevisePreview(pid) {
       }
     }
 
-    setStatus(`Scraped from Amazon · eBay listing ${p.ebayListingId || ''}`);
+    setStatus(`Loaded from cache · eBay listing ${p.ebayListingId || ''} · click 🔄 Refresh Amazon for live data`);
     setCommit('✅ Publish to eBay', false);
 
   } catch(e) {
