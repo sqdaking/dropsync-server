@@ -156,10 +156,52 @@ app.post('/api/products/:id/sync', async (req, res) => {
     const r = await db.pool.query('SELECT data FROM products WHERE id=$1', [id]);
     if (!r.rows.length) return res.status(404).json({ error: 'Product not found' });
     const current = typeof r.rows[0].data === 'string' ? JSON.parse(r.rows[0].data) : r.rows[0].data;
-    const updated = { ...current, ...req.body, id, sync_pending: true };
-    await db.upsertProduct(updated);
-    res.json({ success: true, queued: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+
+    // Apply any inline edits from the modal (markup, quantity, etc.) BEFORE syncing.
+    // Drop sync_pending — we're handling it inline, not via the worker queue.
+    const merged = { ...current, ...req.body, id };
+    delete merged.sync_pending;
+    await db.upsertProduct(merged);
+
+    // Get a valid eBay token (refreshes if expired)
+    const { reviseProduct, getValidToken } = require('./worker');
+    const token = await getValidToken();
+    if (!token) {
+      return res.status(401).json({ error: 'No valid eBay token — re-authenticate in Settings' });
+    }
+
+    // Pull global settings the same way the worker does
+    const markupRaw    = await db.getSetting('markup');
+    const globalMarkup = markupRaw != null ? parseFloat(markupRaw) : 0;
+    const handlingCost = parseFloat(await db.getSetting('handlingCost') || 2);
+    const webhookUrl   = await db.getSetting('webhookUrl') || null;
+    const effMarkup    = (merged.markup != null && merged.markup >= 0) ? merged.markup : globalMarkup;
+
+    // Bypass the 6h cooldown — manual sync is an explicit user action, run NOW.
+    // Only this single call ignores the cooldown; worker-driven syncs still respect it.
+    const productForSync = { ...merged, pushedAt: null, lastSyncedAt: null, lastSynced: null };
+
+    const result = await reviseProduct(productForSync, token, effMarkup, handlingCost, webhookUrl);
+
+    if (result.status === 'ok') {
+      return res.json({
+        success: true,
+        status: result.status,
+        wentOos: result.wentOos,
+        priceChanges: result.priceChanges,
+        stockChanges: result.stockChanges,
+      });
+    }
+    const isErr = result.status === 'error' || result.status === 'revise_failed';
+    return res.status(isErr ? 500 : 200).json({
+      success: !isErr,
+      status:  result.status,
+      error:   result.error || null,
+    });
+  } catch(e) {
+    console.error('[manual-sync] error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.delete('/api/products/:id', async (req, res) => {

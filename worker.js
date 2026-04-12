@@ -248,8 +248,13 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
     const priceEntries = Object.values(pricesObj);
     const costList    = priceEntries.map(p => (typeof p === 'number' ? p : p?.cost) || 0).filter(c => c > 0);
     const avgPrice    = costList.length ? costList.reduce((a, b) => a + b, 0) / costList.length : 0;
-    const anyInStock  = costList.length > 0 && priceEntries.some(p => (typeof p === 'object' ? p?.inStock !== false : true));
-    result.wentOos = !anyInStock;
+    // A product only "went OOS" if we got REAL data back saying so. All-zero costs
+    // from blocked fetches ≠ OOS — that's a sync failure, not stock loss. Without
+    // this gate, a fully-blocked sync looks identical to a fully-OOS product and
+    // would fire the OOS webhook + log a false alarm.
+    const realDataCount = costList.length;
+    const anyInStock    = realDataCount > 0 && priceEntries.some(p => (typeof p === 'object' ? p?.inStock !== false : true));
+    result.wentOos      = realDataCount > 0 && !anyInStock;
 
     console.log(`[Worker]   ✓ ${synced} offers updated · avg Amazon $${avgPrice.toFixed(2)} · ${anyInStock ? 'In Stock' : 'OOS'}`);
 
@@ -465,4 +470,4 @@ function startWorker() {
   setTimeout(runForever, 5000);
 }
 
-module.exports = { startWorker, runForever, getValidToken };
+module.exports = { startWorker, runForever, getValidToken, reviseProduct };

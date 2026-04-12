@@ -1200,6 +1200,34 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
   }
   if (!html) return null;
 
+  // ── Parent-ASIN normalization ──────────────────────────────────────────────
+  // If the URL we just fetched is a child variant, re-fetch the parent ASIN
+  // page instead. Parent pages give:
+  //   - a more stable URL (parents almost never go OOS / get suppressed)
+  //   - Amazon's "preferred" default variant (more likely to have a real buy-box)
+  //   - the same complete dimensionToAsinMap / variationValues / sortedDimValuesForAllDims
+  // Cost: 1 extra fetch on import. Skipped if browser pre-fetched HTML
+  // (clientAsinData path) since we trust what the browser sent.
+  if (!preloadedHtml && asin) {
+    const _parentMatch = html.match(/"parentAsin"\s*:\s*"([A-Z0-9]{10})"/);
+    const _parentAsin  = _parentMatch?.[1];
+    if (_parentAsin && _parentAsin !== asin) {
+      console.log(`[scrapeAmazonProduct] child ASIN ${asin} → re-fetching parent ${_parentAsin} for cleaner data`);
+      await sleep(800); // brief pause so we don't hammer Amazon back-to-back
+      const _parentHtml = await fetchPage(`https://www.amazon.com/dp/${_parentAsin}?th=1`, randUA());
+      if (_parentHtml) {
+        html = _parentHtml;
+        url  = `https://www.amazon.com/dp/${_parentAsin}?th=1`;
+        // Note: we keep the original `asin` variable as the imported child's ASIN
+        // so downstream code that references `asin` (logging, dedupe keys) still works.
+        // The parent ASIN gets stored on product.parentAsin a few lines below.
+        console.log(`[scrapeAmazonProduct] parent fetch ok — using parent HTML for variation matrix`);
+      } else {
+        console.log(`[scrapeAmazonProduct] parent fetch failed — falling back to child HTML`);
+      }
+    }
+  }
+
   const product = {
     url, source: 'amazon', asin: asin || '',
     title: '', price: 0, images: [],
@@ -6915,15 +6943,16 @@ module.exports = async (req, res) => {
         for (let i = 0; i < uniqueAsins.length; i += BATCH) {
           await Promise.all(uniqueAsins.slice(i, i + BATCH).map(async (asin, bi) => {
             await sleep(bi * 150);
-            // 2 attempts max — blocked ASINs get force-OOSed this cycle and
-            // re-tried next cycle, so we don't waste time retrying here.
+            // 2 attempts max — blocked ASINs are set qty=0 this cycle (Out-of-Stock
+            // Control hides the variant) and re-tried normally on the next sync.
+            // This is NOT a real OOS event: no markedOos flag, no OOS webhook.
             const h = await fetchPage(`https://www.amazon.com/dp/${asin}?th=1&psc=1`, randUA(), 2);
             if (!h) {
               asinPrice[asin]   = 0;     // ← explicit 0 so _haveFreshPrice sees it
               asinInStock[asin] = false;
               _fetchFailed.add(asin);
               fetchFail++;
-              console.log(`[smartSync] ${asin} → BLOCKED (force-OOS)`);
+              console.log(`[smartSync] ${asin} → fetch blocked, qty=0 (will retry next sync)`);
               return;
             }
             const price = extractPriceFromBuyBox(h) || extractPrice(h) || 0;
@@ -6935,7 +6964,7 @@ module.exports = async (req, res) => {
           }));
           if (i + BATCH < uniqueAsins.length) await sleep(1000);
         }
-        console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1} done: ${fetchOk} ok, ${fetchFail} blocked (force-OOS) ──`);
+        console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1} done: ${fetchOk} ok, ${fetchFail} blocked (qty=0 this cycle) ──`);
       }
 
       // (removed _bestCost / _bestEbay sibling-price fallback — per user rule
