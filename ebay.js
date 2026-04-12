@@ -6584,6 +6584,7 @@ module.exports = async (req, res) => {
           _source: 'amazon',
           title: body.fallbackTitle || '',
           ebayTitle: body.fallbackTitle || '',
+          description: body.fallbackDescription || body.fallbackTitle || '',
           price: parseFloat(body.fallbackPrice) || 0,
           images: body.fallbackImages || [],
           variations: body.fallbackVariations || [],
@@ -6696,11 +6697,26 @@ module.exports = async (req, res) => {
       for (let i = 0; i < variants.length; i += 5) {
         await Promise.all(variants.slice(i, i + 5).map(async v => {
           try {
-            const itemAspects = { ...groupAspects, ...(v.dims || {}) };
+            // eBay requires: aspect keys normalized to canonical names (Color, Size, etc.)
+            // and aspect values wrapped in arrays of strings, not raw scalars.
+            // Mismatch on either causes errorId 2004 "Invalid request".
+            const itemAspects = {};
+            for (const [k, av] of Object.entries(groupAspects || {})) {
+              itemAspects[k] = Array.isArray(av) ? av : [String(av)];
+            }
+            for (const [k, val] of Object.entries(v.dims || {})) {
+              const normKey = /color|colour/i.test(k) ? 'Color'
+                            : /^size$/i.test(k)       ? 'Size'
+                            : k;
+              itemAspects[normKey] = [String(val)];
+            }
+            const _title = sanitizeTitle(product.ebayTitle || product.title || '');
+            const _desc  = product.description || product.title || _title || 'Product';
             const ib = {
               condition: 'NEW',
               product: {
-                title: sanitizeTitle(product.ebayTitle || product.title || ''),
+                title: _title,
+                description: _desc, // REQUIRED — without this eBay returns 2004 Invalid request
                 imageUrls: [v.image, ...(product.images || [])].filter(Boolean).slice(0, 12),
                 aspects: itemAspects,
               },
@@ -6711,7 +6727,7 @@ module.exports = async (req, res) => {
             });
             if (!ir.ok && ir.status !== 204) {
               updFail++;
-              console.warn(`[resync] inv-item PUT ${v.sku.slice(-20)} ${ir.status}: ${(await ir.text().catch(()=>'')).slice(0,100)}`);
+              console.warn(`[resync] inv-item PUT ${v.sku.slice(-20)} ${ir.status}: ${(await ir.text().catch(()=>'')).slice(0,500)}`);
               return;
             }
             // offer: update existing or create new

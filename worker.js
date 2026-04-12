@@ -217,6 +217,7 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       fallbackPrice:              _scraped?.price || product.cost || 0,
       fallbackShipping:           product.shippingCost || 0,
       fallbackTitle:              _scraped?.ebayTitle || _scraped?.title || product.title || '',
+      fallbackDescription:        _scraped?.description || product.description || product.title || '',
       fallbackImages:             _scraped?.images || product.images || [],
       fallbackAspects:            _scraped?.aspects || product.aspects || {},
     });
