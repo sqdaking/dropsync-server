@@ -2189,38 +2189,39 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
       ? Object.values(comboInStock).some(v => v !== false)
       : mainInStock;
 
-    // Best price selection:
-    //   1. If the URL's ASIN has a matching entry in comboAsin → use THAT entry's price
-    //      (this is what the user expects when they paste a dp/ASIN URL — the page's own
-    //      variant's price, not the cheapest sibling variant).
-    //   2. Else cheapest in-stock variant price.
-    //   3. Else cheapest any variant.
-    //   4. Else fall back to the buy-box base price.
+    // Top-level product.price selection — STRICT, no inheritance from sibling variants.
+    // Old behavior used "cheapest in-stock variant" as a fallback when the URL ASIN
+    // had no fetched price, which produced dangerous mispriced listings: a $79 variant
+    // could end up listed at the $14.97 of a different variant whose ASIN happened to
+    // succeed at fetch time. Per user rule (non-negotiable): NO PRICE FALLBACK FROM
+    // OTHER VARIANTS, EVER. If the URL ASIN's own price isn't available, top-level
+    // price stays 0 — which the handlePush AMAZON-$0 guard then converts into a
+    // qty=0 unbuyable listing. The buyable variants still publish at their own real
+    // prices via buildVariants; only the top-level "starting at" price is gated.
     let _urlAsinPrice = 0;
     if (asin) {
       for (const [key, a] of Object.entries(comboAsin)) {
         if (a === asin) {
           const cp = comboPrices[key];
           if (cp > 0 && comboInStock[key] !== false) { _urlAsinPrice = cp; break; }
-          // Track even if OOS so we have a fallback over cheapest-variant
-          if (cp > 0 && !_urlAsinPrice) _urlAsinPrice = cp;
         }
       }
     }
-    const inStockPrices = Object.entries(comboPrices)
-      .filter(([k]) => comboInStock[k] !== false)
-      .map(([,p]) => p)
-      .filter(p => p > 0);
     if (_urlAsinPrice > 0) {
       product.price = _urlAsinPrice;
       console.log(`[scraper] product.price=$${_urlAsinPrice} (URL ASIN ${asin} match)`);
-    } else if (inStockPrices.length) {
-      product.price = Math.min(...inStockPrices);
-      console.log(`[scraper] product.price=$${product.price} (cheapest in-stock — URL ASIN ${asin||'(none)'} not in combos)`);
     } else {
-      const allPrices = Object.values(comboPrices).filter(p=>p>0);
-      if (allPrices.length) product.price = Math.min(...allPrices);
-      else product.price = product._basePrice || 0; // single-variant fallback
+      // No URL ASIN price — leave product.price as 0. Do NOT inherit from sibling
+      // variants. handlePush will detect this and force the listing to qty=0.
+      // Single-variant fallback: only use _basePrice if there are NO combos at all
+      // (genuine single-product page where no variants exist to inherit from).
+      if (Object.keys(comboPrices).length === 0 && product._basePrice > 0) {
+        product.price = product._basePrice;
+        console.log(`[scraper] product.price=$${product._basePrice} (single-variant from buy-box)`);
+      } else {
+        product.price = 0;
+        console.warn(`[scraper] product.price=0 (URL ASIN ${asin||'(none)'} not fetched, NO sibling-price fallback per safety rule — will publish unbuyable)`);
+      }
     }
 
     // Detect if per-variant price fetches were genuinely blocked.
