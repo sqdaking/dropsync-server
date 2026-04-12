@@ -200,10 +200,14 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       fallbackComboPrices:        (_scraped?.comboPrices       || product.comboPrices)       || null,
       fallbackComboInStock:       (_scraped?.comboInStock      || product.comboInStock)      || null,
       fallbackVariations:         (_scraped?.variations        || product.variations)        || null,
+      fallbackVariationImages:    (_scraped?.variationImages   || product.variationImages)   || null,
       fallbackPrimaryDimName:     (_scraped?._primaryDimName   || product._primaryDimName)   || null,
       fallbackSecondaryDimName:   (_scraped?._secondaryDimName || product._secondaryDimName) || null,
       fallbackPrice:              _scraped?.price || product.cost || 0,
       fallbackShipping:           product.shippingCost || 0,
+      fallbackTitle:              _scraped?.ebayTitle || _scraped?.title || product.title || '',
+      fallbackImages:             _scraped?.images || product.images || [],
+      fallbackAspects:            _scraped?.aspects || product.aspects || {},
     });
     const data = _resp.data || {};
 

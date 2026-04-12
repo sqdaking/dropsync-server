@@ -6571,15 +6571,43 @@ module.exports = async (req, res) => {
       const HARD_CAP   = 50;
       console.log(`[resync] ${normSku} — ${sourceUrl}`);
 
-      // STEP 1: re-scrape Amazon (50-cap + visible-only already applied inside)
-      const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
-      if (!html) {
-        console.warn(`[resync] ${normSku} BLOCKED — Amazon parent unfetchable, aborting (no destructive changes)`);
-        return res.json({ success: false, error: 'Amazon parent page blocked', skippable: true });
+      // STEP 1: get fresh product data
+      // Prefer the worker-provided scrape (already done one step earlier in
+      // worker.js → reviseProduct, passed in as fallback* fields). Only do a
+      // fresh fetchPage when called from the frontend or some other context
+      // that didn't pre-scrape.
+      let product;
+      if (body.comboAsin && Object.keys(body.comboAsin).length > 0 && body.fallbackComboPrices) {
+        // Reconstitute a product object from the worker's scrape payload — same
+        // shape scrapeAmazonProduct would have returned. No re-fetch needed.
+        product = {
+          _source: 'amazon',
+          title: body.fallbackTitle || '',
+          ebayTitle: body.fallbackTitle || '',
+          price: parseFloat(body.fallbackPrice) || 0,
+          images: body.fallbackImages || [],
+          variations: body.fallbackVariations || [],
+          variationImages: body.fallbackVariationImages || {},
+          comboAsin: body.comboAsin,
+          comboPrices: body.fallbackComboPrices,
+          comboInStock: body.fallbackComboInStock || {},
+          aspects: body.fallbackAspects || {},
+          hasVariations: (body.fallbackVariations || []).length > 0,
+          _primaryDimName: body.fallbackPrimaryDimName || null,
+          _secondaryDimName: body.fallbackSecondaryDimName || null,
+          shippingCost: parseFloat(body.fallbackShipping) || 0,
+        };
+        console.log(`[resync] using worker-provided scrape (${Object.keys(product.comboAsin).length} combos, ${Object.keys(product.comboPrices).length} prices)`);
+      } else {
+        const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
+        if (!html) {
+          console.warn(`[resync] ${normSku} BLOCKED — Amazon parent unfetchable, aborting (no destructive changes)`);
+          return res.json({ success: false, error: 'Amazon parent page blocked', skippable: true });
+        }
+        product = await scrapeAmazonProduct(sourceUrl, html, null);
+        if (!product) return res.json({ success: false, error: 'Scrape returned null' });
+        product._source = product._source || 'amazon';
       }
-      const product = await scrapeAmazonProduct(html, sourceUrl);
-      if (!product) return res.json({ success: false, error: 'Scrape returned null' });
-      product._source = product._source || 'amazon';
 
       // STEP 2: pull existing eBay group state
       const grpR = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`, { headers: auth });
@@ -6698,7 +6726,7 @@ module.exports = async (req, res) => {
               const pr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(existing.offerId)}`, {
                 method: 'PUT', headers: auth, body: JSON.stringify(ob),
               });
-              if (pr.ok || pr.status === 204) updOk++;
+              if (pr.ok || pr.status === 204) { updOk++; console.log(`[resync] ✓ ${v.sku.slice(-20)} qty=${v.qty} $${v.price}`); }
               else { updFail++; console.warn(`[resync] offer PUT ${v.sku.slice(-20)} ${pr.status}`); }
             } else {
               const off = buildOffer(v.sku, String(v.price), categoryId, policies, locationKey);
@@ -6706,7 +6734,7 @@ module.exports = async (req, res) => {
               const cr = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, {
                 method: 'POST', headers: auth, body: JSON.stringify(off),
               });
-              if (cr.ok) updOk++;
+              if (cr.ok) { updOk++; console.log(`[resync] ✓ NEW ${v.sku.slice(-20)} qty=${v.qty} $${v.price}`); }
               else { updFail++; console.warn(`[resync] offer POST ${v.sku.slice(-20)} ${cr.status}`); }
             }
           } catch(e) { updFail++; console.warn(`[resync] update threw ${v.sku.slice(-20)}: ${e.message}`); }
