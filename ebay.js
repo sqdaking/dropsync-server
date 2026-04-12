@@ -6551,6 +6551,221 @@ module.exports = async (req, res) => {
 
     // 4. PUT only what changed: qty 0→1 or 1→0, price if diff > $0.01
     // 5. Returns { success, synced, unchanged, priceChanges, stockChanges }
+    // ── RESYNC FROM SCRAPE — full re-push to existing listing ────────────────
+    // Architecture: fresh scrape → reuse existing groupSku → update inventory
+    // items + offers → publish_by_inventory_item_group. Same listing ID, fresh
+    // data top-to-bottom. Replaces the per-variant smartSync reconciliation
+    // dance. Hard cap of 50 total variants on the listing — fresh variants
+    // win, surviving zombies (existing eBay variants no longer on Amazon) get
+    // forced qty=0, oldest zombies get evicted (offer DELETE) when over cap.
+    if (action === 'resyncFromScrape') {
+      const { access_token, ebaySku, sourceUrl,
+              markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw,
+              fulfillmentPolicyId, paymentPolicyId, returnPolicyId } = body;
+      if (!access_token || !ebaySku || !sourceUrl)
+        return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
+
+      const EBAY_API   = getEbayUrls().EBAY_API;
+      const auth       = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
+      const normSku    = ebaySku.trim().replace(/\s+/g, '');
+      const HARD_CAP   = 50;
+      console.log(`[resync] ${normSku} — ${sourceUrl}`);
+
+      // STEP 1: re-scrape Amazon (50-cap + visible-only already applied inside)
+      const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
+      if (!html) {
+        console.warn(`[resync] ${normSku} BLOCKED — Amazon parent unfetchable, aborting (no destructive changes)`);
+        return res.json({ success: false, error: 'Amazon parent page blocked', skippable: true });
+      }
+      const product = await scrapeAmazonProduct(html, sourceUrl);
+      if (!product) return res.json({ success: false, error: 'Scrape returned null' });
+      product._source = product._source || 'amazon';
+
+      // STEP 2: pull existing eBay group state
+      const grpR = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`, { headers: auth });
+      if (!grpR.ok) return res.status(400).json({ error: `Group fetch failed: ${grpR.status}` });
+      const grpData = await grpR.json().catch(() => ({}));
+      const existingSkus = grpData.variantSKUs || [];
+      console.log(`[resync] existing group has ${existingSkus.length} variant SKUs`);
+
+      // STEP 3: discover offer IDs + lastModifiedDate per existing SKU
+      const offerMap = {}; // sku → { offerId, lastModifiedDate, currentPrice }
+      for (let i = 0; i < existingSkus.length; i += 5) {
+        await Promise.all(existingSkus.slice(i, i + 5).map(async sku => {
+          try {
+            const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}&marketplace_id=EBAY_US`, { headers: auth });
+            if (!r.ok) return;
+            const d = await r.json().catch(() => ({}));
+            const off = (d.offers || [])[0];
+            if (off?.offerId) {
+              offerMap[sku] = {
+                offerId: off.offerId,
+                lastModifiedDate: off.lastModifiedDate || off.listingStartDate || '',
+                currentPrice: parseFloat(off.pricingSummary?.price?.value || 0),
+              };
+            }
+          } catch(e) {}
+        }));
+        if (i + 5 < existingSkus.length) await sleep(120);
+      }
+      console.log(`[resync] discovered ${Object.keys(offerMap).length}/${existingSkus.length} offer IDs`);
+
+      // STEP 4: build fresh variants via the same buildVariants the push uses
+      const markupPct = parseFloat(mkRaw  ?? 23);
+      const handling  = parseFloat(handRaw ?? 2);
+      const defaultQty = parseInt(qtyRaw) || 1;
+      const applyMk = cost => {
+        const c = parseFloat(cost) || 0;
+        if (c <= 0) return 0;
+        return Math.ceil(((c + handling) * (1 + markupPct / 100) / (1 - 0.1335) + 0.30) * 100) / 100;
+      };
+      const variants = product.hasVariations
+        ? buildVariants({ product, groupSku: normSku, applyMk, defaultQty, body })
+        : [];
+      const freshSkuSet = new Set(variants.map(v => v.sku));
+      console.log(`[resync] fresh scrape produced ${variants.length} variants`);
+
+      // STEP 5: classify zombies (on eBay but not in fresh scrape)
+      const zombies = existingSkus.filter(s => !freshSkuSet.has(s));
+
+      // STEP 6: enforce 50-cap by evicting oldest zombies first
+      const totalAfterMerge = variants.length + zombies.length;
+      let zombiesToEvict = [], zombiesToKeep = zombies;
+      if (totalAfterMerge > HARD_CAP) {
+        zombies.sort((a, b) => {
+          const da = offerMap[a]?.lastModifiedDate || '';
+          const db = offerMap[b]?.lastModifiedDate || '';
+          return da.localeCompare(db) || existingSkus.indexOf(a) - existingSkus.indexOf(b);
+        });
+        const evictCount = totalAfterMerge - HARD_CAP;
+        zombiesToEvict = zombies.slice(0, evictCount);
+        zombiesToKeep  = zombies.slice(evictCount);
+        console.log(`[resync] cap eviction: total=${totalAfterMerge} > ${HARD_CAP}, evicting ${evictCount} oldest zombies`);
+      }
+
+      // STEP 7: evict zombie offers (DELETE — eBay allows ending an offer)
+      let evictedOk = 0, evictedFail = 0;
+      for (const sku of zombiesToEvict) {
+        const oid = offerMap[sku]?.offerId;
+        if (!oid) continue;
+        try {
+          const dr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(oid)}`, { method: 'DELETE', headers: auth });
+          if (dr.ok || dr.status === 204) { evictedOk++; console.log(`[resync] ✗ evicted ${sku.slice(-20)}`); }
+          else { evictedFail++; console.warn(`[resync] evict ${sku.slice(-20)} failed: ${dr.status}`); }
+        } catch(e) { evictedFail++; }
+      }
+
+      // STEP 8: resolve policies + category for the fresh variant updates
+      let policies = {};
+      try { policies = await resolvePolicies(access_token, { fulfillmentPolicyId, paymentPolicyId, returnPolicyId }); }
+      catch(e) { return res.status(400).json({ error: `Policy resolution failed: ${e.message}` }); }
+      const locationKey = await ensureLocation(auth);
+      const categoryId = product._categoryId || product.categoryId || grpData.aspects?.['eBay Category'] || '';
+
+      // STEP 9: update fresh variants — PUT inventory_item + GET/PUT or POST offer
+      let updOk = 0, updFail = 0;
+      const groupAspects = product.aspects || {};
+      for (let i = 0; i < variants.length; i += 5) {
+        await Promise.all(variants.slice(i, i + 5).map(async v => {
+          try {
+            const itemAspects = { ...groupAspects, ...(v.dims || {}) };
+            const ib = {
+              condition: 'NEW',
+              product: {
+                title: sanitizeTitle(product.ebayTitle || product.title || ''),
+                imageUrls: [v.image, ...(product.images || [])].filter(Boolean).slice(0, 12),
+                aspects: itemAspects,
+              },
+              availability: { shipToLocationAvailability: { quantity: parseInt(v.qty) || 0 } },
+            };
+            const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(v.sku)}`, {
+              method: 'PUT', headers: auth, body: JSON.stringify(ib),
+            });
+            if (!ir.ok && ir.status !== 204) {
+              updFail++;
+              console.warn(`[resync] inv-item PUT ${v.sku.slice(-20)} ${ir.status}: ${(await ir.text().catch(()=>'')).slice(0,100)}`);
+              return;
+            }
+            // offer: update existing or create new
+            const existing = offerMap[v.sku];
+            if (existing?.offerId) {
+              const gr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(existing.offerId)}`, { headers: auth });
+              if (!gr.ok) { updFail++; return; }
+              const ob = await gr.json();
+              ob.pricingSummary = { price: { value: String(v.price), currency: 'USD' } };
+              ob.availableQuantity = parseInt(v.qty) || 0;
+              delete ob.offerId; delete ob.status; delete ob.listing; delete ob.marketplaceId; delete ob.offerState;
+              const pr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(existing.offerId)}`, {
+                method: 'PUT', headers: auth, body: JSON.stringify(ob),
+              });
+              if (pr.ok || pr.status === 204) updOk++;
+              else { updFail++; console.warn(`[resync] offer PUT ${v.sku.slice(-20)} ${pr.status}`); }
+            } else {
+              const off = buildOffer(v.sku, String(v.price), categoryId, policies, locationKey);
+              off.availableQuantity = parseInt(v.qty) || 0;
+              const cr = await fetch(`${EBAY_API}/sell/inventory/v1/offer`, {
+                method: 'POST', headers: auth, body: JSON.stringify(off),
+              });
+              if (cr.ok) updOk++;
+              else { updFail++; console.warn(`[resync] offer POST ${v.sku.slice(-20)} ${cr.status}`); }
+            }
+          } catch(e) { updFail++; console.warn(`[resync] update threw ${v.sku.slice(-20)}: ${e.message}`); }
+        }));
+        if (i + 5 < variants.length) await sleep(200);
+      }
+
+      // STEP 10: force-OOS surviving zombies
+      let zKeptOk = 0;
+      for (const sku of zombiesToKeep) {
+        const oid = offerMap[sku]?.offerId;
+        if (!oid) continue;
+        try {
+          const gr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(oid)}`, { headers: auth });
+          if (!gr.ok) continue;
+          const ob = await gr.json();
+          ob.availableQuantity = 0;
+          const keepPrice = (offerMap[sku].currentPrice > 1.00) ? offerMap[sku].currentPrice : 9.99;
+          ob.pricingSummary = { price: { value: keepPrice.toFixed(2), currency: 'USD' } };
+          delete ob.offerId; delete ob.status; delete ob.listing; delete ob.marketplaceId; delete ob.offerState;
+          const pr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(oid)}`, {
+            method: 'PUT', headers: auth, body: JSON.stringify(ob),
+          });
+          if (pr.ok || pr.status === 204) zKeptOk++;
+        } catch(e) {}
+      }
+
+      // STEP 11: update the group's variantSKUs
+      const finalSkus = [...freshSkuSet, ...zombiesToKeep];
+      try {
+        const gPut = { ...grpData, variantSKUs: finalSkus };
+        delete gPut.inventoryItemGroupKey;
+        await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`, {
+          method: 'PUT', headers: auth, body: JSON.stringify(gPut),
+        });
+      } catch(e) { console.warn(`[resync] group PUT failed: ${e.message}`); }
+
+      // STEP 12: publish
+      let listingId = null;
+      try {
+        const pubR = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`, {
+          method: 'POST', headers: auth,
+          body: JSON.stringify({ inventoryItemGroupKey: normSku, marketplaceId: 'EBAY_US' }),
+        });
+        const pd = await pubR.json().catch(() => ({}));
+        if (pd.listingId) listingId = pd.listingId;
+        else console.warn(`[resync] publish: ${JSON.stringify(pd.errors||{}).slice(0,200)}`);
+      } catch(e) { console.warn(`[resync] publish threw: ${e.message}`); }
+
+      console.log(`[resync] done ${normSku}: fresh=${updOk}/${variants.length}ok zombiesKept=${zKeptOk}/${zombiesToKeep.length} evicted=${evictedOk}/${zombiesToEvict.length} listingId=${listingId||'?'}`);
+      return res.json({
+        success: !!listingId || updOk > 0,
+        listingId,
+        freshOk: updOk, freshFail: updFail,
+        zombiesEvicted: evictedOk, zombiesEvictFail: evictedFail,
+        zombiesKept: zKeptOk, totalSkus: finalSkus.length,
+      });
+    }
+
     if (action === 'smartSync') {
       const { access_token, ebaySku, ebayListingId, sourceUrl,
               markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw } = body;

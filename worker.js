@@ -177,9 +177,11 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       console.warn(`[Worker]   scrape error: ${_se.message}`);
     }
 
-    // Step 2: smartSync with fresh scraped data (in-process)
+    // Step 2: sync with fresh scraped data (in-process)
+    // Toggle: set USE_RESYNC=false to revert to legacy smartSync if anything breaks.
+    const USE_RESYNC = true;
     const _resp = await callEbay({
-      action:        'smartSync',
+      action:        USE_RESYNC ? 'resyncFromScrape' : 'smartSync',
       access_token:  token,
       ebaySku:       sku,
       ebayListingId: product.ebayListingId || '',
