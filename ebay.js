@@ -7465,6 +7465,22 @@ module.exports = async (req, res) => {
               return;
             }
             const offerBody = await gr.json();
+
+            // ── DIFF CHECK: skip PUT if price + qty already match ──────────────
+            // eBay caps revisions at 250/listing/day. PUTing a variant whose price
+            // and qty haven't changed still counts as a revision and burns the budget
+            // for no reason. Compare new values against the live offer; if both match,
+            // skip the PUT entirely.
+            const _currentPrice = parseFloat(offerBody.pricingSummary?.price?.value || 0);
+            const _currentQty   = parseInt(offerBody.availableQuantity ?? -1);
+            const _newPrice     = parseFloat(price.value);
+            const _newQty       = parseInt(availableQuantity);
+            if (_currentPrice === _newPrice && _currentQty === _newQty) {
+              okCount++; // count as success — nothing to do
+              console.log(`[smartSync] = ${(sku||offerId).slice(-18)} unchanged (qty=${_newQty} $${_newPrice.toFixed(2)}) — skipped`);
+              return;
+            }
+
             offerBody.pricingSummary = { price };
             offerBody.availableQuantity = availableQuantity;
             delete offerBody.offerId; delete offerBody.status; delete offerBody.listing;
@@ -7483,7 +7499,7 @@ module.exports = async (req, res) => {
               else                        _failReasons.put4xx++;
               const e = pr._net || await pr.text().catch(() => '');
               const _retag = pr._retried ? ' (after 429-retry)' : '';
-              console.warn(`[smartSync] PUT offer ${(sku||offerId).slice(-18)} ${pr.status || 'NETERR'}${_retag}: ${e.slice(0,140)}`);
+              console.warn(`[smartSync] PUT offer ${(sku||offerId).slice(-18)} ${pr.status || 'NETERR'}${_retag}: ${e.slice(0,500)}`);
             }
           } catch(e) {
             failCount++;
