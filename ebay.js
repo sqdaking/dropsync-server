@@ -7521,20 +7521,9 @@ module.exports = async (req, res) => {
             }
             const offerBody = await gr.json();
 
-            // ── DIFF CHECK: skip PUT if price + qty already match ──────────────
-            // eBay caps revisions at 250/listing/day. PUTing a variant whose price
-            // and qty haven't changed still counts as a revision and burns the budget
-            // for no reason. Compare new values against the live offer; if both match,
-            // skip the PUT entirely.
-            const _currentPrice = parseFloat(offerBody.pricingSummary?.price?.value || 0);
-            const _currentQty   = parseInt(offerBody.availableQuantity ?? -1);
-            const _newPrice     = parseFloat(price.value);
-            const _newQty       = parseInt(availableQuantity);
-            if (_currentPrice === _newPrice && _currentQty === _newQty) {
-              okCount++; // count as success — nothing to do
-              console.log(`[smartSync] = ${(sku||offerId).slice(-18)} unchanged (qty=${_newQty} $${_newPrice.toFixed(2)}) — skipped`);
-              return;
-            }
+            // Diff check DISABLED — force PUT every variant every sync.
+            // (The check was causing some variants with stale offer-side data to
+            // never get updated. Push always.)
 
             offerBody.pricingSummary = { price };
             offerBody.availableQuantity = availableQuantity;
@@ -7588,7 +7577,12 @@ module.exports = async (req, res) => {
                 availability: { shipToLocationAvailability: { quantity: availableQuantity } },
               };
               if (_id.conditionId) _ib.conditionId = _id.conditionId;
-              if (_id.packageWeightAndSize) _ib.packageWeightAndSize = _id.packageWeightAndSize;
+              // Only include packageWeightAndSize if weight.value is a valid positive number.
+              // Some listings have weight.value=0 or missing — eBay returns 25709 if we echo it back.
+              if (_id.packageWeightAndSize) {
+                const _wv = parseFloat(_id.packageWeightAndSize?.weight?.value || 0);
+                if (_wv > 0) _ib.packageWeightAndSize = _id.packageWeightAndSize;
+              }
               const _pr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
                 method: 'PUT', headers: auth, body: JSON.stringify(_ib),
               });
@@ -8696,18 +8690,35 @@ module.exports = async (req, res) => {
           const h = await fetchPage(url, randUA());
           if (!h || h.length < 5000) return;
           let added = 0;
+          // Pattern 1: "asin":"B0XXXXXXXX" — JSON blocks (most pages)
           for (const m of h.matchAll(/"asin"\s*:\s*"([B][0-9A-Z]{9})"/g))
             if (!productMap[m[1]]) { productMap[m[1]] = { asin: m[1], title: '', dept }; added++; }
+          // Pattern 2: data-asin="B0XXXXXXXX" — search results, listing grids
           for (const m of h.matchAll(/data-asin="([B][0-9A-Z]{9})"/g))
             if (!productMap[m[1]]) { productMap[m[1]] = { asin: m[1], title: '', dept }; added++; }
+          // Pattern 3: /slug/dp/B0XXXXXXXX — product links with title slug
           for (const m of h.matchAll(/href="[^"]*\/([^\/\s"]{5,})\/dp\/([B][0-9A-Z]{9})[^"]*"/g)) {
             const slug = decodeURIComponent(m[1]).replace(/-/g,' ');
             if (slug.length > 5 && !productMap[m[2]])
               productMap[m[2]] = { asin: m[2], title: slug, url: 'https://www.amazon.com/dp/'+m[2], dept };
           }
+          // Pattern 4: /dp/B0XXXXXXXX with nearby alt= image
           for (const m of h.matchAll(/\/dp\/([B][0-9A-Z]{9})[^"]*"[^>]*>[\s\S]{0,300}?alt="([^"]{10,120})"/g)) {
             if (!productMap[m[1]] || !productMap[m[1]].title)
               productMap[m[1]] = { asin: m[1], title: m[2], url: 'https://www.amazon.com/dp/'+m[1], dept };
+          }
+          // Pattern 5: ANY /dp/B0XXXXXXXX in href (loosest — catches brand stores, carousels, lazy data)
+          for (const m of h.matchAll(/\/dp\/([B][0-9A-Z]{9})/g))
+            if (!productMap[m[1]]) { productMap[m[1]] = { asin: m[1], title: '', dept }; added++; }
+          // Pattern 6: "productId":"B0XXXXXXXX" or "productAsin":"B0..." — React/JSON state blobs
+          for (const m of h.matchAll(/"(?:productId|productAsin|childAsin|parentAsin|id|sku)"\s*:\s*"([B][0-9A-Z]{9})"/g))
+            if (!productMap[m[1]]) { productMap[m[1]] = { asin: m[1], title: '', dept }; added++; }
+          // Pattern 7: bare ASIN-looking strings inside Amazon's image URLs (m.media-amazon.com/.../B0XXXXXXXX...)
+          for (const m of h.matchAll(/B0[0-9A-Z]{8}/g)) {
+            const _a = m[0];
+            if (!productMap[_a] && /B0[A-Z0-9]{8}/.test(_a)) {
+              productMap[_a] = { asin: _a, title: '', dept }; added++;
+            }
           }
           pagesLoaded++;
           console.log(`[dealsScrape] loaded ${dept} → ${url.slice(0,55)} → +${added} pool=${Object.keys(productMap).length}`);
