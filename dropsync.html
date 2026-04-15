@@ -3917,9 +3917,13 @@ function openDraftEdit(pid) {
     : '<div style="color:var(--text3);font-size:12px;padding:8px">No images</div>';
 
   // Build variants table
-  const primDim = p._primaryDimName || 'Color';
-  const secDim  = p._secondaryDimName || 'Size';
-  const extraDimNames = p._extraDimNames || (p._extraDimName ? [p._extraDimName] : []);
+  // Only assume Color/Size when product actually has variations.
+  // Single-variant products should show no dim pills at all.
+  const primDim = p.hasVariations ? (p._primaryDimName   || 'Color') : null;
+  const secDim  = p.hasVariations ? (p._secondaryDimName || 'Size')  : null;
+  const extraDimNames = p.hasVariations
+    ? (p._extraDimNames || (p._extraDimName ? [p._extraDimName] : []))
+    : [];
   const comboAsin = p.comboAsin||{};
   const comboPrices = p.comboPrices||{};
   const hasCombo = Object.keys(comboAsin).length > 0;
@@ -5028,6 +5032,7 @@ async function toggleBrowserRelay() {
   // Relay is always on — this just pauses/resumes the tick cycle
   if (_relayTimer) {
     stopBrowserRelay();
+    S.browserRelay = false; save();
     toast('⏸ Browser Relay paused — Amazon fetches will fall back to the server (may get blocked)', 'warn', 5000);
   } else {
     S.browserRelay = true; save();
@@ -8128,9 +8133,10 @@ function renderSettings() {
     </div>`;
 
   if (S.serverUrl) syncWorkerPauseState();
-  // Browser relay is always on — browser IP first, server as fallback
-  if (!_relayTimer) {
-    S.browserRelay = true; save();
+  // Auto-start relay only if user hasn't explicitly turned it off.
+  // Respect S.browserRelay === false (user paused it) — don't force it back on.
+  if (!_relayTimer && S.browserRelay !== false) {
+    if (S.browserRelay === undefined) { S.browserRelay = true; save(); }
     startBrowserRelay();
     console.log('[relay] auto-started — browser fetches Amazon, server is fallback only');
   }
