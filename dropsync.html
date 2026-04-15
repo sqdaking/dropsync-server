@@ -3604,7 +3604,7 @@ async function bulkReviseSelected() {
     const pid = listed[i];
     const p = (S.products||[]).find(x => x.id === pid);
     if (!p) continue;
-    if (p._markedOos) { unchanged++; toast(`⏭️ Skipping OOS-locked: ${p.title?.slice(0,30)}`, 'info', 1500); continue; }
+    // OOS-locked products get the same scrape+update treatment — Amazon decides qty.
     if (btn) btn.innerHTML = `⏳ ${i+1}/${listed.length}`;
     toast(`Revising ${i+1}/${listed.length}: ${p.title?.slice(0,30)}…`, 'info', 2500);
     try {
