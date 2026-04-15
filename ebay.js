@@ -2313,19 +2313,10 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
     // Only flag _pricesFailed when ALL combo prices equal the main-page price AND
     // each combo has a different ASIN (meaning real per-ASIN data should exist but didn't load).
     const allComboPrices = Object.values(comboPrices).filter(p => p > 0);
-    const uniquePrices = [...new Set(allComboPrices)];
-    const uniqueAsins = [...new Set(Object.values(comboAsin))];
-    const allEqualMainPrice = allComboPrices.length > 0 && uniquePrices.length === 1
-                           && Math.abs(uniquePrices[0] - mainPrice) < 0.01;
-    if (allComboPrices.length >= 3 && allEqualMainPrice && uniqueAsins.length > 1) {
-      // All variants fell back to main-page price AND each has a different ASIN
-      // → per-ASIN price fetches were blocked (Amazon bot-protection)
-      product._pricesFailed = true;
-      product._pricesFailedReason = 'All variant prices match main page — Amazon may have blocked per-ASIN price fetches.';
-      console.warn(`[scraper] price fetch possibly blocked — ${allComboPrices.length} combos all $${uniquePrices[0]} == mainPrice`);
-    } else {
-      product._pricesFailed = false;
-    }
+    // Per user rule: if Amazon returned a price, use it. Period. No "looks suspicious"
+    // false-positive flagging on uniform prices — many legit products have all variants
+    // at the same price. _pricesFailed stays false unless prices are literally absent.
+    product._pricesFailed = false;
 
     // ── Per-variation images ──────────────────────────────────────────────────
     // CRITICAL: Amazon's swatchImgMap is a flat {value → url} where the keys are
