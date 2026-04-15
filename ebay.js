@@ -7589,10 +7589,16 @@ module.exports = async (req, res) => {
               };
               if (_id.conditionId) _ib.conditionId = _id.conditionId;
               if (_id.packageWeightAndSize) _ib.packageWeightAndSize = _id.packageWeightAndSize;
-              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
+              const _pr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`, {
                 method: 'PUT', headers: auth, body: JSON.stringify(_ib),
               });
-            } catch(_qe) {}
+              if (!_pr.ok && _pr.status !== 204) {
+                const _et = await _pr.text().catch(() => '');
+                console.warn(`[smartSync] inv-item PUT ${sku.slice(-20)} ${_pr.status}: ${_et.slice(0,400)}`);
+              }
+            } catch(_qe) {
+              console.warn(`[smartSync] inv-item PUT ${sku.slice(-20)} threw: ${_qe.message}`);
+            }
           }));
           if (_qi + 5 < _itemUpdates.length) await sleep(100);
         }
