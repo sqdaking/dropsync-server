@@ -6795,7 +6795,15 @@ module.exports = async (req, res) => {
               itemAspects[normKey] = [String(val)];
             }
             const _title = sanitizeTitle(product.ebayTitle || product.title || '');
-            const _desc  = product.description || product.title || _title || 'Product';
+            // Sanitize description: strip VERO brand names + banned words eBay rejects.
+            // Without this, descriptions echoing brand names trigger 25019 "improper words"
+            // and the entire publish fails.
+            let _desc = product.description || product.title || _title || 'Product';
+            _desc = stripVeROFromTitle(_desc); // strip VERO brand names from desc body
+            const _BANNED_DESC = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
+              /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
+            for (const re of _BANNED_DESC) _desc = _desc.replace(re, '');
+            _desc = _desc.replace(/\s{2,}/g, ' ').trim() || _title || 'Product';
             const ib = {
               condition: 'NEW',
               product: {
@@ -6881,7 +6889,7 @@ module.exports = async (req, res) => {
         });
         const pd = await pubR.json().catch(() => ({}));
         if (pd.listingId) listingId = pd.listingId;
-        else console.warn(`[resync] publish: ${JSON.stringify(pd.errors||{}).slice(0,200)}`);
+        else console.warn(`[resync] publish: ${JSON.stringify(pd.errors||{}).slice(0,800)}`);
       } catch(e) { console.warn(`[resync] publish threw: ${e.message}`); }
 
       console.log(`[resync] done ${normSku}: fresh=${updOk}/${variants.length}ok zombiesKept=${zKeptOk}/${zombiesToKeep.length} evicted=${evictedOk}/${zombiesToEvict.length} listingId=${listingId||'?'}`);
@@ -7645,7 +7653,7 @@ module.exports = async (req, res) => {
             console.warn(`[smartSync] individual publish also failed — listing may need re-push`);
             return res.json({ success: false, error: 'eBay group deleted and individual publish failed', needsRepush: true, synced: okCount });
           }
-        } else console.warn(`[smartSync] publish ${pubR.status}: ${pubTxt.slice(0,200)}`);
+        } else console.warn(`[smartSync] publish ${pubR.status}: ${pubTxt.slice(0,800)}`);
       } catch(e) { console.warn('[smartSync] publish error:', e.message); }
 
       return res.json({
