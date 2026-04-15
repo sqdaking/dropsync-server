@@ -85,10 +85,9 @@ async function reviseProduct(product, token, markup, handlingCost, webhookUrl) {
       result.status = 'skipped_ae'; return result;
     }
     if (!sku || !product.sourceUrl) { result.status = 'skipped_no_sku'; return result; }
-    if (product.markedOos === true) {
-      console.log(`[Worker]   skipping OOS-locked: "${(product.title||'').slice(0,40)}"`);
-      result.status = 'skipped_oos'; return result;
-    }
+    // markedOos products used to be skipped entirely — but that left them stranded
+    // if Amazon stock came back. Now they get scraped + updated like everything else.
+    // Amazon says in-stock → qty=1; Amazon says OOS or no price → qty=0.
 
     // ── POST-PUSH / POST-SYNC COOLDOWN ────────────────────────────────────────
     // Skip products that were pushed OR synced recently. The user's expectation
@@ -392,8 +391,7 @@ async function runForever() {
         const allProducts = await db.getProductsForSync(9999);
         _cachedListed = allProducts.filter(p =>
           p.status === 'listed' && p.ebaySku && p.sourceUrl &&
-          !/aliexpress\.com/i.test(p.sourceUrl) &&
-          p.markedOos !== true
+          !/aliexpress\.com/i.test(p.sourceUrl)
         );
         _cacheLoadedAt = Date.now();
         if (cursor === 0) console.log(`[Worker] Product list loaded: ${_cachedListed.length} listed`);
