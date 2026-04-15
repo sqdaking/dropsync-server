@@ -5862,12 +5862,17 @@ function showConfirmModal(title, bodyHtml, confirmLabel='Confirm', cancelLabel='
 }
 
 async function smartSyncSelected() {
-  const selectedIds = [...document.querySelectorAll('.draft-select-cb:checked')].map(cb => cb.dataset.id).filter(Boolean);
+  // Selected products live in S._selectedIds (a Set) — not on a stale CSS class.
+  // Read from there so checked items actually drive the sync.
+  const selectedIds = (S._selectedIds instanceof Set) ? [...S._selectedIds] : [];
   const listed = selectedIds.length
     ? (S.products||[]).filter(p => selectedIds.includes(p.id) && p.status === 'listed')
     : (S.products||[]).filter(p => p.status === 'listed');
+  if (!selectedIds.length) {
+    if (!confirm(`No products selected. Sync all ${listed.length} listed products instead?`)) return;
+  }
   if (!listed.length) { toast('No listed products selected', 'warn'); return; }
-  toast(`🔄 Syncing ${listed.length} products…`, 'info', 4000);
+  toast(`🔄 Syncing ${listed.length} product${listed.length===1?'':'s'}…`, 'info', 4000);
   let ok = 0, blocked = 0, failed = 0;
   for (const p of listed) {
     const r = await smartSyncProduct(p);
