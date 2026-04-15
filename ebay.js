@@ -4164,6 +4164,13 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       .replace(/<ul>\s*<\/ul>/gi, '')
       .replace(/\s{2,}/g, ' ')
       .trim();
+    // Also strip VERO brand names + banned words (same as title/resync sanitize).
+    // Without this, descriptions echoing brand names trigger 25019 "improper words".
+    product.description = stripVeROFromTitle(product.description);
+    const _BANNED = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
+      /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
+    for (const re of _BANNED) product.description = product.description.replace(re, '');
+    product.description = product.description.replace(/\s{2,}/g, ' ').trim() || product.title || 'Product';
   }
   if (product.bullets?.length) {
     const GARBAGE = [/image\s*(unavailable|not\s*available)/i, /select\s*your\s*preferred/i,
