@@ -4481,18 +4481,26 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         code: 'PRICE_TOO_LOW'
       });
     }
-    // Bump any qty=0 variant whose computed price is below $1 to a $9.99
-    // placeholder so eBay accepts the offer. They're unbuyable so price is moot.
+    // For OOS variants (qty=0) with no usable price: use the HIGHEST price from
+    // other variants in the same listing instead of a $9.99 placeholder. This
+    // keeps the 4× max/min price ratio safe (eBay rejects with 25019 if ratio>4)
+    // and avoids dragging the whole listing's price spread down. Variant stays
+    // qty=0 so no buyer can transact at the inherited price.
     let _bumped = 0;
+    const _validPrices = variants
+      .map(v => parseFloat(v.price) || 0)
+      .filter(p => p >= 1);
+    const _maxValidPrice = _validPrices.length > 0 ? Math.max(..._validPrices) : 9.99;
+    const _fallbackPrice = _maxValidPrice >= 1 ? _maxValidPrice : 9.99;
     for (const v of variants) {
       const _qty = parseInt(v.qty) || 0;
       const _price = parseFloat(v.price) || 0;
       if (_qty === 0 && _price < 1) {
-        v.price = '9.99';
+        v.price = _fallbackPrice.toFixed(2);
         _bumped++;
       }
     }
-    if (_bumped > 0) console.log(`[push/var] bumped ${_bumped} OOS variant(s) to $9.99 placeholder for eBay min-price compliance`);
+    if (_bumped > 0) console.log(`[push/var] bumped ${_bumped} OOS variant(s) to $${_fallbackPrice.toFixed(2)} (highest valid sibling price, qty=0)`);
   }
 
   // Block push if per-variant prices couldn't be verified
