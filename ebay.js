@@ -5014,8 +5014,12 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       if (attempt < 5) { await sleep([0, 2000, 4000, 6000, 8000][attempt] || 3000); continue; }
       return res.status(400).json({ error: 'Publish failed: variation specs mismatch (eBay 25013). Try re-pushing.', errorId: 25013, unrecoverable: true });
     }
-    // 25019: price variation > 4X — clamp all variant prices to within 4X of the min price
-    if (errId === 25019 || /price difference.*variation|maximum price difference|4X|4x/i.test(errMsg0)) {
+    // 25019 has TWO meanings: (a) price variation > 4X, (b) improper words / VERO violation.
+    // Only treat as price-clamp if the message clearly says so. Otherwise it's a content
+    // rejection — clamping won't help and we should fall through to other handlers / fail.
+    const _is4xPrice = /price difference.*variation|maximum price difference|allowed.*price.*range|4[xX]/i.test(errMsg0);
+    const _isImproper = /improper words|violation of eBay policy|title.*description.*may contain/i.test(errMsg0);
+    if (errId === 25019 && _is4xPrice && !_isImproper) {
       const prices = variants.map(v => parseFloat(v.price)).filter(p => p > 0);
       const minP = Math.min(...prices);
       const maxAllowed = +(minP * 4).toFixed(2);
@@ -5037,6 +5041,10 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         await sleep(2000); continue;
       }
       return res.status(400).json({ error: 'Variant prices differ by more than 4X — eBay requires all variants within same price range.', errorId: 25019, unrecoverable: true });
+    }
+    if (errId === 25019 && _isImproper) {
+      console.warn(`[push] 25019 improper words — title/desc rejected by eBay content filter. Sanitization may have missed a banned term.`);
+      return res.status(400).json({ error: 'eBay rejected listing: title or description contains banned words (VERO brand name or restricted term). Edit the listing and remove brand-specific terms.', errorId: 25019, unrecoverable: true });
     }
     // 25005: category doesn't support multi-variation — retry with fallback categories
     if (errId === 25005 || /does not support multi-variation|invalid category/i.test(errMsg0)) {
