@@ -7505,6 +7505,16 @@ module.exports = async (req, res) => {
             // (The check was causing some variants with stale offer-side data to
             // never get updated. Push always.)
 
+            // Sanitize listingDescription — offer-level description can also
+            // trigger 25019 "improper words" on VERO brand names or banned terms.
+            if (offerBody.listingDescription) {
+              let _od = stripVeROFromTitle(offerBody.listingDescription);
+              const _BANNED = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
+                /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
+              for (const re of _BANNED) _od = _od.replace(re, '');
+              offerBody.listingDescription = _od.replace(/\s{2,}/g, ' ').trim() || 'Product';
+            }
+
             offerBody.pricingSummary = { price };
             offerBody.availableQuantity = availableQuantity;
             delete offerBody.offerId; delete offerBody.status; delete offerBody.listing;
