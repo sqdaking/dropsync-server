@@ -6831,7 +6831,15 @@ module.exports = async (req, res) => {
           if (!gr.ok) continue;
           const ob = await gr.json();
           ob.availableQuantity = 0;
-          const keepPrice = (offerMap[sku].currentPrice > 1.00) ? offerMap[sku].currentPrice : 9.99;
+          // Use existing price if safely > $1, else highest sibling price in the group
+          // (not $9.99 placeholder — keeps 4× price-ratio rule safe).
+          const _zMaxSibling = (() => {
+            const _prices = Object.values(offerMap)
+              .map(o => parseFloat(o.currentPrice) || 0)
+              .filter(p => p > 1);
+            return _prices.length > 0 ? Math.max(..._prices) : 9.99;
+          })();
+          const keepPrice = (offerMap[sku].currentPrice > 1.00) ? offerMap[sku].currentPrice : _zMaxSibling;
           ob.pricingSummary = { price: { value: keepPrice.toFixed(2), currency: 'USD' } };
           delete ob.offerId; delete ob.status; delete ob.listing; delete ob.marketplaceId; delete ob.offerState;
           const pr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(oid)}`, {
@@ -7354,6 +7362,16 @@ module.exports = async (req, res) => {
       // this guard a 900-ASIN listing would flip 800 variants to qty=0 forever.
       const _haveFreshPrice = new Set(uniqueAsins.filter(a => asinPrice[a] !== undefined));
 
+      // Highest existing sibling price in the group — use as fallback for orphans
+      // and no-price variants instead of $9.99. Keeps the 4× max/min ratio safe
+      // (high-priced variant becomes the anchor; everything else fits within 4×).
+      const _highestSiblingPrice = (() => {
+        const _prices = Object.values(offerMap)
+          .map(o => parseFloat(o.currentPrice) || 0)
+          .filter(p => p > 1);
+        return _prices.length > 0 ? Math.max(..._prices) : 9.99;
+      })();
+
       const updates = [];
       const _skippedNoBatch = [];
       const _orphanedSkus = [];
@@ -7399,10 +7417,10 @@ module.exports = async (req, res) => {
         // orphans entirely, or the variant will simply stop being offered.
         if (!asin) {
           _orphanedSkus.push(sku);
-          // eBay rejects prices at or below their per-category minimum (often $1.00 strict).
-          // Use the existing offer price if it's safely above the minimum, otherwise
-          // use a $9.99 placeholder. qty=0 below ensures the placeholder is unbuyable.
-          const preservePrice = offer.currentPrice > 1.00 ? offer.currentPrice : 9.99;
+          // Use existing offer price if safely > $1, otherwise use highest sibling
+          // price (not $9.99 placeholder) to keep the group's 4× price ratio safe.
+          // qty=0 below ensures the variant is unbuyable.
+          const preservePrice = offer.currentPrice > 1.00 ? offer.currentPrice : _highestSiblingPrice;
           console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match on current Amazon parent), forcing qty=0 price=$${preservePrice}`);
           updates.push({
             offerId:           offer.offerId,
@@ -7430,8 +7448,8 @@ module.exports = async (req, res) => {
         // Three cases for putPrice:
         //   1. Real ebayPrice from a real Amazon cost → use it
         //   2. Existing offer price > $1.00 → preserve it (still > min)
-        //   3. Otherwise → $9.99 placeholder
-        // ENFORCE qty=0 whenever we use the placeholder so no buyer can transact
+        //   3. Otherwise → highest sibling price (keeps 4× ratio safe)
+        // ENFORCE qty=0 whenever we use a fallback so no buyer can transact
         // at a fake price. This is the user's non-negotiable rule applied here.
         let putPrice;
         if (ebayPrice > 0) {
@@ -7440,8 +7458,8 @@ module.exports = async (req, res) => {
           putPrice = offer.currentPrice;
           qty = 0; // no real Amazon price → unbuyable, regardless of what inStock said
         } else {
-          putPrice = 9.99;
-          qty = 0; // placeholder → unbuyable, non-negotiable
+          putPrice = _highestSiblingPrice;
+          qty = 0; // fallback price → unbuyable, non-negotiable
         }
 
         console.log(`[smartSync] ${sku.slice(-20)} asin=${asin||'?'} $${cost} → eBay $${putPrice.toFixed(2)} qty=${qty}`);
