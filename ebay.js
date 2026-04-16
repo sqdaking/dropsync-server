@@ -7645,8 +7645,9 @@ module.exports = async (req, res) => {
         if (pubD.listingId) console.log(`[smartSync] published OK listingId=${pubD.listingId}`);
         else if ((pubD.errors||[]).some(e => e.errorId === 25016))
           console.log(`[smartSync] publish skipped — some unmatched offers have $0 price (ok, offer updates already live)`);
-        else if ((pubD.errors||[]).some(e => e.errorId === 25705)) {
-          console.warn(`[smartSync] publish 25705 — group missing, trying individual offer publish`);
+        else if ((pubD.errors||[]).some(e => e.errorId === 25705 || e.errorId === 25604)) {
+          const _errId = pubD.errors.find(e => e.errorId === 25705 || e.errorId === 25604)?.errorId;
+          console.warn(`[smartSync] publish ${_errId} — group/product missing, trying individual offer publish`);
           // Try publishing each offer individually — bypasses the group requirement
           let indivOk = 0;
           for (const { offerId } of updates) {
@@ -7662,7 +7663,7 @@ module.exports = async (req, res) => {
           if (indivOk > 0) console.log(`[smartSync] individual publish: ${indivOk}/${updates.length} ok`);
           else {
             console.warn(`[smartSync] individual publish also failed — listing may need re-push`);
-            return res.json({ success: false, error: 'eBay group deleted and individual publish failed', needsRepush: true, synced: okCount });
+            return res.json({ success: false, error: `eBay group error ${_errId} and individual publish failed`, needsRepush: true, synced: okCount });
           }
         } else console.warn(`[smartSync] publish ${pubR.status}: ${pubTxt.slice(0,800)}`);
       } catch(e) { console.warn('[smartSync] publish error:', e.message); }
