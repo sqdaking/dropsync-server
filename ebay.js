@@ -309,6 +309,38 @@ const VERO_STRIP = [
   'nokia','motorola','subway',
 ];
 
+// ── sanitizeDescription: one function for ALL description cleanup ─────────────
+// Strips: problematic HTML (tables, scripts, iframes, forms, style blocks),
+// VERO brand names, banned words (authentic, genuine, etc.). Used by push,
+// resync, smartSync inv-item PUT, and smartSync offer PUT.
+function sanitizeDescription(desc, fallback) {
+  if (!desc) return fallback || 'Product';
+  let d = desc;
+  // Strip problematic HTML elements eBay rejects in inventory item descriptions
+  d = d.replace(/<table[\s\S]*?<\/table>/gi, '');
+  d = d.replace(/<script[\s\S]*?<\/script>/gi, '');
+  d = d.replace(/<style[\s\S]*?<\/style>/gi, '');
+  d = d.replace(/<iframe[\s\S]*?<\/iframe>/gi, '');
+  d = d.replace(/<form[\s\S]*?<\/form>/gi, '');
+  d = d.replace(/<object[\s\S]*?<\/object>/gi, '');
+  d = d.replace(/<embed[^>]*>/gi, '');
+  d = d.replace(/<noscript[\s\S]*?<\/noscript>/gi, '');
+  // Strip garbage list items
+  d = d.replace(/<li[^>]*>[^<]*Image\s*(Unavailable|not\s*available)[^<]*<\/li>/gi, '');
+  d = d.replace(/<li[^>]*>[^<]*Select\s*your\s*preferred[^<]*<\/li>/gi, '');
+  d = d.replace(/<li[^>]*>[^<]*(Clothing,\s*Shoes|Tops,\s*Tees)[^<]*<\/li>/gi, '');
+  d = d.replace(/<li[^>]*>([^<]{0,15})<\/li>/gi, '');
+  d = d.replace(/<ul>\s*<\/ul>/gi, '');
+  // Strip VERO brand names
+  d = stripVeROFromTitle(d);
+  // Strip banned words
+  const _BANNED = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
+    /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
+  for (const re of _BANNED) d = d.replace(re, '');
+  d = d.replace(/\s{2,}/g, ' ').trim();
+  return d || fallback || 'Product';
+}
+
 function stripVeROFromTitle(title) {
   if (!title) return title;
   let t = title;
@@ -4113,21 +4145,7 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
 
   // ── Sanitize description: strip garbage phrases ──────────────────────────────
   if (product.description) {
-    product.description = product.description
-      .replace(/<li[^>]*>[^<]*Image\s*(Unavailable|not\s*available)[^<]*<\/li>/gi, '')
-      .replace(/<li[^>]*>[^<]*Select\s*your\s*preferred[^<]*<\/li>/gi, '')
-      .replace(/<li[^>]*>[^<]*(Clothing,\s*Shoes|Tops,\s*Tees)[^<]*<\/li>/gi, '')
-      .replace(/<li[^>]*>([^<]{0,15})<\/li>/gi, '') // strip very short li items
-      .replace(/<ul>\s*<\/ul>/gi, '')
-      .replace(/\s{2,}/g, ' ')
-      .trim();
-    // Also strip VERO brand names + banned words (same as title/resync sanitize).
-    // Without this, descriptions echoing brand names trigger 25019 "improper words".
-    product.description = stripVeROFromTitle(product.description);
-    const _BANNED = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
-      /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
-    for (const re of _BANNED) product.description = product.description.replace(re, '');
-    product.description = product.description.replace(/\s{2,}/g, ' ').trim() || product.title || 'Product';
+    product.description = sanitizeDescription(product.description, product.title);
   }
   if (product.bullets?.length) {
     const GARBAGE = [/image\s*(unavailable|not\s*available)/i, /select\s*your\s*preferred/i,
@@ -6766,15 +6784,10 @@ module.exports = async (req, res) => {
               itemAspects[normKey] = [String(val)];
             }
             const _title = sanitizeTitle(product.ebayTitle || product.title || '');
-            // Sanitize description: strip VERO brand names + banned words eBay rejects.
-            // Without this, descriptions echoing brand names trigger 25019 "improper words"
-            // and the entire publish fails.
-            let _desc = product.description || product.title || _title || 'Product';
-            _desc = stripVeROFromTitle(_desc); // strip VERO brand names from desc body
-            const _BANNED_DESC = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
-              /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
-            for (const re of _BANNED_DESC) _desc = _desc.replace(re, '');
-            _desc = _desc.replace(/\s{2,}/g, ' ').trim() || _title || 'Product';
+            const _desc = sanitizeDescription(
+              product.description || product.title || _title,
+              _title
+            );
             const ib = {
               condition: 'NEW',
               product: {
@@ -7524,13 +7537,9 @@ module.exports = async (req, res) => {
             // never get updated. Push always.)
 
             // Sanitize listingDescription — offer-level description can also
-            // trigger 25019 "improper words" on VERO brand names or banned terms.
+            // trigger 25019 on VERO brand names, banned terms, or problematic HTML.
             if (offerBody.listingDescription) {
-              let _od = stripVeROFromTitle(offerBody.listingDescription);
-              const _BANNED = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
-                /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
-              for (const re of _BANNED) _od = _od.replace(re, '');
-              offerBody.listingDescription = _od.replace(/\s{2,}/g, ' ').trim() || 'Product';
+              offerBody.listingDescription = sanitizeDescription(offerBody.listingDescription, 'Product');
             }
 
             offerBody.pricingSummary = { price };
@@ -7584,13 +7593,7 @@ module.exports = async (req, res) => {
               // words are present, even on a routine qty PUT.
               const _prod = { ..._id.product };
               if (_prod.title) _prod.title = sanitizeTitle(_prod.title);
-              if (_prod.description) {
-                let _d = stripVeROFromTitle(_prod.description);
-                const _BANNED = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
-                  /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
-                for (const re of _BANNED) _d = _d.replace(re, '');
-                _prod.description = _d.replace(/\s{2,}/g, ' ').trim() || _prod.title || 'Product';
-              }
+              if (_prod.description) _prod.description = sanitizeDescription(_prod.description, _prod.title);
               const _ib = {
                 condition: _id.condition,
                 product: _prod,
@@ -7608,7 +7611,7 @@ module.exports = async (req, res) => {
               });
               if (!_pr.ok && _pr.status !== 204) {
                 const _et = await _pr.text().catch(() => '');
-                console.warn(`[smartSync] inv-item PUT ${sku.slice(-20)} ${_pr.status}: ${_et.slice(0,400)}`);
+                console.warn(`[smartSync] inv-item PUT ${sku.slice(-20)} ${_pr.status}: ${_et.slice(0,1500)}`);
               }
             } catch(_qe) {
               console.warn(`[smartSync] inv-item PUT ${sku.slice(-20)} threw: ${_qe.message}`);
@@ -7667,6 +7670,46 @@ module.exports = async (req, res) => {
           }
         } else console.warn(`[smartSync] publish ${pubR.status}: ${pubTxt.slice(0,800)}`);
       } catch(e) { console.warn('[smartSync] publish error:', e.message); }
+
+      // ── CLEANUP STALE VARIANTS FROM GROUP ─────────────────────────────────────
+      // Remove from the group any SKU that is:
+      //   (a) orphaned — no ASIN match on current Amazon parent (dead variant)
+      //   (b) has no offerId in offerMap — eBay has no offer for it
+      // No safety guard — per user request, always delete.
+      try {
+        const _allGroupSkus = Object.keys(offerMap);
+        const _orphanSet = new Set(_orphanedSkus);
+        const _toDelete = _allGroupSkus.filter(s => {
+          if (_orphanSet.has(s)) return true;
+          if (!offerMap[s]?.offerId) return true;
+          return false;
+        });
+        if (_toDelete.length > 0) {
+          const _keepSkus = _allGroupSkus.filter(s => !_toDelete.includes(s));
+          // GET group, update variantSKUs, PUT group
+          const _ggR = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`, { headers: auth });
+          if (_ggR.ok) {
+            const _gg = await _ggR.json();
+            _gg.variantSKUs = _keepSkus;
+            delete _gg.inventoryItemGroupKey;
+            const _gpR = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`,
+              { method: 'PUT', headers: auth, body: JSON.stringify(_gg) });
+            if (_gpR.ok || _gpR.status === 204) {
+              console.log(`[smartSync] cleanup: removed ${_toDelete.length} stale variant(s) from group — kept ${_keepSkus.length}`);
+              // Delete orphaned offers too so they don't linger
+              for (const _ds of _toDelete) {
+                const _oid = offerMap[_ds]?.offerId;
+                if (_oid) {
+                  await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(_oid)}`, { method: 'DELETE', headers: auth }).catch(()=>{});
+                }
+              }
+            } else {
+              const _gpT = await _gpR.text().catch(()=>'');
+              console.warn(`[smartSync] cleanup: group PUT ${_gpR.status}: ${_gpT.slice(0,300)}`);
+            }
+          }
+        }
+      } catch(_ce) { console.warn(`[smartSync] cleanup threw: ${_ce.message}`); }
 
       return res.json({
         success: true, synced: okCount, failed: failCount,
