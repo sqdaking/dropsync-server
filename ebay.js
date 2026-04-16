@@ -41,34 +41,6 @@ const randUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 let _relayHandle = null; // { isAlive: () => bool, db: { enqueueRelayFetch, awaitRelayResult } }
 function setRelayHandle(h) { _relayHandle = h; }
 
-// ── Server-side direct-fetch health tracking ─────────────────────────────────
-// Rolling window of recent direct-fetch outcomes (true = blocked, false = ok).
-// When the block rate crosses the threshold, fetchPage puts the whole pipeline
-// into a global backoff for a fixed duration. First successful fetch during
-// backoff clears it.
-let _recentBlocks = [];
-let _backoffUntil = 0;
-function _recordDirectResult(blocked) {
-  _recentBlocks.push(blocked);
-  if (_recentBlocks.length > 20) _recentBlocks.shift(); // keep window bounded
-}
-function _maybeTriggerBackoff(windowSize, threshold, durationMs) {
-  if (_recentBlocks.length < windowSize) return;
-  const lastN = _recentBlocks.slice(-windowSize);
-  const blocked = lastN.filter(Boolean).length;
-  if (blocked >= threshold && _backoffUntil < Date.now()) {
-    _backoffUntil = Date.now() + durationMs;
-    console.warn(`[fetch] ⚠️ backoff triggered: ${blocked}/${windowSize} recent direct fetches blocked — pausing ${Math.round(durationMs/1000)}s`);
-    _recentBlocks = []; // reset window so we don't re-trigger immediately
-  }
-}
-function _clearBackoffOnSuccess() {
-  if (_backoffUntil > Date.now()) {
-    console.log(`[fetch] ✓ direct fetch succeeded — clearing backoff early`);
-    _backoffUntil = 0;
-  }
-}
-
 async function fetchPage(url, ua, maxAttempts) {
   const isBlocked = (html) => {
     if (!html || html.length < 1000) return true;
@@ -160,25 +132,16 @@ async function fetchPage(url, ua, maxAttempts) {
     ...(extra || {}),
   });
 
-  // ── SERVER DIRECT FETCH: delayed + back-off logic ───────────────────────────
-  // Tweakable knobs (change these to tune behavior):
+  // ── SERVER DIRECT FETCH: upfront delay only ─────────────────────────────────
+  // Tweakable knobs:
   const DIRECT_UPFRONT_DELAY_MS = 3000; // pause before first direct attempt
-  const BLOCK_RATE_WINDOW       = 10;   // track last N direct attempts
-  const BLOCK_RATE_THRESHOLD    = 9;    // if ≥ N of last 10 got blocked → back off
-  const BACKOFF_DURATION_MS     = 60000;// how long to pause the whole pipeline
 
   // Upfront delay: relay-fallback arrivals land here, so give the IP a breather
   // before a first attempt. Helps avoid immediate block cascades.
   await sleep(DIRECT_UPFRONT_DELAY_MS);
 
-  // Global backoff check — if recent direct fetches have been mostly blocked,
-  // Amazon has probably flagged the Railway IP. Pause the server-fetch pipeline
-  // for BACKOFF_DURATION_MS before any new direct attempts.
-  if (_backoffUntil > Date.now()) {
-    const _remaining = Math.round((_backoffUntil - Date.now()) / 1000);
-    console.log(`[fetch] in global backoff${_asinTag} — ${_remaining}s left, skipping direct`);
-    return '';
-  }
+  // Global backoff REMOVED — was causing more problems than it solved by
+  // pausing the pipeline when fetches could have succeeded via relay.
 
   // Direct attempts with increasing delays and varied URL/UA/referer combos
   // maxAttempts=1 for ASIN batch fetches: fail fast, use size-price fallback instead of wasting budget
@@ -200,17 +163,11 @@ async function fetchPage(url, ua, maxAttempts) {
       const html = await r.text();
       if (!isBlocked(html)) {
         // ok fetch logged by caller's batch summary — suppress here to save log lines
-        _recordDirectResult(false);
-        _clearBackoffOnSuccess();
         return html;
       }
       console.warn(`[fetch] direct attempt ${i+1} blocked (${html.length}b)${_asinTag}`);
-      _recordDirectResult(true);
-      _maybeTriggerBackoff(BLOCK_RATE_WINDOW, BLOCK_RATE_THRESHOLD, BACKOFF_DURATION_MS);
     } catch(e) {
       console.warn(`[fetch] direct attempt ${i+1} error: ${e.message}${_asinTag}`);
-      _recordDirectResult(true);
-      _maybeTriggerBackoff(BLOCK_RATE_WINDOW, BLOCK_RATE_THRESHOLD, BACKOFF_DURATION_MS);
     }
   }
 
@@ -7594,9 +7551,21 @@ module.exports = async (req, res) => {
               if (!_ir.ok) return;
               const _id = await _ir.json().catch(() => ({}));
               if (!_id.condition) return;
+              // Sanitize product title and description before echoing back — eBay
+              // rejects with 25019 "improper words" if VERO brand names or banned
+              // words are present, even on a routine qty PUT.
+              const _prod = { ..._id.product };
+              if (_prod.title) _prod.title = sanitizeTitle(_prod.title);
+              if (_prod.description) {
+                let _d = stripVeROFromTitle(_prod.description);
+                const _BANNED = [/\bauthentic\b/gi, /\bgenuine\b/gi, /\boriginal\b/gi,
+                  /\bverified\b/gi, /\bcertified\b/gi, /\bauthorized\b/gi];
+                for (const re of _BANNED) _d = _d.replace(re, '');
+                _prod.description = _d.replace(/\s{2,}/g, ' ').trim() || _prod.title || 'Product';
+              }
               const _ib = {
                 condition: _id.condition,
-                product: _id.product || {},
+                product: _prod,
                 availability: { shipToLocationAvailability: { quantity: availableQuantity } },
               };
               if (_id.conditionId) _ib.conditionId = _id.conditionId;
