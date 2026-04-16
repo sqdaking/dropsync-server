@@ -7454,7 +7454,11 @@ module.exports = async (req, res) => {
         }
 
         const cost      = asinPrice[asin] || 0;
-        const inStock   = asinInStock[asin] !== false;
+        // Strict in-stock check: require explicit true. Undefined or false → OOS.
+        // Prevents scrape-edge-cases where OOS detection missed and inStock stayed
+        // undefined from flipping to qty=1 (the old "!== false" default leaked OOS
+        // variants as in-stock).
+        const inStock   = asinInStock[asin] === true;
         const ebayPrice = cost > 0 ? applyMk(cost) : 0;
         let qty         = (inStock && ebayPrice > 0) ? defaultQty : 0;
         // eBay rejects prices at or below their per-category minimum (often $1.00 strict).
@@ -7546,9 +7550,30 @@ module.exports = async (req, res) => {
             offerBody.availableQuantity = availableQuantity;
             delete offerBody.offerId; delete offerBody.status; delete offerBody.listing;
             delete offerBody.marketplaceId; delete offerBody.offerState;
-            const pr = await _fetchRetry(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, {
+            let pr = await _fetchRetry(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, {
               method: 'PUT', headers: auth, body: JSON.stringify(offerBody),
             });
+            // If PUT fails with 25007 (invalid shipping/fulfillment policy), strip
+            // listingPolicies from the body and retry. The policies were set at
+            // publish time; price/qty updates don't actually need them re-sent.
+            if (!pr.ok && pr.status !== 204) {
+              const _peekTxt = await pr.text().catch(() => '');
+              if (/25007|fulfillment policy|shipping policy/i.test(_peekTxt)) {
+                const _retryBody = { ...offerBody };
+                delete _retryBody.listingPolicies;
+                delete _retryBody.fulfillmentPolicyId;
+                delete _retryBody.paymentPolicyId;
+                delete _retryBody.returnPolicyId;
+                pr = await _fetchRetry(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, {
+                  method: 'PUT', headers: auth, body: JSON.stringify(_retryBody),
+                });
+                if (pr.ok || pr.status === 204)
+                  console.log(`[smartSync] ✓ ${(sku||offerId).slice(-18)} qty=${availableQuantity} $${price.value} (after policy strip)`);
+              } else {
+                // Re-wrap the already-consumed text into a fake response for downstream logging
+                pr = { ok: false, status: pr.status, text: async () => _peekTxt };
+              }
+            }
             if (pr.ok || pr.status === 204) {
               okCount++;
               console.log(`[smartSync] ✓ ${(sku||offerId).slice(-18)} qty=${availableQuantity} $${price.value}`);
