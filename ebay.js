@@ -2039,8 +2039,14 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
           return;
         }
 
-        if (price) { asinPrice[asin] = price; asinInStock[asin] = true; _batchResults1.push({asin, price, status:'ok', delivDays}); }
-        else { _batchResults1.push({asin, status:'no_price'}); }
+        if (price) {
+          // Fold Amazon shipping into the stored per-ASIN cost so downstream
+          // callers (smartSync, revise) apply markup to price + shipping.
+          const _withShip = price + (shipping || 0);
+          asinPrice[asin] = _withShip;
+          asinInStock[asin] = true;
+          _batchResults1.push({asin, price: _withShip, status:'ok', delivDays});
+        } else { _batchResults1.push({asin, status:'no_price'}); }
         if (shipping !== null) asinShipping[asin] = shipping; // store per-ASIN shipping cost
         // Cache main image while page is in memory — avoids second fetch for non-color dims
         if (!asinImgCache[asin]) { const _imgs = extractAllImages(h); if (_imgs.length) asinImgCache[asin] = _imgs; }
@@ -2156,18 +2162,17 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
       // Main page shows only the selected variant's price, not other variants
       // If asinPrice is missing (fetch failed/skipped), use primaryPrices or 0
       const _baseAsinPrice = asinPrice[asin] || 0;
-      // Include per-ASIN Amazon shipping in the cost basis so markup applies correctly
-      // asinShipping[asin]: 0 = free, positive = paid, null/undefined = fall back to product-level shippingCost
-      // Simple rule: if Amazon charges shipping for this ASIN → mark OOS so we skip it
-      // asinShipping[asin] = 0 = free, positive = paid, null/undefined = unknown (treat as free)
+      // Per-ASIN Amazon shipping — add to cost basis so markup applies to the
+      // total (price + shipping). Variants with paid shipping stay sellable; we
+      // just price them higher to cover the shipping fee. asinShipping[asin]: 0
+      // or null = free, positive = paid amount to add.
       const _asinShip = asinShipping[asin] ?? 0;
+      const _costWithShip = _baseAsinPrice + _asinShip;
       if (_asinShip > 0) {
-        // Has a shipping fee → not profitable to list → treat as OOS
-        comboInStock[key] = false;
-        console.log(`[scraper] ${asin} marked OOS — Amazon shipping cost $${_asinShip}`);
+        console.log(`[scraper] ${asin} +$${_asinShip.toFixed(2)} shipping → cost $${_costWithShip.toFixed(2)}`);
       }
-      comboPrices[key]   = _baseAsinPrice;
-      comboShipping[key] = 0; // never add shipping to price — OOS if they charge
+      comboPrices[key]   = _costWithShip;
+      comboShipping[key] = 0; // shipping already folded into price; don't double-count
       // sortedDimValues UNAVAILABLE = "See all available options" on Amazon = truly OOS.
       // This is the highest-priority signal — mark false immediately.
       if (unavailableAsins.has(asin)) {
