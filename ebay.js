@@ -3989,14 +3989,20 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   {
     const _src = product._source || 'amazon';
     if (_src === 'amazon') {
-      const PLACEHOLDER = 9.99; // arbitrary > $0.99 (eBay min); never sold because qty=0
+      // Use highest sibling price as fallback for unpriced variants (was $9.99
+      // placeholder). Keeps 4× max/min price ratio safe and avoids the problem
+      // of $9.99 variants slipping through to qty=1 downstream.
+      const _siblingPrices = Object.values(product.comboPrices || {})
+        .map(p => parseFloat(p) || 0)
+        .filter(p => p >= 1);
+      const _fallback = _siblingPrices.length > 0 ? Math.max(..._siblingPrices) : (parseFloat(product.price) || 9.99);
 
       // Simple/single-variant case
       const _scrapedPrice = parseFloat(product.price) || 0;
       if (_scrapedPrice <= 0) {
         console.warn(`[push] AMAZON $0 → forcing OOS for "${(product.title||'').slice(0,60)}" (was product.price=${product.price})`);
         product.inStock = false;
-        product.price = PLACEHOLDER;
+        product.price = _fallback;
       }
 
       // Multi-variant case: zero out any combo whose Amazon cost is 0
@@ -4007,12 +4013,12 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
           const p = parseFloat(rawPrice) || 0;
           if (p <= 0) {
             product.comboInStock[key] = false;
-            product.comboPrices[key]  = PLACEHOLDER;
+            product.comboPrices[key]  = _fallback;
             _zeroed++;
           }
         }
         if (_zeroed > 0) {
-          console.warn(`[push] AMAZON $0 variants → forced ${_zeroed} variant(s) to OOS for "${(product.title||'').slice(0,60)}"`);
+          console.warn(`[push] AMAZON $0 variants → forced ${_zeroed} variant(s) to OOS at fallback $${_fallback.toFixed(2)}`);
         }
       }
     }
