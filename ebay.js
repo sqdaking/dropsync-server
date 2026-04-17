@@ -3002,7 +3002,7 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
         secondaryVal: sVal,
         extraVal:    _extraVals[0] || '', // first extra dim value (for backwards compat)
         price:       (ebayPrice > 0 ? ebayPrice : 0).toFixed(2),
-        qty:         inStock ? defaultQty : 0,
+        qty:         (inStock && ebayPrice > 0) ? defaultQty : 0, // NO price → qty=0, no exceptions
         image:       getImage(pVal, _pValImgIdx[pVal]),
         asin,        // expose ASIN so push imageUrls can use per-combo images
       });
@@ -3035,7 +3035,7 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
           primaryVal:   pv.value,
           secondaryVal: sv.value,
           price:        (ebayPrice > 0 ? ebayPrice : 0).toFixed(2),
-          qty:          inStock ? defaultQty : 0,
+          qty:          (inStock && ebayPrice > 0) ? defaultQty : 0, // NO price → qty=0
           image:        _pvImg, // all sizes of same color share same image
         });
       }
@@ -3054,7 +3054,7 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
         primaryVal:   pv.value,
         secondaryVal: '',
         price:        (ebayPrice > 0 ? ebayPrice : 0).toFixed(2),
-        qty:          inStock ? defaultQty : 0,
+        qty:          (inStock && ebayPrice > 0) ? defaultQty : 0, // NO price → qty=0
         image:        getImage(pv.value, _pi),
       });
     }
@@ -4055,22 +4055,18 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       return true;
     });
     if (_realCombos.length < 2) {
-      console.log(`[push] collapsing to single-variant: hasVariations=true but only ${_realCombos.length} real combo(s) — dims were ${product._primaryDimName || 'none'}/${product._secondaryDimName || 'none'}`);
-      // Promote the single combo's price to top-level if base price is missing
-      if (!product.price && _realCombos.length === 1) {
-        product.price = parseFloat(_combos[_realCombos[0]]) || product.price || 0;
-      }
-      product.hasVariations    = false;
-      product.variations       = [];
-      product.variationImages  = {};
-      product.comboPrices      = {};
-      product.comboInStock     = {};
-      product.comboAsin        = {};
-      product.sizePrices       = {};
-      product._primaryDimName  = null;
-      product._secondaryDimName = null;
-      product._extraDimNames   = [];
-      product._isFullyMultiAsin = false;
+      // Product had variations on Amazon but scrape only got <2 priced combos.
+      // Almost always this means per-ASIN fetches were blocked, and the single
+      // priced combo is a random variant whose price doesn't represent the
+      // listing. Collapsing to single-variant mode publishes the listing at
+      // that wrong price. REFUSE to push instead — wait for a clean scrape.
+      const _totalCombos = Object.keys(_combos).length;
+      console.warn(`[push] REFUSING multi→single collapse: product has ${_totalCombos} Amazon variants but only ${_realCombos.length} priced+in-stock — refuse to publish at guessed price`);
+      return res.status(400).json({
+        error: `Scrape incomplete: ${_realCombos.length}/${_totalCombos} variants priced from Amazon. Refusing to publish at guessed price. Wait for a clean scrape and try again.`,
+        code: 'SCRAPE_INCOMPLETE',
+        unrecoverable: true,
+      });
     }
   }
 
@@ -7511,6 +7507,31 @@ module.exports = async (req, res) => {
       }
       if (_orphanedSkus.length > 0) {
         console.log(`[smartSync] forced OOS on ${_orphanedSkus.length} orphan variants: ${_orphanedSkus.slice(0,5).map(s => s.slice(-24)).join(', ')}${_orphanedSkus.length > 5 ? '…' : ''}`);
+      }
+
+      // ── 4× PRICE CLAMP ───────────────────────────────────────────────────────
+      // eBay rejects multi-variation listings with max/min price ratio > 4×.
+      // Clamp any variant whose putPrice > 4× the min putPrice. Also bring low
+      // prices UP to min/4 if they'd force unrealistic cheap variants. We clamp
+      // DOWN only — never UP, since buying a $9.99 variant the user thought was
+      // $50 would cost us real money.
+      if (updates.length >= 2) {
+        const _putPrices = updates.map(u => parseFloat(u.price.value)).filter(p => p > 0);
+        if (_putPrices.length >= 2) {
+          const _minP = Math.min(..._putPrices);
+          const _maxAllowed = +(_minP * 4).toFixed(2);
+          let _clamped = 0;
+          for (const u of updates) {
+            const _cur = parseFloat(u.price.value);
+            if (_cur > _maxAllowed) {
+              u.price.value = _maxAllowed.toFixed(2);
+              _clamped++;
+            }
+          }
+          if (_clamped > 0) {
+            console.log(`[smartSync] 4× price clamp: min=$${_minP.toFixed(2)} maxAllowed=$${_maxAllowed.toFixed(2)} clamped ${_clamped} variant(s) down`);
+          }
+        }
       }
 
       // ── STEP 5: Update all variants ──────────────────────────────────────────
