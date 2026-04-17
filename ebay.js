@@ -1924,7 +1924,14 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
     const _clientDataSize = clientAsinData ? Object.keys(clientAsinData).length : 0;
     if (_clientDataSize > 0) {
       for (const [asin, data] of Object.entries(clientAsinData)) {
-        if (data.price > 0) asinPrice[asin] = data.price;
+        // Browser sends price + shipping separately. Fold shipping into stored
+        // cost so smartSync/markup logic includes it. Server-batch path does
+        // the same at line 2046 — keep both paths consistent.
+        if (data.price > 0) {
+          const _ship = parseFloat(data.shipping) || 0;
+          asinPrice[asin] = data.price + _ship;
+          if (_ship > 0) asinShipping[asin] = _ship;
+        }
         if (data.inStock !== undefined) asinInStock[asin] = data.inStock;
       }
       console.log(`[scraper] browser provided ${_clientDataSize} ASIN prices — skipping server Amazon fetches`);
@@ -7386,14 +7393,21 @@ module.exports = async (req, res) => {
       // this guard a 900-ASIN listing would flip 800 variants to qty=0 forever.
       const _haveFreshPrice = new Set(uniqueAsins.filter(a => asinPrice[a] !== undefined));
 
-      // Highest existing sibling price in the group — use as fallback for orphans
-      // and no-price variants instead of $9.99. Keeps the 4× max/min ratio safe
-      // (high-priced variant becomes the anchor; everything else fits within 4×).
+      // Highest sibling price for use as fallback. Priority:
+      //   1. Highest fresh Amazon price (with markup applied) from this scrape
+      //   2. Highest existing offer price > $1 (stale, but better than placeholder)
+      //   3. $9.99 last resort
       const _highestSiblingPrice = (() => {
-        const _prices = Object.values(offerMap)
+        // Try fresh Amazon prices first (most accurate)
+        const _freshCosts = Object.values(asinPrice).filter(p => p > 0);
+        if (_freshCosts.length > 0) {
+          return applyMk(Math.max(..._freshCosts));
+        }
+        // Fallback to existing offer prices
+        const _offerPrices = Object.values(offerMap)
           .map(o => parseFloat(o.currentPrice) || 0)
           .filter(p => p > 1);
-        return _prices.length > 0 ? Math.max(..._prices) : 9.99;
+        return _offerPrices.length > 0 ? Math.max(..._offerPrices) : 9.99;
       })();
 
       const updates = [];
@@ -7441,10 +7455,9 @@ module.exports = async (req, res) => {
         // orphans entirely, or the variant will simply stop being offered.
         if (!asin) {
           _orphanedSkus.push(sku);
-          // Use existing offer price if safely > $1, otherwise use highest sibling
-          // price (not $9.99 placeholder) to keep the group's 4× price ratio safe.
-          // qty=0 below ensures the variant is unbuyable.
-          const preservePrice = offer.currentPrice > 1.00 ? offer.currentPrice : _highestSiblingPrice;
+          // Use highest sibling (fresh Amazon or highest offer) — never trust
+          // the variant's own stale currentPrice which might be a $9.99 leftover.
+          const preservePrice = _highestSiblingPrice;
           console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match on current Amazon parent), forcing qty=0 price=$${preservePrice}`);
           updates.push({
             offerId:           offer.offerId,
@@ -7473,19 +7486,14 @@ module.exports = async (req, res) => {
         const ebayPrice = cost > 0 ? applyMk(cost) : 0;
         let qty         = (inStock && ebayPrice > 0) ? defaultQty : 0;
         // eBay rejects prices at or below their per-category minimum (often $1.00 strict).
-        // Three cases for putPrice:
-        //   1. Real ebayPrice from a real Amazon cost → use it
-        //   2. Existing offer price > $1.00 → preserve it (still > min)
-        //   3. Otherwise → highest sibling price (keeps 4× ratio safe)
-        // ENFORCE qty=0 whenever we use a fallback so no buyer can transact
-        // at a fake price. This is the user's non-negotiable rule applied here.
+        // When Amazon has no cost → use highest sibling price (not existing offer price,
+        // which may be a stale $9.99 from a prior bad push). Keeps 4× ratio safe.
+        // qty=0 on all fallback paths → no buyer can transact.
         let putPrice;
         if (ebayPrice > 0) {
           putPrice = ebayPrice;
-        } else if (offer.currentPrice > 1.00) {
-          putPrice = offer.currentPrice;
-          qty = 0; // no real Amazon price → unbuyable, regardless of what inStock said
         } else {
+          // No fresh Amazon price — prefer highest sibling over stale current price
           putPrice = _highestSiblingPrice;
           qty = 0; // fallback price → unbuyable, non-negotiable
         }
