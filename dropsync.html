@@ -998,12 +998,28 @@ function _browserExtractAsinData(html) {
       if (v > 0 && v < 10000) { price = v; break; }
     }
   }
+  // Shipping: extract Amazon's delivery fee (free = 0, paid = actual amount).
+  // Server applies markup to price + shipping so the final eBay price covers it.
+  let shipping = 0;
+  const shipPats = [
+    /"deliveryPrice"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
+    /\+\s*\$([\d.]+)\s+(?:shipping|delivery)/i,
+    /"shippingCost"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
+    /Delivery:\s*\$([\d.]+)/i,
+  ];
+  for (const p of shipPats) {
+    const m = html.match(p);
+    if (m) {
+      const v = parseFloat(m[1]);
+      if (v > 0 && v < 1000) { shipping = v; break; }
+    }
+  }
   // OOS: check buy-box signals
   const inStock = !html.includes('outOfStockBuyBox')
     && !/currently unavailable/i.test(html)
     && !/out of stock/i.test(html.slice(0, 50000))
     && !html.includes('Join the waitlist');
-  return { price, inStock: price > 0 ? inStock : false };
+  return { price, shipping, inStock: price > 0 ? inStock : false };
 }
 
 // ── Prefetch per-ASIN price+stock from browser — sends exact data to server ──────
