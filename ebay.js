@@ -4378,9 +4378,17 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         code: 'PRICE_TOO_LOW'
       });
     }
-    // For OOS (qty=0) listings with 0 ebayPrice, fall back to a $9.99 placeholder
-    // so eBay accepts the offer ($0.99 minimum). Worker will revise on next pass.
-    const finalPrice = (ebayPrice >= 1 ? ebayPrice : 9.99).toFixed(2);
+    // No Amazon price and no siblings to borrow from (single-variant) → refuse
+    // to publish. Returning a placeholder price risks selling at a fake value.
+    if (ebayPrice < 1) {
+      console.warn(`[push/simple] REFUSING: no valid Amazon price for "${(product.title||'').slice(0,60)}" — no siblings to fall back to (single-variant)`);
+      return res.status(400).json({
+        error: 'Cannot push: Amazon scrape returned no valid price and this is a single-variant product (no sibling prices to borrow from). Try importing again later.',
+        code: 'NO_PRICE_SINGLE_VARIANT',
+        unrecoverable: true,
+      });
+    }
+    const finalPrice = ebayPrice.toFixed(2);
     console.log(`[push/simple] cost=$${basePrice} → $${finalPrice} (qty=${simpleQty})`);
 
     console.log(`[push/simple] inStock=${product.inStock} qty=${simpleQty}`);
@@ -6854,16 +6862,22 @@ module.exports = async (req, res) => {
           const gr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(oid)}`, { headers: auth });
           if (!gr.ok) continue;
           const ob = await gr.json();
-          ob.availableQuantity = 0;
-          // Use existing price if safely > $1, else highest sibling price in the group
-          // (not $9.99 placeholder — keeps 4× price-ratio rule safe).
+          // Pick a price: sibling > existing > skip. qty forced 0 either way.
           const _zMaxSibling = (() => {
             const _prices = Object.values(offerMap)
               .map(o => parseFloat(o.currentPrice) || 0)
               .filter(p => p > 1);
-            return _prices.length > 0 ? Math.max(..._prices) : 9.99;
+            return _prices.length > 0 ? Math.max(..._prices) : null;
           })();
-          const keepPrice = (offerMap[sku].currentPrice > 1.00) ? offerMap[sku].currentPrice : _zMaxSibling;
+          const _currOffer = parseFloat(offerMap[sku].currentPrice) || 0;
+          let keepPrice = null;
+          if (_currOffer > 1.00) keepPrice = _currOffer;
+          else if (_zMaxSibling !== null) keepPrice = _zMaxSibling;
+          if (keepPrice === null || keepPrice <= 0) {
+            console.log(`[resync] zombie ${sku.slice(-20)} → no valid price source, skipping`);
+            continue;
+          }
+          ob.availableQuantity = 0;
           ob.pricingSummary = { price: { value: keepPrice.toFixed(2), currency: 'USD' } };
           delete ob.offerId; delete ob.status; delete ob.listing; delete ob.marketplaceId; delete ob.offerState;
           const pr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(oid)}`, {
@@ -7388,8 +7402,8 @@ module.exports = async (req, res) => {
 
       // Highest sibling price for use as fallback. Priority:
       //   1. Highest fresh Amazon price (with markup applied) from this scrape
-      //   2. Highest existing offer price > $1 (stale, but better than placeholder)
-      //   3. $9.99 last resort
+      //   2. Highest existing offer price > $1
+      //   3. null → no sibling available, skip pushing this variant entirely
       const _highestSiblingPrice = (() => {
         // Try fresh Amazon prices first (most accurate)
         const _freshCosts = Object.values(asinPrice).filter(p => p > 0);
@@ -7400,7 +7414,7 @@ module.exports = async (req, res) => {
         const _offerPrices = Object.values(offerMap)
           .map(o => parseFloat(o.currentPrice) || 0)
           .filter(p => p > 1);
-        return _offerPrices.length > 0 ? Math.max(..._offerPrices) : 9.99;
+        return _offerPrices.length > 0 ? Math.max(..._offerPrices) : null;
       })();
 
       const updates = [];
@@ -7448,10 +7462,18 @@ module.exports = async (req, res) => {
         // orphans entirely, or the variant will simply stop being offered.
         if (!asin) {
           _orphanedSkus.push(sku);
-          // Use highest sibling (fresh Amazon or highest offer) — never trust
-          // the variant's own stale currentPrice which might be a $9.99 leftover.
-          const preservePrice = _highestSiblingPrice;
-          console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN (no ASIN match on current Amazon parent), forcing qty=0 price=$${preservePrice}`);
+          // No sibling price and no current price → we must use SOMETHING or
+          // skip (eBay requires price>0). Prefer the existing offer price even
+          // if stale; if it's 0 too, then skip. qty forced 0 either way.
+          const _existing = parseFloat(offer.currentPrice) || 0;
+          const preservePrice = _highestSiblingPrice !== null
+            ? _highestSiblingPrice
+            : (_existing > 0 ? _existing : null);
+          if (preservePrice === null) {
+            console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN, no sibling, no existing price — cannot push valid offer, skipping`);
+            continue;
+          }
+          console.log(`[smartSync] ${sku.slice(-24)} → ORPHAN qty=0 price=$${preservePrice}`);
           updates.push({
             offerId:           offer.offerId,
             sku,
@@ -7472,7 +7494,7 @@ module.exports = async (req, res) => {
         if (!_haveFreshPrice.has(asin)) {
           const _currPrice = parseFloat(offer.currentPrice) || 0;
           const _brokenPlaceholder = _currPrice > 0 && _currPrice < 11; // captures $9.99-ish
-          if (_brokenPlaceholder) {
+          if (_brokenPlaceholder && _highestSiblingPrice !== null) {
             console.log(`[smartSync] ${sku.slice(-20)} → current price $${_currPrice} looks broken — forcing qty=0 with sibling price`);
             updates.push({
               offerId:           offer.offerId,
@@ -7492,7 +7514,11 @@ module.exports = async (req, res) => {
         // gate anyway (no price → qty=0), so this is just a secondary check.
         const inStock   = asinInStock[asin] !== false;
         const ebayPrice = cost > 0 ? applyMk(cost) : 0;
-        let qty         = (inStock && ebayPrice > 0) ? defaultQty : 0;
+        // Anything blocked during fetch → qty=0 no matter what. Even if
+        // asinPrice/inStock logic above somehow produced a >0 value, a blocked
+        // fetch means we don't actually know the truth — treat as unbuyable.
+        const _wasBlocked = _fetchFailed.has(asin);
+        let qty         = (inStock && ebayPrice > 0 && !_wasBlocked) ? defaultQty : 0;
         // eBay rejects prices at or below their per-category minimum (often $1.00 strict).
         // When Amazon has no cost → use highest sibling price (not existing offer price,
         // which may be a stale $9.99 from a prior bad push). Keeps 4× ratio safe.
@@ -7501,8 +7527,20 @@ module.exports = async (req, res) => {
         if (ebayPrice > 0) {
           putPrice = ebayPrice;
         } else {
-          // No fresh Amazon price — prefer highest sibling over stale current price
-          putPrice = _highestSiblingPrice;
+          // No fresh Amazon price. Use highest sibling; if no sibling, fall back
+          // to existing offer price (must be > 0 for eBay to accept). If neither
+          // is available, skip — we have no valid price to send. qty forced 0.
+          if (_highestSiblingPrice !== null) {
+            putPrice = _highestSiblingPrice;
+          } else {
+            const _existing = parseFloat(offer.currentPrice) || 0;
+            if (_existing > 0) {
+              putPrice = _existing;
+            } else {
+              console.log(`[smartSync] ${sku.slice(-20)} → no Amazon price, no sibling, no existing price — cannot push, skipping`);
+              continue;
+            }
+          }
           qty = 0; // fallback price → unbuyable, non-negotiable
         }
 
