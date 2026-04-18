@@ -2169,14 +2169,11 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
       // Main page shows only the selected variant's price, not other variants
       // If asinPrice is missing (fetch failed/skipped), use primaryPrices or 0
       const _baseAsinPrice = asinPrice[asin] || 0;
-      // Per-ASIN Amazon shipping — add to cost basis so markup applies to the
-      // total (price + shipping). Variants with paid shipping stay sellable; we
-      // just price them higher to cover the shipping fee. asinShipping[asin]: 0
-      // or null = free, positive = paid amount to add.
-      const _asinShip = asinShipping[asin] ?? 0;
-      const _costWithShip = _baseAsinPrice + _asinShip;
-      if (_asinShip > 0) {
-        console.log(`[scraper] ${asin} +$${_asinShip.toFixed(2)} shipping → cost $${_costWithShip.toFixed(2)}`);
+      // asinPrice already has shipping folded in (set at line ~2052). Don't add
+      // it again here or shipping gets counted twice.
+      const _costWithShip = _baseAsinPrice;
+      if ((asinShipping[asin] ?? 0) > 0) {
+        console.log(`[scraper] ${asin} cost=$${_costWithShip.toFixed(2)} (incl. $${asinShipping[asin].toFixed(2)} shipping)`);
       }
       comboPrices[key]   = _costWithShip;
       comboShipping[key] = 0; // shipping already folded into price; don't double-count
@@ -7466,19 +7463,34 @@ module.exports = async (req, res) => {
         }
 
         // ── ACCURACY GUARD ─────────────────────────────────────────────────────
-        // If the matched ASIN is outside the current fetch batch, skip entirely.
-        // Preserves the variant's existing qty + price rather than OOSing it.
+        // If the matched ASIN is outside the current fetch batch, usually skip
+        // entirely to preserve existing qty + price. BUT: if the current offer
+        // price is obviously broken (<$11, likely a $9.99 placeholder from a
+        // historical bad sync), force qty=0 with a sibling price to kill the
+        // stuck state. We can't price it correctly without the ASIN's fresh
+        // data, but we CAN prevent it from staying buyable at a garbage price.
         if (!_haveFreshPrice.has(asin)) {
+          const _currPrice = parseFloat(offer.currentPrice) || 0;
+          const _brokenPlaceholder = _currPrice > 0 && _currPrice < 11; // captures $9.99-ish
+          if (_brokenPlaceholder) {
+            console.log(`[smartSync] ${sku.slice(-20)} → current price $${_currPrice} looks broken — forcing qty=0 with sibling price`);
+            updates.push({
+              offerId:           offer.offerId,
+              sku,
+              availableQuantity: 0,
+              price:             { value: _highestSiblingPrice.toFixed(2), currency: 'USD' },
+            });
+            continue;
+          }
           _skippedNoBatch.push(sku);
           continue;
         }
 
         const cost      = asinPrice[asin] || 0;
-        // Strict in-stock check: require explicit true. Undefined or false → OOS.
-        // Prevents scrape-edge-cases where OOS detection missed and inStock stayed
-        // undefined from flipping to qty=1 (the old "!== false" default leaked OOS
-        // variants as in-stock).
-        const inStock   = asinInStock[asin] === true;
+        // inStock: trust scraper's explicit false signals (OOS confirmed).
+        // undefined or true → treat as in stock. Amazon price is the primary
+        // gate anyway (no price → qty=0), so this is just a secondary check.
+        const inStock   = asinInStock[asin] !== false;
         const ebayPrice = cost > 0 ? applyMk(cost) : 0;
         let qty         = (inStock && ebayPrice > 0) ? defaultQty : 0;
         // eBay rejects prices at or below their per-category minimum (often $1.00 strict).
@@ -7509,30 +7521,8 @@ module.exports = async (req, res) => {
         console.log(`[smartSync] forced OOS on ${_orphanedSkus.length} orphan variants: ${_orphanedSkus.slice(0,5).map(s => s.slice(-24)).join(', ')}${_orphanedSkus.length > 5 ? '…' : ''}`);
       }
 
-      // ── 4× PRICE CLAMP ───────────────────────────────────────────────────────
-      // eBay rejects multi-variation listings with max/min price ratio > 4×.
-      // Clamp any variant whose putPrice > 4× the min putPrice. Also bring low
-      // prices UP to min/4 if they'd force unrealistic cheap variants. We clamp
-      // DOWN only — never UP, since buying a $9.99 variant the user thought was
-      // $50 would cost us real money.
-      if (updates.length >= 2) {
-        const _putPrices = updates.map(u => parseFloat(u.price.value)).filter(p => p > 0);
-        if (_putPrices.length >= 2) {
-          const _minP = Math.min(..._putPrices);
-          const _maxAllowed = +(_minP * 4).toFixed(2);
-          let _clamped = 0;
-          for (const u of updates) {
-            const _cur = parseFloat(u.price.value);
-            if (_cur > _maxAllowed) {
-              u.price.value = _maxAllowed.toFixed(2);
-              _clamped++;
-            }
-          }
-          if (_clamped > 0) {
-            console.log(`[smartSync] 4× price clamp: min=$${_minP.toFixed(2)} maxAllowed=$${_maxAllowed.toFixed(2)} clamped ${_clamped} variant(s) down`);
-          }
-        }
-      }
+      // (proactive 4× price clamp removed — many categories don't enforce it.
+      // If eBay rejects with 25019 4× message, we react then; no preemptive clamping.)
 
       // ── STEP 5: Update all variants ──────────────────────────────────────────
       console.log(`[smartSync] updating ${updates.length} variants…`);
