@@ -7037,10 +7037,14 @@ module.exports = async (req, res) => {
               return;
             }
             const price = extractPriceFromBuyBox(h) || extractPrice(h) || 0;
+            const shipping = extractShippingFromPage(h) || 0;
             const oos   = isAmazonOOS(h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '');
-            asinPrice[asin]   = price;
+            // Fold shipping into the cost so markup applies to price + shipping.
+            const _total = price + (shipping || 0);
+            asinPrice[asin]   = _total;
             asinInStock[asin] = !oos && price > 0;
-            console.log(`[smartSync] ${asin} → $${price} inStock=${!oos}`);
+            if (shipping > 0) console.log(`[smartSync] ${asin} → $${price} +$${shipping} ship = $${_total.toFixed(2)} inStock=${!oos}`);
+            else               console.log(`[smartSync] ${asin} → $${price} inStock=${!oos}`);
             fetchOk++;
           }));
           if (i + BATCH < uniqueAsins.length) await sleep(1000);
