@@ -757,15 +757,19 @@ function extractShippingFromPage(html) {
   // Returns: 0 = free shipping, positive number = shipping cost, null = unknown
   if (!html) return null;
 
-  // Check for free shipping signals first
-  const freeRx = [/FREE\s+(?:delivery|shipping)/i, /free\s+prime\s+delivery/i,
-    /"freeShipping"\s*:\s*true/i, /class="[^"]*FREE[^"]*delivery[^"]*"/i,
-    /"shippingMessage"\s*:\s*"[^"]*FREE/i];
-  for (const rx of freeRx) { if (rx.test(html)) return 0; }
+  // Locate the buy-box delivery section first — restrict ALL checks to that
+  // region so we don't match unrelated "FREE returns" or other-seller mentions.
+  const section = html.match(/id="(?:delivery-message|deliveryMessageMirror|fast-track-message|mir-layout-DELIVERY_BLOCK|deliveryBlockMessage|shippingMessageInsideBuyBox)"[\s\S]{0,1500}/)?.[0]
+                || html.match(/id="apex_desktop"[\s\S]{0,3000}/)?.[0]
+                || '';
 
-  const section = html.match(/id="delivery-message"[\s\S]{0,500}/)?.[0]
-                || html.match(/id="deliveryMessageMirror"[\s\S]{0,500}/)?.[0]
-                || html.match(/id="fast-track-message"[\s\S]{0,500}/)?.[0] || '';
+  // If we have a section, check FREE markers there. Otherwise return null
+  // (don't guess — let the caller treat unknown as 0 with no markup).
+  if (section) {
+    if (/FREE\s+(?:delivery|shipping)/i.test(section)) return 0;
+    if (/"freeShipping"\s*:\s*true/i.test(section)) return 0;
+    if (/free\s+prime\s+delivery/i.test(section)) return 0;
+  }
 
   const shipPats = [/\$([\d,]+\.?\d*)\s+shipping/i, /shipping[:\s]+\$([\d,]+\.?\d*)/i,
     /"shippingCost"\s*:\s*\{"amount"\s*:\s*([\d.]+)/, /\+\s*\$([\d.]+)\s+(?:shipping|delivery)/i];
@@ -773,6 +777,8 @@ function extractShippingFromPage(html) {
     const m = (section || html).match(rx);
     if (m) { const c = parseFloat(m[1].replace(/,/g,'')); if (c >= 0 && c < 100) return c; }
   }
+  // No paid-shipping pattern matched and no FREE marker found — treat as null
+  // (unknown). Caller treats null as 0 (no addition). Better than guessing wrong.
   return null;
 }
 
