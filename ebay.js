@@ -7290,28 +7290,56 @@ module.exports = async (req, res) => {
         // Without this, "BUTTERFLY" can match a variant whose actual color is "LAVENDER BUTTERFLY"
         // because both .includes() the substring — whichever is iterated first wins.
         // Primary (Amazon-order) slugs take precedence over reversed-order slugs.
-        const _sortedSlugs = [
-          ...Object.entries(slugToAsin),
-          ...Object.entries(slugToAsinReversed),
+        // Separate compound (multi-dim) slugs from primary-only slugs — try compound
+        // first; only fall back to primary-only if compound matching fails entirely.
+        // This prevents 5 SKUs from all matching the same ASIN via primary dim alone.
+        const _compoundSlugs = [
+          ...Object.entries(slugToAsin).filter(([s]) => s.includes('_')),
+          ...Object.entries(slugToAsinReversed).filter(([s]) => s.includes('_')),
+        ].sort((a, b) => b[0].length - a[0].length);
+        const _primaryOnlySlugs = [
+          ...Object.entries(slugToAsin).filter(([s]) => !s.includes('_')),
+          ...Object.entries(slugToAsinReversed).filter(([s]) => !s.includes('_')),
         ].sort((a, b) => b[0].length - a[0].length);
         const _pfxUpper = normSku.toUpperCase() + '-';
-        let _reconHits = 0;
+        let _reconHits = 0, _reconAmbiguous = 0;
         for (const sku of _needsRecon) {
           // Strip the group SKU prefix when present, then uppercase for case-insensitive matching
           const sfx = (sku.toUpperCase().startsWith(_pfxUpper)
             ? sku.slice(normSku.length + 1)
             : sku).toUpperCase();
-          for (const [slug, asin] of _sortedSlugs) {
+          let matched = false;
+          // Try compound (multi-dim) slugs FIRST
+          for (const [slug, asin] of _compoundSlugs) {
             if (sfx.startsWith(slug) || sfx.includes(slug)) {
+              skuToAsin[sku] = asin;
+              _reconHits++;
+              matched = true;
+              break;
+            }
+          }
+          if (matched) continue;
+          // Only fall back to primary-only if no compound matched. But check
+          // how many ASINs share this primary value — if multiple, the match
+          // is ambiguous (same primary, different secondaries) so DON'T guess.
+          for (const [slug, asin] of _primaryOnlySlugs) {
+            if (sfx.startsWith(slug) || sfx.includes(slug)) {
+              // Count how many ASINs in dimensionToAsinMap share this primary value
+              const _dupCount = _primaryOnlySlugs.filter(([s]) => s === slug).length;
+              if (_dupCount >= 2) {
+                // Ambiguous — multiple ASINs share this primary. Skip the match.
+                _reconAmbiguous++;
+                break;
+              }
               skuToAsin[sku] = asin;
               _reconHits++;
               break;
             }
           }
         }
-        console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}]${_canReconFromCombo?' +comboAsin fallback':''})`);
+        console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs${_reconAmbiguous > 0 ? ` (${_reconAmbiguous} ambiguous, skipped to avoid wrong-price assignment)` : ''} (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}]${_canReconFromCombo?' +comboAsin fallback':''})`);
         // Stash the sorted slug map for aspect-based reconstruction below
-        global.__smartSyncSlugMap = _sortedSlugs;
+        global.__smartSyncSlugMap = [..._compoundSlugs, ..._primaryOnlySlugs];
         global.__smartSyncSlug    = _slug;
       }
 
