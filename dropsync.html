@@ -5006,6 +5006,18 @@ async function _relayTick() {
   if (!S.browserRelay) { stopBrowserRelay(); return; }
   _relayRunning = true;
 
+  // ── PAUSE RELAY DURING BULK OPERATIONS ──────────────────────────────────────
+  // When bulk import or bulk push is running, smartSync revisions compete for
+  // the same Amazon fetches + Railway CPU + browser resources. Pause the relay
+  // so bulk work has the lane to itself. Resumes automatically when bulk is done.
+  if ((typeof BULK !== 'undefined') && (BULK.scraping || BULK.pushing)) {
+    console.log(`[relay] paused — bulk ${BULK.scraping?'import':'push'} in progress, will resume when finished`);
+    _relayRunning = false;
+    _relayTimer = setTimeout(_relayTick, 15000); // re-check every 15s
+    _renderRelayStatus();
+    return;
+  }
+
   const listed = (S.products||[]).filter(p =>
     p.status === 'listed' && p.ebaySku && p.sourceUrl &&
     !/aliexpress/.test(p.sourceUrl) &&
