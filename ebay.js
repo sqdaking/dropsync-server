@@ -7025,11 +7025,11 @@ module.exports = async (req, res) => {
       const _fetchFailed = new Set(); // ASINs where fetchPage returned null
       if (uniqueAsins.length > 0) {
         console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1}: ASINs ${asinOffset+1}–${asinOffset+uniqueAsins.length} of ${allUniqueAsins.length} ──`);
-        const BATCH = 6;
+        const BATCH = 8;
         let fetchOk = 0, fetchFail = 0;
         for (let i = 0; i < uniqueAsins.length; i += BATCH) {
           await Promise.all(uniqueAsins.slice(i, i + BATCH).map(async (asin, bi) => {
-            await sleep(bi * 150);
+            await sleep(bi * 100);
             // 2 attempts max — blocked ASINs are set qty=0 this cycle (Out-of-Stock
             // Control hides the variant) and re-tried normally on the next sync.
             // This is NOT a real OOS event: no markedOos flag, no OOS webhook.
