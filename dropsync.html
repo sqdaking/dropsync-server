@@ -1000,18 +1000,33 @@ function _browserExtractAsinData(html) {
   }
   // Shipping: extract Amazon's delivery fee (free = 0, paid = actual amount).
   // Server applies markup to price + shipping so the final eBay price covers it.
+  // Strategy: locate the buy-box delivery section first to avoid matching
+  // unrelated "FREE returns" or other-seller mentions elsewhere on the page.
   let shipping = 0;
-  const shipPats = [
-    /"deliveryPrice"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
-    /\+\s*\$([\d.]+)\s+(?:shipping|delivery)/i,
-    /"shippingCost"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
-    /Delivery:\s*\$([\d.]+)/i,
-  ];
-  for (const p of shipPats) {
-    const m = html.match(p);
-    if (m) {
-      const v = parseFloat(m[1]);
-      if (v > 0 && v < 1000) { shipping = v; break; }
+  const section = html.match(/id="(?:delivery-message|deliveryMessageMirror|fast-track-message|mir-layout-DELIVERY_BLOCK|deliveryBlockMessage|shippingMessageInsideBuyBox)"[\s\S]{0,1500}/)?.[0]
+                || html.match(/id="apex_desktop"[\s\S]{0,3000}/)?.[0]
+                || '';
+  // Check FREE markers in the section (not page-wide — avoids false FREE)
+  const isFree = section && (
+    /FREE\s+(?:delivery|shipping)/i.test(section) ||
+    /"freeShipping"\s*:\s*true/i.test(section) ||
+    /free\s+prime\s+delivery/i.test(section)
+  );
+  if (!isFree) {
+    const shipPats = [
+      /"deliveryPrice"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
+      /"shippingCost"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
+      /\+\s*\$([\d,]+\.?\d*)\s+(?:shipping|delivery)/i,
+      /\$([\d,]+\.?\d*)\s+shipping/i,
+      /shipping[:\s]+\$([\d,]+\.?\d*)/i,
+      /Delivery:\s*\$([\d,]+\.?\d*)/i,
+    ];
+    for (const p of shipPats) {
+      const m = (section || html).match(p);
+      if (m) {
+        const v = parseFloat(m[1].replace(/,/g,''));
+        if (v > 0 && v < 100) { shipping = v; break; }
+      }
     }
   }
   // OOS: check buy-box signals
