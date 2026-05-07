@@ -2309,6 +2309,9 @@ async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinDat
       } else {
         product.price = 0;
         console.warn(`[scraper] product.price=0 (URL ASIN ${asin||'(none)'} not fetched, NO sibling-price fallback per safety rule — will publish unbuyable)`);
+        // Mark scrape as zero-variants — push handler will refuse to publish
+        // a listing built from a fully-blocked scrape.
+        product._zeroVariantsAfterCap = true;
       }
     }
 
@@ -4334,9 +4337,17 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     }
     console.log('[push] aspects filled:', Object.keys(aspects).length, 'fields');
 
-    // eBay hard limit: max 45 item specifics per listing
-    // Priority: keep required/high-value fields, drop low-value extras
-    if (Object.keys(aspects).length > 45) {
+    // Cap each multi-value aspect to 5 entries — eBay sometimes counts each
+    // value as a separate specific. Without this, a single key with 10 values
+    // can push us over 45 even though Object.keys looks fine.
+    for (const _ak of Object.keys(aspects)) {
+      if (Array.isArray(aspects[_ak]) && aspects[_ak].length > 5) {
+        aspects[_ak] = aspects[_ak].slice(0, 5);
+      }
+    }
+
+    // eBay hard limit: max 45 item specifics per listing. Cap at 40 for safety.
+    if (Object.keys(aspects).length > 40) {
       const PRIORITY_KEEP = new Set(['Brand','Color','Size','Material','Style','Department','Type',
         'Pattern','Occasion','Size Type','Country/Region of Manufacture','MPN','UPC','EAN','ISBN',
         'Set Includes','Number of Items in Set','Room','Assembly Required','Theme','Age Group',
@@ -4348,9 +4359,9 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       const keep = keys.filter(k => PRIORITY_KEEP.has(k));
       const extra = keys.filter(k => !PRIORITY_KEEP.has(k));
       // Fill up to 45 with priority first, then extras
-      const allowed = new Set([...keep, ...extra].slice(0, 45));
+      const allowed = new Set([...keep, ...extra].slice(0, 40));
       for (const k of keys) { if (!allowed.has(k)) delete aspects[k]; }
-      console.log(`[push] aspects capped from ${keys.length} to ${Object.keys(aspects).length} (eBay limit 45)`);
+      console.log(`[push] aspects capped from ${keys.length} to ${Object.keys(aspects).length} (eBay limit 45, our cap 40 for safety)`);
     }
   }
   // Truncate ALL aspect values to 65 chars max (eBay hard limit)
@@ -8174,9 +8185,17 @@ module.exports = async (req, res) => {
     }
     console.log('[push] aspects filled:', Object.keys(aspects).length, 'fields');
 
-    // eBay hard limit: max 45 item specifics per listing
-    // Priority: keep required/high-value fields, drop low-value extras
-    if (Object.keys(aspects).length > 45) {
+    // Cap each multi-value aspect to 5 entries — eBay sometimes counts each
+    // value as a separate specific. Without this, a single key with 10 values
+    // can push us over 45 even though Object.keys looks fine.
+    for (const _ak of Object.keys(aspects)) {
+      if (Array.isArray(aspects[_ak]) && aspects[_ak].length > 5) {
+        aspects[_ak] = aspects[_ak].slice(0, 5);
+      }
+    }
+
+    // eBay hard limit: max 45 item specifics per listing. Cap at 40 for safety.
+    if (Object.keys(aspects).length > 40) {
       const PRIORITY_KEEP = new Set(['Brand','Color','Size','Material','Style','Department','Type',
         'Pattern','Occasion','Size Type','Country/Region of Manufacture','MPN','UPC','EAN','ISBN',
         'Set Includes','Number of Items in Set','Room','Assembly Required','Theme','Age Group',
@@ -8188,9 +8207,9 @@ module.exports = async (req, res) => {
       const keep = keys.filter(k => PRIORITY_KEEP.has(k));
       const extra = keys.filter(k => !PRIORITY_KEEP.has(k));
       // Fill up to 45 with priority first, then extras
-      const allowed = new Set([...keep, ...extra].slice(0, 45));
+      const allowed = new Set([...keep, ...extra].slice(0, 40));
       for (const k of keys) { if (!allowed.has(k)) delete aspects[k]; }
-      console.log(`[push] aspects capped from ${keys.length} to ${Object.keys(aspects).length} (eBay limit 45)`);
+      console.log(`[push] aspects capped from ${keys.length} to ${Object.keys(aspects).length} (eBay limit 45, our cap 40 for safety)`);
     }
   }
   // Truncate ALL aspect values to 65 chars max (eBay hard limit)
