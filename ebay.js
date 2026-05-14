@@ -7824,6 +7824,10 @@ module.exports = async (req, res) => {
         const _toDelete = _allGroupSkus.filter(s => {
           if (_orphanSet.has(s)) return true;
           if (!offerMap[s]?.offerId) return true;
+          // Delete any variant priced at exactly $9.99 — leftover from historical
+          // bad pushes. Better to drop the variant than leave a $9.99 trap.
+          const _curPrice = parseFloat(offerMap[s].currentPrice) || 0;
+          if (_curPrice === 9.99) return true;
           return false;
         });
         if (_toDelete.length > 0) {
