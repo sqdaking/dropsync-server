@@ -391,9 +391,46 @@ function _saveOosLocks() {
 async function loadProductsFromRailway() {
   if (!S.serverUrl) return false;
   try {
-    const d = await fetch(S.serverUrl + '/api/products?limit=9000').then(r => r.json());
-    if (!d || !Array.isArray(d.products)) return false;
-    if (d.products.length === 0) {
+    // Paginate to avoid 32MB+ truncated JSON responses. Server can stream a few
+    // hundred at a time without timing out or hitting size limits.
+    const PAGE_SIZE = 500;
+    let offset = 0;
+    let allProducts = [];
+    let pageCount = 0;
+    while (true) {
+      const r = await fetch(`${S.serverUrl}/api/products?limit=${PAGE_SIZE}&offset=${offset}`);
+      if (!r.ok) break;
+      // Read as text first, then parse — gives us a chance to recover from a
+      // truncated chunk by trimming back to last valid bracket.
+      const txt = await r.text();
+      let chunk;
+      try {
+        chunk = JSON.parse(txt);
+      } catch(parseErr) {
+        // Truncated mid-stream — try to recover the last complete product
+        const lastClose = txt.lastIndexOf('}]');
+        if (lastClose > 0) {
+          try {
+            chunk = JSON.parse(txt.slice(0, lastClose + 2) + '}');
+            console.warn(`[Railway] truncated response at offset ${offset} — recovered partial chunk`);
+          } catch(_) {
+            console.warn(`[Railway] truncated and unrecoverable at offset ${offset} — stopping pagination`);
+            break;
+          }
+        } else {
+          break;
+        }
+      }
+      if (!chunk || !Array.isArray(chunk.products) || chunk.products.length === 0) break;
+      allProducts.push(...chunk.products);
+      pageCount++;
+      if (chunk.products.length < PAGE_SIZE) break; // last page
+      offset += PAGE_SIZE;
+      if (pageCount > 50) { console.warn('[Railway] pagination safety stop at 50 pages'); break; }
+    }
+    const d = { products: allProducts };
+    console.log(`[Railway] paginated load: ${pageCount} pages, ${allProducts.length} total products`);
+    if (!d.products.length) {
       // Railway is empty — seed it from localStorage if we have products
       if (S.products.length > 0) {
         console.log('[Railway] DB empty — seeding', S.products.length, 'products from local cache');
@@ -405,8 +442,6 @@ async function loadProductsFromRailway() {
       return false;
     }
     // Railway has data — use it as primary source
-    // For products in Railway, use Railway data (has worker-updated prices/status)
-    // For products only in localStorage (not yet pushed to Railway), keep them
     const localMap = new Map((S.products||[]).map(p => [p.id, p]));
     const rwMap    = new Map(d.products.map(p => [p.id, p]));
     const localOnly = S.products.filter(p => !rwMap.has(p.id));
@@ -443,7 +478,6 @@ async function loadProductsFromRailway() {
     S.products = [...merged, ..._filteredLocalOnly];
     _restoreOosLocks(); // reapply OOS locks after Railway load
     // FIX: never write products to localStorage — only settings (products live in Railway)
-    // Writing all of S caused quota exceeded errors with large product catalogs
     try {
       const settingsOnly = {
         serverUrl: S.serverUrl,
