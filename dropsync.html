@@ -961,8 +961,9 @@ async function fetchAmazonInBrowser(url) {
   // Add random delay to avoid rate limiting.
   await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
   const proxies = [
-    () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
+    // Server-proxy first — your own Railway endpoint, most reliable for you.
     () => S.serverUrl ? fetch(`${S.serverUrl}/api/amazon?url=${encodeURIComponent(cleanUrl)}`).then(r => { if(!r.ok) throw new Error('status '+r.status); return r.text(); }) : Promise.reject(new Error('no serverUrl')),
+    () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
     () => fetch(`https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`,{headers:{'Accept':'text/html'}}).then(r=>r.text()),
     () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
   ];
