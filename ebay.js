@@ -63,8 +63,9 @@ async function fetchPage(url, ua, maxAttempts) {
   // Only for amazon.com URLs (the only domain that gets blocked) and only
   // when a browser tab is actively heartbeating. The relay enqueues the URL,
   // a browser tab claims it, fetches Amazon from a residential IP, POSTs
-  // the HTML back. We await up to 60s. If the relay times out or returns
-  // blocked HTML, we fall through to the existing direct-fetch logic below.
+  // the HTML back. We await up to 60s. STRICT MODE: if relay is alive, we
+  // do NOT fall back to direct on failure — direct burns the Railway IP and
+  // makes blocks worse. Better to skip this cycle and retry next time.
   if (_relayHandle && _relayHandle.isAlive() && /amazon\.(com|co\.uk|de|ca)/.test(url)) {
     try {
       const jobId = await _relayHandle.db.enqueueRelayFetch(url, asin);
@@ -73,12 +74,15 @@ async function fetchPage(url, ua, maxAttempts) {
         console.log(`[fetch] relay hit${_asinTag} (${html.length}b)`);
         return html;
       }
-      if (html) console.log(`[fetch] relay returned blocked HTML${_asinTag} — falling back to direct`);
-      else      console.log(`[fetch] relay timeout${_asinTag} — falling back to direct`);
+      if (html) console.log(`[fetch] relay returned blocked HTML${_asinTag} — giving up (relay-only mode)`);
+      else      console.log(`[fetch] relay timeout${_asinTag} — giving up (relay-only mode)`);
     } catch(e) {
-      console.warn(`[fetch] relay error${_asinTag}: ${e.message} — falling back to direct`);
+      console.warn(`[fetch] relay error${_asinTag}: ${e.message} — giving up (relay-only mode)`);
     }
+    return ''; // relay tried but failed — do NOT fall through to direct
   }
+  // Relay not alive → only NOW fall through to direct (last resort).
+  // When relay is up but a specific URL fails, we return above without trying direct.
 
   // Vary Accept-Language + platform per request to avoid uniform fingerprint
   const _langList = ['en-US,en;q=0.9', 'en-US,en;q=0.8,fr;q=0.5', 'en-GB,en;q=0.9', 'en-US,en;q=0.9,es;q=0.7', 'en-US,en;q=0.9,de;q=0.5'];
