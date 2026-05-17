@@ -2156,6 +2156,7 @@ async function bulkFetchDeals(dept) {
   if (!window.BULK) { bulkLoadState?.(); }
   if (typeof BULK === 'undefined' || BULK.scraping) return;
   BULK.scraping = true;
+  BULK._scrapingStartedAt = Date.now(); // track start so stuck flag can be auto-cleared
   renderBulk();
 
   try {
@@ -2342,6 +2343,7 @@ async function bulkPushAll() {
   if (!S.token) { toast('Connect eBay in Settings first', 'error'); return; }
   if (BULK.pushing) return;
   BULK.pushing = true;
+  BULK._pushingStartedAt = Date.now();
   // Pause the worker for the entire bulk push — prevents Railway CPU contention
   // between concurrent bulk-push API calls and the per-minute sync rotation that
   // caused two crashes during large pushes. _releasePushLock in finally block
@@ -5061,11 +5063,28 @@ async function _relayTick() {
   // the same Amazon fetches + Railway CPU + browser resources. Pause the relay
   // so bulk work has the lane to itself. Resumes automatically when bulk is done.
   if ((typeof BULK !== 'undefined') && (BULK.scraping || BULK.pushing)) {
-    console.log(`[relay] paused — bulk ${BULK.scraping?'import':'push'} in progress, will resume when finished`);
-    _relayRunning = false;
-    _relayTimer = setTimeout(_relayTick, 15000); // re-check every 15s
-    _renderRelayStatus();
-    return;
+    // Safety: if a bulk flag has been "true" for >5 minutes with no progress, it's
+    // probably stuck (errored without cleanup, tab navigated away mid-op). Clear it.
+    const STUCK_MS = 5 * 60 * 1000;
+    const now = Date.now();
+    if (BULK.scraping && BULK._scrapingStartedAt && (now - BULK._scrapingStartedAt > STUCK_MS)) {
+      console.warn('[relay] BULK.scraping stuck for >5min — auto-clearing');
+      BULK.scraping = false;
+      BULK._scrapingStartedAt = null;
+    }
+    if (BULK.pushing && BULK._pushingStartedAt && (now - BULK._pushingStartedAt > STUCK_MS)) {
+      console.warn('[relay] BULK.pushing stuck for >5min — auto-clearing');
+      BULK.pushing = false;
+      BULK._pushingStartedAt = null;
+    }
+    // Re-check after auto-clear
+    if (BULK.scraping || BULK.pushing) {
+      console.log(`[relay] paused — bulk ${BULK.scraping?'import':'push'} in progress, will resume when finished`);
+      _relayRunning = false;
+      _relayTimer = setTimeout(_relayTick, 15000); // re-check every 15s
+      _renderRelayStatus();
+      return;
+    }
   }
 
   const listed = (S.products||[]).filter(p =>
@@ -7223,7 +7242,7 @@ async function smartSyncProduct(p) {
         sourceUrl:       p.sourceUrl,
         markup:          p.markup != null ? p.markup : (S.markup || 23),
         handlingCost:    S.handlingCost || 2,
-        quantity:        p.quantity || 1,
+        quantity:        S.quantity || p.quantity || 1,
         // Variant SKU→ASIN/offerId maps so backend can find all offer IDs
         skuToAsin:                p.skuToAsin        || null,
         cachedOfferIds:           p.offerIdCache    || null,
