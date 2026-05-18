@@ -7828,14 +7828,20 @@ module.exports = async (req, res) => {
         const _toDelete = _allGroupSkus.filter(s => {
           if (_orphanSet.has(s)) return true;
           if (!offerMap[s]?.offerId) return true;
-          // Delete any variant priced at exactly $9.99 — leftover from historical
-          // bad pushes. Better to drop the variant than leave a $9.99 trap.
+          // AGGRESSIVE: delete ANY variant priced at or below $15. Real Amazon
+          // dropship products are almost never genuinely <$15 after markup. Any
+          // variant in this range is leftover placeholder data ($9.99, $10, $12,
+          // etc) from historical bad pushes. Better aggressive cleanup than
+          // leaving a single $9.99 trap on the listing.
           const _curPrice = parseFloat(offerMap[s].currentPrice) || 0;
-          if (_curPrice === 9.99) return true;
+          if (_curPrice > 0 && _curPrice <= 15) return true;
           return false;
         });
-        if (_toDelete.length > 0) {
+        if (_toDelete.length === 0) {
+          console.log(`[smartSync] cleanup: nothing to delete (group has ${_allGroupSkus.length} SKUs, all valid)`);
+        } else {
           const _keepSkus = _allGroupSkus.filter(s => !_toDelete.includes(s));
+          console.log(`[smartSync] cleanup: deleting ${_toDelete.length} stale/cheap variant(s): ${_toDelete.slice(0,5).map(s=>s.slice(-20)).join(', ')}${_toDelete.length>5?'…':''}`);
           // GET group, update variantSKUs, PUT group
           const _ggR = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`, { headers: auth });
           if (_ggR.ok) {
@@ -7845,19 +7851,29 @@ module.exports = async (req, res) => {
             const _gpR = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`,
               { method: 'PUT', headers: auth, body: JSON.stringify(_gg) });
             if (_gpR.ok || _gpR.status === 204) {
-              console.log(`[smartSync] cleanup: removed ${_toDelete.length} stale variant(s) from group — kept ${_keepSkus.length}`);
-              // Delete orphaned offers too so they don't linger
-              for (const _ds of _toDelete) {
-                const _oid = offerMap[_ds]?.offerId;
-                if (_oid) {
-                  await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(_oid)}`, { method: 'DELETE', headers: auth }).catch(()=>{});
-                }
-              }
+              console.log(`[smartSync] cleanup: ✓ group updated — removed ${_toDelete.length} variant(s), kept ${_keepSkus.length}`);
             } else {
               const _gpT = await _gpR.text().catch(()=>'');
               console.warn(`[smartSync] cleanup: group PUT ${_gpR.status}: ${_gpT.slice(0,300)}`);
             }
+          } else {
+            const _ggT = await _ggR.text().catch(()=>'');
+            console.warn(`[smartSync] cleanup: group GET ${_ggR.status}: ${_ggT.slice(0,200)} — falling back to direct offer deletes`);
           }
+          // ALWAYS delete the offers, even if group PUT failed. The whole point
+          // is to kill these placeholder-priced variants from the listing.
+          let _delOk = 0, _delFail = 0;
+          for (const _ds of _toDelete) {
+            const _oid = offerMap[_ds]?.offerId;
+            if (_oid) {
+              const _dr = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(_oid)}`, { method: 'DELETE', headers: auth }).catch(()=>null);
+              if (_dr && (_dr.ok || _dr.status === 204)) _delOk++;
+              else _delFail++;
+            }
+            // Also delete the inventory item itself so eBay fully forgets the SKU
+            await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(_ds)}`, { method: 'DELETE', headers: auth }).catch(()=>{});
+          }
+          console.log(`[smartSync] cleanup: offer DELETE — ${_delOk} ok, ${_delFail} failed`);
         }
       } catch(_ce) { console.warn(`[smartSync] cleanup threw: ${_ce.message}`); }
 
