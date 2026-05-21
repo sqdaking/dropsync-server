@@ -66,7 +66,8 @@ async function fetchPage(url, ua, maxAttempts) {
   // the HTML back. We await up to 60s. STRICT MODE: if relay is alive, we
   // do NOT fall back to direct on failure — direct burns the Railway IP and
   // makes blocks worse. Better to skip this cycle and retry next time.
-  if (_relayHandle && _relayHandle.isAlive() && /amazon\.(com|co\.uk|de|ca)/.test(url)) {
+  const _isAmazonUrl = /amazon\.(com|co\.uk|de|ca)/.test(url);
+  if (_relayHandle && _relayHandle.isAlive() && _isAmazonUrl) {
     try {
       const jobId = await _relayHandle.db.enqueueRelayFetch(url, asin);
       const html = await _relayHandle.db.awaitRelayResult(jobId, 60000);
@@ -80,6 +81,14 @@ async function fetchPage(url, ua, maxAttempts) {
       console.warn(`[fetch] relay error${_asinTag}: ${e.message} — giving up (relay-only mode)`);
     }
     return ''; // relay tried but failed — do NOT fall through to direct
+  }
+  // Log WHY relay was skipped so we can debug "browser not fetching" reports.
+  if (_isAmazonUrl) {
+    if (!_relayHandle) {
+      console.log(`[fetch] relay skipped${_asinTag} — no relay handle registered (server.js setup issue)`);
+    } else if (!_relayHandle.isAlive()) {
+      console.log(`[fetch] relay skipped${_asinTag} — isAlive=false (tab closed or heartbeat stale)`);
+    }
   }
   // Relay not alive → only NOW fall through to direct (last resort).
   // When relay is up but a specific URL fails, we return above without trying direct.
