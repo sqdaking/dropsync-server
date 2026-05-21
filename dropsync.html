@@ -962,38 +962,14 @@ async function fetchAmazonInBrowser(url) {
     html.includes('To discuss automated access to Amazon data');
   const wt = (p, ms) => Promise.race([p, new Promise((_,r) => setTimeout(() => r(new Error('timeout')), ms))]);
 
-  // Attempt 1: Direct fetch — uses browser cookies + residential IP
-  // Amazon allows cross-origin reads (no CORS restriction on product pages for GET)
-  try {
-    const r = await wt(fetch(cleanUrl, {
-      credentials: 'include',
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cache-Control': 'no-cache',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Upgrade-Insecure-Requests': '1',
-      },
-      mode: 'cors',
-    }), 10000);
-    if (r.ok) {
-      const html = await r.text();
-      if (!isBlocked(html)) {
-        console.log(`[browserFetch] direct ok len=${html.length}`);
-        return html;
-      }
-    }
-  } catch(e) {
-    // CORS error is expected if Amazon doesn't allow it — fall through to proxies
-    console.log(`[browserFetch] direct blocked (expected) — trying proxies`);
-  }
+  // Attempt 1: SKIPPED — direct fetch(amazon.com) ALWAYS fails with CORS from
+  // our origin (dropsync-server.up.railway.app). It just wasted 10s timeout per
+  // call and filled the console with red errors. Skip straight to proxy 1.
 
-  // Attempt 2: CORS proxies — codetabs first (empirically the most reliable
-  // for Amazon), others as fallback in case codetabs has a bad window.
-  // Add random delay to avoid rate limiting.
-  await new Promise(r => setTimeout(r, 500 + Math.random() * 1000));
+  // CORS proxies — codetabs first (empirically the most reliable for Amazon),
+  // others as fallback in case codetabs has a bad window.
+  // Small random delay to spread requests and avoid rate limiting.
+  await new Promise(r => setTimeout(r, 200 + Math.random() * 500));
   const proxies = [
     // Codetabs proxy first — confirmed working most consistently.
     () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
