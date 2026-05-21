@@ -5050,20 +5050,17 @@ async function _relayClaimAndFetchJob() {
     if (!r.ok) return;
     const job = await r.json();
     if (job.empty || !job.id) return;
-    // Got a job — fetch Amazon from this browser tab (residential IP)
+    // Got a job — fetch Amazon using existing proxy-aware function which
+    // bounces through corsproxy/codetabs/server-proxy since direct fetch
+    // from this origin will fail CORS.
     let html = '';
     let error = '';
     try {
-      const fr = await fetch(job.url, {
-        headers: {
-          'Accept': 'text/html,application/xhtml+xml',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'User-Agent': navigator.userAgent,
-        },
-        credentials: 'include', // include amazon.com cookies (logged-in session helps)
-      });
-      if (fr.ok) html = await fr.text();
-      else error = `HTTP ${fr.status}`;
+      html = await fetchAmazonInBrowser(job.url);
+      if (!html || html.length < 1000) {
+        error = 'empty or too small (probably blocked)';
+        html = '';
+      }
     } catch(e) {
       error = e.message || 'fetch failed';
     }
