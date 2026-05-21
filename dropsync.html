@@ -8627,66 +8627,20 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
   if (!S.token) { toast('Connect eBay first', 'error'); return; }
 
   const orig = btn.textContent;
-  btn.textContent = '⏳ Fetching Amazon…';
+  btn.textContent = '⏳ Syncing…';
   btn.disabled = true;
   try {
-    // Fetch Amazon page via Railway proxy BEFORE calling the server
-    const clientHtml = await fetchAmazonInBrowser(p.sourceUrl);
-    const clientAsinData = clientHtml ? await prefetchAsinPrices(clientHtml) : {};
-    btn.textContent = clientHtml ? '⏳ Replenishing…' : '⏳ Replenishing (no proxy)…';
-
-    const token = await ensureToken();
-    const r = await fetch(`${S.serverUrl}/api/ebay?action=replenish`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        access_token:  token,
-        ebaySku:       normaliseGroupSku(p.ebaySku),
-        sourceUrl:     p.sourceUrl,
-        ebayListingId: p.ebayListingId || '',
-        quantity:      p.quantity || 1,
-        markup:        S.markup,
-        handlingCost:  S.handlingCost,
-        clientHtml,   // browser-fetched Amazon HTML (bypasses datacenter-IP blocks)
-        clientAsinData, // browser-prefetched per-ASIN price+stock data
-      })
-    });
-    const d = await safeJson(r);
-    if (!d.success) {
-      if (d.multiAsinMismatch) {
-        // Multi-ASIN product — show dedicated message with Re-push suggestion
-        btn.textContent = '⚠️ Multi-ASIN';
-        btn.style.color = '#f59e0b';
-        setTimeout(() => { btn.textContent = orig; btn.disabled = false; btn.style.color = ''; }, 6000);
-        toast('⚠️ Multi-ASIN listing — use Re-push instead. Each color is a separate Amazon ASIN; replenish can only handle true variation parents.', 'warn', 10000);
-        addLog('warn', `Replenish blocked (multi-ASIN): ${p.title?.slice(0,50)}`, d.message?.slice(0,120), { productId: p.id });
-        return;
-      }
-      // rolledBack = true means eBay listing was restored to old state
-      const msg = d.message || d.errors?.[0] || d.error || 'Replenish failed';
-      throw new Error(d.rolledBack ? `${msg} (old listing preserved)` : msg);
+    // Replenish now uses the standard smartSync flow — scrape Amazon + push
+    // updated price/qty to eBay. Same behavior as the Sync button, just
+    // triggered from the order card so user can refresh after a sale.
+    const result = await smartSyncProduct(p);
+    if (!result || result.error) {
+      throw new Error(result?.error || 'Sync failed');
     }
-    p.lastSynced = new Date().toISOString();
-    if (d.price)        { p.myPrice = d.price; }
-    if (d.title)        { p.title = d.title; }
-    if (d.comboInStock) {
-      if (!p.comboInStock) p.comboInStock = {};
-      for (const [k, v] of Object.entries(d.comboInStock)) {
-        if (v === false) p.comboInStock[k] = false;
-        else if (v === true) p.comboInStock[k] = true;
-      }
-    }
-    if (d.comboAsin)    { p.comboAsin = d.comboAsin; }
-    if (d.comboPrices) {
-      const newU = new Set(Object.values(d.comboPrices)).size;
-      const curU = new Set(Object.values(p.comboPrices||{})).size;
-      if (!d._pricesFailed) p.comboPrices = d.comboPrices; // always use fresh unless Amazon blocked
-    }
-    p.lastReviseError = null;
-    markDirty(p.id); save();
     btn.textContent = '✅ Replenished!';
     btn.style.color = '#10b981';
-    toast(`✅ Replenished — ${d.images || 0} fresh photos · $${d.price?.toFixed(2)} · ${d.inStock ? 'In Stock' : 'OOS'} · same listing ID`, 'success', 6000);
-    addLog('sync', `Replenished: ${p.title?.slice(0,50)}`, `Fresh Amazon data applied to eBay SKU ${p.ebaySku}`, { productId: p.id });
+    toast(`✅ Replenished — listing synced with latest Amazon data`, 'success', 5000);
+    addLog('sync', `Replenished: ${p.title?.slice(0,50)}`, `smartSync applied to ${p.ebaySku}`, { productId: p.id });
     setTimeout(() => { btn.textContent = orig; btn.disabled = false; btn.style.color = ''; }, 4000);
   } catch(e) {
     btn.textContent = orig;
