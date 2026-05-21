@@ -5028,16 +5028,84 @@ async function toggleWorkerPause() {
 let _relayTimer = null;
 let _relayCursor = parseInt(localStorage.getItem('_relayCursor') || '0') || 0;
 let _relayRunning = false;
+// ── REAL RELAY: heartbeat + job poller ────────────────────────────────────────
+// Server expects /api/relay/heartbeat every <60s to consider relay "alive".
+// Server expects polling on /api/relay/needs to claim Amazon-fetch jobs.
+// Without these two timers, server's isRelayAlive() returns false and every
+// fetch falls through to direct (which Amazon blocks on Railway IP).
+let _relayHeartbeatTimer = null;
+let _relayJobPollTimer = null;
+
+async function _relaySendHeartbeat() {
+  if (!S.serverUrl) return;
+  try {
+    await fetch(`${S.serverUrl}/api/relay/heartbeat`, { method: 'POST' });
+  } catch(_) {} // silent — next beat will retry
+}
+
+async function _relayClaimAndFetchJob() {
+  if (!S.serverUrl) return;
+  try {
+    const r = await fetch(`${S.serverUrl}/api/relay/needs`);
+    if (!r.ok) return;
+    const job = await r.json();
+    if (job.empty || !job.id) return;
+    // Got a job — fetch Amazon from this browser tab (residential IP)
+    let html = '';
+    let error = '';
+    try {
+      const fr = await fetch(job.url, {
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'User-Agent': navigator.userAgent,
+        },
+        credentials: 'include', // include amazon.com cookies (logged-in session helps)
+      });
+      if (fr.ok) html = await fr.text();
+      else error = `HTTP ${fr.status}`;
+    } catch(e) {
+      error = e.message || 'fetch failed';
+    }
+    // POST result back
+    try {
+      await fetch(`${S.serverUrl}/api/relay/submit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: job.id, html, error }),
+      });
+    } catch(_) {}
+  } catch(_) {}
+}
+
+function _startRelayBackground() {
+  // Heartbeat every 20s (well under the 60s server timeout)
+  if (!_relayHeartbeatTimer) {
+    _relaySendHeartbeat();
+    _relayHeartbeatTimer = setInterval(_relaySendHeartbeat, 20000);
+  }
+  // Poll for jobs every 500ms — fast enough to feel real-time, gentle on CPU
+  if (!_relayJobPollTimer) {
+    _relayJobPollTimer = setInterval(_relayClaimAndFetchJob, 500);
+  }
+}
+
+function _stopRelayBackground() {
+  if (_relayHeartbeatTimer) { clearInterval(_relayHeartbeatTimer); _relayHeartbeatTimer = null; }
+  if (_relayJobPollTimer)   { clearInterval(_relayJobPollTimer);   _relayJobPollTimer = null; }
+}
 
 async function startBrowserRelay() {
   if (_relayTimer) return; // already running
-  console.log('[relay] Browser relay started');
+  console.log('[relay] Browser relay started — heartbeat + job poller active');
+  _startRelayBackground(); // begin heartbeat + job claiming
   _renderRelayStatus();
   _relayTick();
 }
 
 function stopBrowserRelay() {
   if (_relayTimer) { clearTimeout(_relayTimer); _relayTimer = null; }
+  _stopRelayBackground();
   _relayRunning = false;
   console.log('[relay] Browser relay stopped');
   _renderRelayStatus();
@@ -7713,6 +7781,12 @@ function renderOrderRows() {
              ✏️
            </button>
            ${ebaySku ? `
+             <button onclick="syncFromOrder('${productId}',this)"
+               style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:#fff;background:#3b82f6;border:none;padding:3px 9px;border-radius:6px;cursor:pointer"
+               onmouseover="this.style.opacity='.85'" onmouseout="this.style.opacity='1'"
+               title="Scrape Amazon + push updated price/qty to eBay">
+               🔄 Sync
+             </button>
              <button onclick="replenishFromOrder('${productId}','${orderId_safe}',this)"
                style="display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:600;color:#10b981;background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.3);padding:3px 9px;border-radius:6px;cursor:pointer"
                onmouseover="this.style.background='rgba(16,185,129,.2)'" onmouseout="this.style.background='rgba(16,185,129,.1)'">
