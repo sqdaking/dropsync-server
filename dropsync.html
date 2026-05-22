@@ -2334,6 +2334,17 @@ async function bulkPushAll() {
 
   for (let i=0; i<toPush.length; i++) {
     const p = toPush[i];
+    // SAFETY: if product no longer exists in S.products (was deleted), skip it.
+    // This is a second line of defense against stale BULK.queue entries — the
+    // primary fix is in deleteProduct(), but stale localStorage from before
+    // that fix can still leak deleted IDs into BULK.queue.
+    const _stillExists = S.products.find(x => x.id === p.id);
+    if (!_stillExists) {
+      BULK.queue = BULK.queue.filter(x => x.id !== p.id);
+      bulkLog(`⏭ ${(p.title||p.asin||p.id).slice(0,50)} — no longer in catalog (was deleted), skipping`, 'warn');
+      skipped++;
+      continue;
+    }
     // Dedup: skip if already live
     const stored = S.products.find(x=>x.id===p.id);
     if (stored?.status==='listed' && stored?.ebayListingId) {
@@ -7572,6 +7583,16 @@ function deleteProduct(pid) {
     if (!confirm('Delete this product from DropSync?')) return;
     addLog('delete', `Deleted: ${p.title.slice(0,50)}`, 'Removed from DropSync (was draft/ended)', { productId: p.id });
     S.products = S.products.filter(x => x.id !== pid);
+    // CRITICAL: also remove from bulk push queues. Without this the draft
+    // stays queued and the next bulkPushAll will push the "deleted" product.
+    // This was the source of the "deleted drafts keep getting pushed days later" bug.
+    if (typeof BULK !== 'undefined' && BULK.queue) {
+      BULK.queue = BULK.queue.filter(x => x.id !== pid);
+      try { bulkSaveState(); } catch(_) {}
+    }
+    if (typeof WS_BULK !== 'undefined' && WS_BULK.queue) {
+      WS_BULK.queue = WS_BULK.queue.filter(x => x.id !== pid);
+    }
     save();
     deleteProductFromRailway(pid);
     if (S.view === 'drafts') renderDrafts(); else renderProducts();
