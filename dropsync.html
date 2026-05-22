@@ -8665,6 +8665,46 @@ async function saveNewSourceUrl(productId, orderIdSafe, remove = false) {
   renderOrderRows();
 }
 
+// ── Sync button on order cards ────────────────────────────────────────────────
+// Direct smartSync trigger from order cards (alongside Replenish, which does
+// the same thing — the two buttons exist for UX clarity).
+async function syncFromOrder(productId, btn) {
+  const p = S.products?.find(x => x.id === productId);
+  if (!p) { toast('Product not found in catalog', 'error'); return; }
+  if (!p.sourceUrl) { toast('No Amazon URL linked', 'error'); return; }
+  if (!p.ebaySku || p.ebaySku.startsWith('DS-RECOVERED') || p.ebaySku.startsWith('DS-EXISTING')) {
+    toast('Real eBay SKU needed — go to Settings → Recover SKUs first', 'warn', 5000); return;
+  }
+  if (!S.token) { toast('Connect eBay first', 'error'); return; }
+
+  const orig = btn.textContent;
+  btn.textContent = '⏳ Syncing…';
+  btn.disabled = true;
+  try {
+    const result = await smartSyncProduct(p);
+    if (!result) throw new Error('No response from smartSync');
+    if (result.skipped) {
+      let reason = 'unknown';
+      if (p.status !== 'listed') reason = `status is "${p.status}", not "listed"`;
+      else if (!p.sourceUrl) reason = 'no Amazon URL';
+      else if (p.ebaySku?.startsWith('DS-')) reason = 'placeholder SKU — recover real SKU first';
+      throw new Error(`Sync skipped: ${reason}`);
+    }
+    if (result.error) throw new Error(result.error);
+    if (result.needsRepush) throw new Error('eBay group was deleted — needs full re-push');
+    btn.textContent = '✅ Done!';
+    btn.style.background = '#10b981';
+    toast(`✅ Synced — fresh Amazon data pushed to eBay`, 'success', 5000);
+    addLog('sync', `Order-sync: ${p.title?.slice(0,50)}`, `smartSync from order card on ${p.ebaySku}`, { productId: p.id });
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; btn.style.background = '#3b82f6'; }, 4000);
+  } catch(e) {
+    btn.textContent = orig;
+    btn.disabled = false;
+    toast(`Sync failed: ${e.message}`, 'error', 7000);
+    addLog('error', `Order-sync failed: ${p.title?.slice(0,50)}`, e.message, { productId: p.id });
+  }
+}
+
 async function replenishFromOrder(productId, orderIdSafe, btn) {
   const p = S.products?.find(x => x.id === productId);
   if (!p) { toast('Product not found in catalog', 'error'); return; }
