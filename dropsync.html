@@ -8682,10 +8682,19 @@ async function replenishFromOrder(productId, orderIdSafe, btn) {
     // updated price/qty to eBay. Same behavior as the Sync button, just
     // triggered from the order card so user can refresh after a sale.
     const result = await smartSyncProduct(p);
-    if (!result || result.error) {
-      throw new Error(result?.error || 'Sync failed');
+    if (!result) throw new Error('No response from smartSync');
+    if (result.skipped) {
+      // smartSyncProduct skipped — tell the user why
+      let reason = 'unknown';
+      if (p.status !== 'listed') reason = `status is "${p.status}", not "listed"`;
+      else if (!p.sourceUrl) reason = 'no Amazon URL';
+      else if (p.ebaySku?.startsWith('DS-RECOVERED')) reason = 'SKU is recovered placeholder — needs real eBay SKU';
+      else if (p.ebaySku?.startsWith('DS-EXISTING')) reason = 'SKU is existing placeholder — needs real eBay SKU';
+      throw new Error(`Sync skipped: ${reason}`);
     }
-    btn.textContent = '✅ Replenished!';
+    if (result.error) throw new Error(result.error);
+    if (result.needsRepush) throw new Error('eBay group was deleted — needs full re-push from Drafts tab');
+    btn.textContent = '✅ Synced!';
     btn.style.color = '#10b981';
     toast(`✅ Replenished — listing synced with latest Amazon data`, 'success', 5000);
     addLog('sync', `Replenished: ${p.title?.slice(0,50)}`, `smartSync applied to ${p.ebaySku}`, { productId: p.id });
