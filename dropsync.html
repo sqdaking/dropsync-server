@@ -5064,10 +5064,10 @@ function _startRelayBackground() {
   // tab gets to them. With 5 concurrent claimers, each polling every 500ms,
   // we can sustain ~10 fetches/sec — enough to keep up with smartSync waves.
   if (!_relayJobPollTimer) {
-    const CONCURRENT_CLAIMERS = 5;
+    const CONCURRENT_CLAIMERS = 3;
     _relayJobPollTimer = [];
     for (let i = 0; i < CONCURRENT_CLAIMERS; i++) {
-      _relayJobPollTimer.push(setInterval(_relayClaimAndFetchJob, 500 + i * 100));
+      _relayJobPollTimer.push(setInterval(_relayClaimAndFetchJob, 500 + i * 150));
     }
   }
 }
