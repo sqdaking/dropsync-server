@@ -5058,15 +5058,27 @@ function _startRelayBackground() {
     _relaySendHeartbeat();
     _relayHeartbeatTimer = setInterval(_relaySendHeartbeat, 20000);
   }
-  // Poll for jobs every 500ms — fast enough to feel real-time, gentle on CPU
+  // PARALLEL JOB CLAIMING: run multiple concurrent claimers so we can fetch
+  // many Amazon pages at once instead of serially. Without this, server's
+  // job queue piles up to 50+ entries and most time out at 60s before this
+  // tab gets to them. With 5 concurrent claimers, each polling every 500ms,
+  // we can sustain ~10 fetches/sec — enough to keep up with smartSync waves.
   if (!_relayJobPollTimer) {
-    _relayJobPollTimer = setInterval(_relayClaimAndFetchJob, 500);
+    const CONCURRENT_CLAIMERS = 5;
+    _relayJobPollTimer = [];
+    for (let i = 0; i < CONCURRENT_CLAIMERS; i++) {
+      _relayJobPollTimer.push(setInterval(_relayClaimAndFetchJob, 500 + i * 100));
+    }
   }
 }
 
 function _stopRelayBackground() {
   if (_relayHeartbeatTimer) { clearInterval(_relayHeartbeatTimer); _relayHeartbeatTimer = null; }
-  if (_relayJobPollTimer)   { clearInterval(_relayJobPollTimer);   _relayJobPollTimer = null; }
+  if (_relayJobPollTimer) {
+    if (Array.isArray(_relayJobPollTimer)) _relayJobPollTimer.forEach(t => clearInterval(t));
+    else clearInterval(_relayJobPollTimer);
+    _relayJobPollTimer = null;
+  }
 }
 
 async function startBrowserRelay() {
