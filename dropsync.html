@@ -1138,20 +1138,36 @@ async function prefetchAsinPrices(mainHtml) {
   if (toFetch.length > 0) {
     console.log(`[prefetchAsin] ${toFetch.length} ASINs need individual fetch`);
     const isBlocked = html => !html || html.length < 5000 || /validateCaptcha|robot check/i.test(html);
-    for (let i = 0; i < toFetch.length; i += 4) {
-      await Promise.all(toFetch.slice(i, i + 4).map(async asin => {
+    const hasExt = await _extensionAvailable();
+    // EXTENSION-FIRST: when the Chrome extension is installed, fetch ASINs
+    // through it (residential IP). Higher concurrency since residential IP
+    // is not rate-limited like the codetabs/allorigins proxies were.
+    for (let i = 0; i < toFetch.length; i += (hasExt ? 6 : 4)) {
+      const batch = toFetch.slice(i, i + (hasExt ? 6 : 4));
+      await Promise.all(batch.map(async asin => {
         try {
-          const url = `https://www.amazon.com/dp/${asin}?th=1`;
+          const url = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
           let html = null;
-          for (const proxy of [
-            `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-            `https://corsproxy.io/?${encodeURIComponent(url)}`,
-          ]) {
+          // Try extension first
+          if (hasExt) {
             try {
-              const r = await fetch(proxy, { headers: { Accept: 'text/html' } });
-              const h = await r.text();
-              if (!isBlocked(h)) { html = h; break; }
+              const extHtml = await _fetchAmazonViaExtension(url);
+              if (extHtml && !isBlocked(extHtml)) html = extHtml;
             } catch(e) {}
+          }
+          // Fallback to proxies
+          if (!html) {
+            for (const proxy of [
+              `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+              `https://corsproxy.io/?${encodeURIComponent(url)}`,
+              `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+            ]) {
+              try {
+                const r = await fetch(proxy, { headers: { Accept: 'text/html' } });
+                const h = await r.text();
+                if (!isBlocked(h)) { html = h; break; }
+              } catch(e) {}
+            }
           }
           if (html) {
             const data = _browserExtractAsinData(html);
@@ -1159,7 +1175,10 @@ async function prefetchAsinPrices(mainHtml) {
           }
         } catch(e) {}
       }));
-      if (i + 4 < toFetch.length) await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000));
+      // Less delay when using extension (residential IP, no rate limit)
+      if (i + (hasExt ? 6 : 4) < toFetch.length) {
+        await new Promise(r => setTimeout(r, hasExt ? 200 : 1500 + Math.random() * 1000));
+      }
     }
   }
 
