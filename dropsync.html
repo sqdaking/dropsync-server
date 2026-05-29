@@ -908,9 +908,12 @@ window.addEventListener('message', (event) => {
 });
 
 async function _extensionAvailable() {
-  // Quick check: did the content script inject the marker on this page?
-  if (window.__dropsyncExtensionReady === true) {
-    if (_extReadyCached === null) console.log('[extension] detected v' + (window.__dropsyncExtensionVersion || '?'));
+  // Detect extension via DOM marker (CSP-safe — content script sets data attr
+  // on <html> regardless of page CSP, unlike window flags which require script
+  // injection that gets blocked by strict CSPs).
+  const v = document.documentElement.dataset.dropsyncExtension;
+  if (v) {
+    if (_extReadyCached !== true) console.log('[extension] detected v' + v);
     _extReadyCached = true;
     return true;
   }
@@ -919,7 +922,7 @@ async function _extensionAvailable() {
 }
 
 async function _fetchAmazonViaExtension(url) {
-  if (!window.__dropsyncExtensionReady) throw new Error('Extension not installed');
+  if (!document.documentElement.dataset.dropsyncExtension) throw new Error('Extension not installed');
   const reqId = 'ext_' + (++_extReqCounter) + '_' + Date.now();
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
