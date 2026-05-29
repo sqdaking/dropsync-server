@@ -2202,10 +2202,16 @@ async function bulkFetchDeals(dept) {
         try {
           const _bUrl = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
           const _bRes = await fetchAmazonInBrowser(_bUrl).catch(() => null);
-          if (_bRes === '__EXTENSION__') {
-            _clientAsinData = window._extensionScrapeResult || null;
-          } else if (typeof _bRes === 'string' && _bRes.length > 5000) {
+          if (typeof _bRes === 'string' && _bRes.length > 5000) {
             _pageHtml = _bRes;
+            // CRITICAL: prefetch child ASIN data so server doesn't need to fetch
+            // them itself (those fetches go through Railway IP and get blocked).
+            // The extension handles per-ASIN fetches with residential IP.
+            try {
+              _clientAsinData = await prefetchAsinPrices(_pageHtml);
+              const _n = Object.keys(_clientAsinData || {}).length;
+              if (_n > 0) console.log(`[bulk] ${asin}: prefetched ${_n} child ASIN prices`);
+            } catch(_pe) { console.warn(`[bulk] ${asin}: prefetch failed:`, _pe.message); }
           }
         } catch(_be) { /* fall through to server-only path */ }
 
@@ -7329,6 +7335,25 @@ async function smartSyncProduct(p) {
 
   try {
     const token = await ensureToken();
+
+    // ── PRE-FETCH AMAZON DATA VIA EXTENSION ──────────────────────────────────
+    // If the Chrome extension is installed, fetch all child ASINs ourselves
+    // (residential IP) and send the data to the server so it doesn't need to
+    // fetch them itself (Railway IP gets blocked). This is the single biggest
+    // reliability win — without this, server tries to fetch each ASIN and
+    // typically gets blocked, ending with $0 prices and qty=0 everywhere.
+    let _clientAsinData = null;
+    try {
+      if (await _extensionAvailable()) {
+        const parentHtml = await _fetchAmazonViaExtension(p.sourceUrl).catch(() => null);
+        if (parentHtml && parentHtml.length > 5000) {
+          _clientAsinData = await prefetchAsinPrices(parentHtml);
+          const _n = Object.keys(_clientAsinData || {}).length;
+          if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices via extension for ${p.ebaySku}`);
+        }
+      }
+    } catch(_pe) { console.warn(`[smartSync] prefetch failed:`, _pe.message); }
+
     const r = await fetch(`${S.serverUrl}/api/ebay?action=smartSync`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -7339,6 +7364,8 @@ async function smartSyncProduct(p) {
         markup:          p.markup != null ? p.markup : (S.markup || 23),
         handlingCost:    S.handlingCost || 2,
         quantity:        S.quantity || p.quantity || 1,
+        // Browser-prefetched ASIN data — server skips its own fetching when this is provided
+        clientAsinData:           _clientAsinData,
         // Variant SKU→ASIN/offerId maps so backend can find all offer IDs
         skuToAsin:                p.skuToAsin        || null,
         cachedOfferIds:           p.offerIdCache    || null,
