@@ -6951,7 +6951,8 @@ module.exports = async (req, res) => {
 
     if (action === 'smartSync') {
       const { access_token, ebaySku, ebayListingId, sourceUrl,
-              markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw } = body;
+              markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw,
+              clientAsinData } = body;
       if (!access_token || !ebaySku || !sourceUrl)
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
 
@@ -7047,7 +7048,29 @@ module.exports = async (req, res) => {
       const asinPrice   = {};
       const asinInStock = {};
       const _fetchFailed = new Set(); // ASINs where fetchPage returned null
-      if (uniqueAsins.length > 0) {
+
+      // ── FAST PATH: browser provided clientAsinData (residential IP) ───────
+      // When the Chrome extension prefetches ASIN data and ships it with the
+      // request, we use it directly and skip server-side fetching entirely.
+      // This is the difference between "Railway IP blocked on every ASIN" and
+      // "every variant gets accurate price + stock from real Amazon data".
+      const _hasClientData = clientAsinData && typeof clientAsinData === 'object'
+        && Object.keys(clientAsinData).length > 0;
+      if (_hasClientData) {
+        let _used = 0;
+        for (const [asin, data] of Object.entries(clientAsinData)) {
+          if (!asin || !/^[A-Z0-9]{10}$/.test(asin)) continue;
+          if (!data || typeof data !== 'object') continue;
+          const p = parseFloat(data.price);
+          if (!isFinite(p)) continue;
+          asinPrice[asin]   = p > 0 ? p : 0;
+          asinInStock[asin] = data.inStock !== false && p > 0;
+          if (p > 0) _used++;
+        }
+        console.log(`[smartSync] using browser clientAsinData: ${_used} ASINs priced (skipping server-side fetch)`);
+      }
+
+      if (uniqueAsins.length > 0 && !_hasClientData) {
         console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1}: ASINs ${asinOffset+1}–${asinOffset+uniqueAsins.length} of ${allUniqueAsins.length} ──`);
         const BATCH = 8;
         let fetchOk = 0, fetchFail = 0;
