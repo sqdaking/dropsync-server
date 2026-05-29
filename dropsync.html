@@ -886,46 +886,53 @@ function normaliseGroupSku(sku) {
 // Extension ID is discovered at runtime by trying to ping known/stored IDs.
 let _extId = localStorage.getItem('ds_ext_id') || null;
 
-async function _extensionAvailable() {
-  if (_extId) {
-    // Verify stored ID still works
-    try {
-      const r = await _extPing(_extId);
-      if (r) return true;
-    } catch(e) {}
-    _extId = null;
-    localStorage.removeItem('ds_ext_id');
+// ── DropSync Amazon Fetcher Extension integration ─────────────────────────────
+// Detects if the Chrome extension is installed (sets window.__dropsyncExtensionReady).
+// Sends Amazon fetch requests via window.postMessage; content script relays to
+// the extension's background worker, which fetches Amazon with the user's
+// residential IP and returns HTML.
+let _extReadyCached = null;
+let _extReqCounter = 0;
+const _extPendingResolvers = new Map();
+
+// One global listener for extension responses
+window.addEventListener('message', (event) => {
+  if (event.source !== window) return;
+  const msg = event.data;
+  if (!msg || msg.__dropsync !== 'fetchAmazonResponse' && msg.__dropsync !== 'pingResponse') return;
+  const resolver = _extPendingResolvers.get(msg.reqId);
+  if (resolver) {
+    _extPendingResolvers.delete(msg.reqId);
+    resolver(msg.response);
   }
+});
+
+async function _extensionAvailable() {
+  // Quick check: did the content script inject the marker on this page?
+  if (window.__dropsyncExtensionReady === true) {
+    if (_extReadyCached === null) console.log('[extension] detected v' + (window.__dropsyncExtensionVersion || '?'));
+    _extReadyCached = true;
+    return true;
+  }
+  _extReadyCached = false;
   return false;
 }
 
-function _extPing(extId) {
-  return new Promise((resolve) => {
-    try {
-      chrome.runtime.sendMessage(extId, { type: 'DROPSYNC_PING', id: 'ping' }, (r) => {
-        if (chrome.runtime.lastError) { resolve(false); return; }
-        resolve(r?.type === 'DROPSYNC_PONG');
-      });
-    } catch(e) { resolve(false); }
-    setTimeout(() => resolve(false), 1000);
-  });
-}
-
-async function _scrapeViaExtension(asin) {
-  if (!_extId) throw new Error('No extension ID');
+async function _fetchAmazonViaExtension(url) {
+  if (!window.__dropsyncExtensionReady) throw new Error('Extension not installed');
+  const reqId = 'ext_' + (++_extReqCounter) + '_' + Date.now();
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('extension timeout after 90s')), 90000);
-    try {
-      chrome.runtime.sendMessage(_extId,
-        { type: 'DROPSYNC_SCRAPE_REQUEST', requestId: 'sc_'+Date.now(), mainAsin: asin },
-        (result) => {
-          clearTimeout(timeout);
-          if (chrome.runtime.lastError) { reject(new Error(chrome.runtime.lastError.message)); return; }
-          if (result?.success) resolve(result);
-          else reject(new Error(result?.error || 'scrape failed'));
-        }
-      );
-    } catch(e) { clearTimeout(timeout); reject(e); }
+    const timeout = setTimeout(() => {
+      _extPendingResolvers.delete(reqId);
+      reject(new Error('extension fetch timeout after 30s'));
+    }, 30000);
+    _extPendingResolvers.set(reqId, (response) => {
+      clearTimeout(timeout);
+      if (!response) { reject(new Error('no response from extension')); return; }
+      if (!response.ok) { reject(new Error(response.error || `blocked or empty (status ${response.status})`)); return; }
+      resolve(response.html);
+    });
+    window.postMessage({ __dropsync: 'fetchAmazon', reqId, url }, '*');
   });
 }
 
@@ -934,18 +941,20 @@ async function fetchAmazonInBrowser(url) {
   const asin  = asinM?.[1];
   if (!asin) return null;
 
-  // Try extension first — it runs directly on Amazon with no CORS
+  // Try extension first — runs Amazon fetch with the user's residential IP,
+  // bypasses CORS entirely. New extension returns raw HTML directly so we don't
+  // need a separate prefetch step.
   const hasExt = await _extensionAvailable();
   if (hasExt) {
     try {
-      console.log('[browserFetch] using Chrome extension for', asin);
-      const result = await _scrapeViaExtension(asin);
-      // Extension returns full scraped data — store it for prefetchAsinPrices to use
-      window._extensionScrapeResult = result;
-      // Return a sentinel so caller knows extension handled it
-      return '__EXTENSION__';
+      const html = await _fetchAmazonViaExtension(url);
+      if (html && html.length > 1000) {
+        console.log(`[browserFetch] extension ok len=${html.length} for ${asin}`);
+        return html;
+      }
+      console.warn(`[browserFetch] extension returned empty/small (len=${html?.length||0}) — trying proxies`);
     } catch(e) {
-      console.warn('[browserFetch] extension failed:', e.message);
+      console.warn('[browserFetch] extension failed:', e.message, '— trying proxies');
     }
   }
 
