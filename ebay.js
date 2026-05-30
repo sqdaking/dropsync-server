@@ -60,38 +60,17 @@ async function fetchPage(url, ua, maxAttempts) {
   const _asinTag = asin ? ` [${asin}]` : '';
 
   // ── RELAY FIRST: try browser-fetched HTML before burning a direct attempt ──
-  // Only for amazon.com URLs (the only domain that gets blocked) and only
-  // when a browser tab is actively heartbeating. The relay enqueues the URL,
-  // a browser tab claims it, fetches Amazon from a residential IP, POSTs
-  // the HTML back. We await up to 60s. STRICT MODE: if relay is alive, we
-  // do NOT fall back to direct on failure — direct burns the Railway IP and
-  // makes blocks worse. Better to skip this cycle and retry next time.
+  // RELAY QUEUE DISABLED. The Chrome extension now handles all Amazon fetches
+  // directly from the user's residential IP via clientAsinData on each call.
+  // This server-side path is no longer used — keeping the check here so any
+  // legacy callers fail fast instead of timing out the queue.
   const _isAmazonUrl = /amazon\.(com|co\.uk|de|ca)/.test(url);
-  if (_relayHandle && _relayHandle.isAlive() && _isAmazonUrl) {
-    try {
-      const jobId = await _relayHandle.db.enqueueRelayFetch(url, asin);
-      const html = await _relayHandle.db.awaitRelayResult(jobId, 25000);
-      if (html && !isBlocked(html)) {
-        console.log(`[fetch] relay hit${_asinTag} (${html.length}b)`);
-        return html;
-      }
-      if (html) console.log(`[fetch] relay returned blocked HTML${_asinTag} — giving up (relay-only mode)`);
-      else      console.log(`[fetch] relay timeout${_asinTag} — giving up (relay-only mode)`);
-    } catch(e) {
-      console.warn(`[fetch] relay error${_asinTag}: ${e.message} — giving up (relay-only mode)`);
-    }
-    return ''; // relay tried but failed — do NOT fall through to direct
-  }
-  // Log WHY relay was skipped so we can debug "browser not fetching" reports.
   if (_isAmazonUrl) {
-    if (!_relayHandle) {
-      console.log(`[fetch] relay skipped${_asinTag} — no relay handle registered (server.js setup issue)`);
-    } else if (!_relayHandle.isAlive()) {
-      console.log(`[fetch] relay skipped${_asinTag} — isAlive=false (tab closed or heartbeat stale)`);
-    }
+    console.log(`[fetch] amazon URL${_asinTag} — extension expected to handle; server-side fetch disabled`);
+    return '';
   }
-  // Relay not alive → only NOW fall through to direct (last resort).
-  // When relay is up but a specific URL fails, we return above without trying direct.
+  // Non-Amazon URLs (e.g. category pages from dealsScrape) fall through to
+  // direct fetch below. Those don't get blocked the same way Amazon does.
 
   // Vary Accept-Language + platform per request to avoid uniform fingerprint
   const _langList = ['en-US,en;q=0.9', 'en-US,en;q=0.8,fr;q=0.5', 'en-GB,en;q=0.9', 'en-US,en;q=0.9,es;q=0.7', 'en-US,en;q=0.9,de;q=0.5'];
