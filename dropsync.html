@@ -1140,10 +1140,14 @@ async function prefetchAsinPrices(mainHtml) {
     const isBlocked = html => !html || html.length < 5000 || /validateCaptcha|robot check/i.test(html);
     const hasExt = await _extensionAvailable();
     // EXTENSION-FIRST: when the Chrome extension is installed, fetch ASINs
-    // through it (residential IP). Higher concurrency since residential IP
-    // is not rate-limited like the codetabs/allorigins proxies were.
-    for (let i = 0; i < toFetch.length; i += (hasExt ? 6 : 4)) {
-      const batch = toFetch.slice(i, i + (hasExt ? 6 : 4));
+    // through it (residential IP). Keep concurrency LOW — each fetch returns
+    // 2-3MB of HTML which Chrome buffers in memory. With high concurrency
+    // (we tried 6) you exhaust Chrome's network sockets (ERR_INSUFFICIENT_RESOURCES)
+    // which silently breaks heartbeats AND fetches AND smartSync. 2 concurrent
+    // with 500ms between batches gives Chrome time to release sockets.
+    const _conc = hasExt ? 2 : 3;
+    for (let i = 0; i < toFetch.length; i += _conc) {
+      const batch = toFetch.slice(i, i + _conc);
       await Promise.all(batch.map(async asin => {
         try {
           const url = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
@@ -1175,9 +1179,9 @@ async function prefetchAsinPrices(mainHtml) {
           }
         } catch(e) {}
       }));
-      // Less delay when using extension (residential IP, no rate limit)
-      if (i + (hasExt ? 6 : 4) < toFetch.length) {
-        await new Promise(r => setTimeout(r, hasExt ? 200 : 1500 + Math.random() * 1000));
+      // 500ms between batches to let Chrome release sockets/memory.
+      if (i + _conc < toFetch.length) {
+        await new Promise(r => setTimeout(r, hasExt ? 500 : 1500 + Math.random() * 1000));
       }
     }
   }
@@ -5058,69 +5062,25 @@ let _relayRunning = false;
 // Server expects polling on /api/relay/needs to claim Amazon-fetch jobs.
 // Without these two timers, server's isRelayAlive() returns false and every
 // fetch falls through to direct (which Amazon blocks on Railway IP).
+// ── REVISE ROTATION (extension handles fetching, no heartbeat/queue needed) ──
+// We used to run a heartbeat + job poller here so the server could push Amazon
+// fetches through the browser via a Postgres queue. Now the Chrome extension
+// fetches Amazon directly, browser prefetches all ASIN data, and ships it as
+// clientAsinData on each smartSync call. The relay_jobs queue is no longer
+// used — heartbeat/poller were also exhausting Chrome sockets and filling the
+// Postgres volume. DISABLED.
 let _relayHeartbeatTimer = null;
 let _relayJobPollTimer = null;
 
-async function _relaySendHeartbeat() {
-  if (!S.serverUrl) return;
-  try {
-    await fetch(`${S.serverUrl}/api/relay/heartbeat`, { method: 'POST' });
-  } catch(_) {} // silent — next beat will retry
-}
-
-async function _relayClaimAndFetchJob() {
-  if (!S.serverUrl) return;
-  try {
-    const r = await fetch(`${S.serverUrl}/api/relay/needs`);
-    if (!r.ok) return;
-    const job = await r.json();
-    if (job.empty || !job.id) return;
-    // Got a job — fetch Amazon using existing proxy-aware function which
-    // bounces through corsproxy/codetabs/server-proxy since direct fetch
-    // from this origin will fail CORS.
-    let html = '';
-    let error = '';
-    try {
-      html = await fetchAmazonInBrowser(job.url);
-      if (!html || html.length < 1000) {
-        error = 'empty or too small (probably blocked)';
-        html = '';
-      }
-    } catch(e) {
-      error = e.message || 'fetch failed';
-    }
-    // POST result back
-    try {
-      await fetch(`${S.serverUrl}/api/relay/submit`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: job.id, html, error }),
-      });
-    } catch(_) {}
-  } catch(_) {}
-}
+async function _relaySendHeartbeat() { /* disabled — extension replaces relay */ }
+async function _relayClaimAndFetchJob() { /* disabled — extension replaces relay */ }
 
 function _startRelayBackground() {
-  // Heartbeat every 20s (well under the 60s server timeout)
-  if (!_relayHeartbeatTimer) {
-    _relaySendHeartbeat();
-    _relayHeartbeatTimer = setInterval(_relaySendHeartbeat, 20000);
-  }
-  // PARALLEL JOB CLAIMING: run multiple concurrent claimers so we can fetch
-  // many Amazon pages at once instead of serially. Without this, server's
-  // job queue piles up to 50+ entries and most time out at 60s before this
-  // tab gets to them. With 5 concurrent claimers, each polling every 500ms,
-  // we can sustain ~10 fetches/sec — enough to keep up with smartSync waves.
-  if (!_relayJobPollTimer) {
-    const CONCURRENT_CLAIMERS = 3;
-    _relayJobPollTimer = [];
-    for (let i = 0; i < CONCURRENT_CLAIMERS; i++) {
-      _relayJobPollTimer.push(setInterval(_relayClaimAndFetchJob, 500 + i * 150));
-    }
-  }
+  // No-op. Extension fetches Amazon directly; no queue/heartbeat needed.
 }
 
 function _stopRelayBackground() {
+  // No-op. Clean up any stragglers if they exist.
   if (_relayHeartbeatTimer) { clearInterval(_relayHeartbeatTimer); _relayHeartbeatTimer = null; }
   if (_relayJobPollTimer) {
     if (Array.isArray(_relayJobPollTimer)) _relayJobPollTimer.forEach(t => clearInterval(t));
@@ -5131,8 +5091,7 @@ function _stopRelayBackground() {
 
 async function startBrowserRelay() {
   if (_relayTimer) return; // already running
-  console.log('[relay] Browser relay started — heartbeat + job poller active');
-  _startRelayBackground(); // begin heartbeat + job claiming
+  console.log('[relay] revise rotation started (extension handles Amazon fetches)');
   _renderRelayStatus();
   _relayTick();
 }
