@@ -35,8 +35,16 @@ if (_proxyHost && _proxyPort && _proxyUser && _proxyPass) {
   console.log('[proxy] residential proxy DISABLED (no PROXY_HOST/PORT/USER/PASS env vars)');
 }
 
+// Per-call proxy bypass flag — checked by _withProxy. Set to true by import
+// paths so they fall back to Railway direct IP instead of burning paid proxy
+// bandwidth.
+const _bypassProxyDuringCall = { value: false };
+
 // Helper: fetch options with proxy agent attached for Amazon URLs
 function _withProxy(opts, url) {
+  // Per-call bypass: import paths (bulk + single) set this so they don't burn
+  // residential proxy bandwidth. Fallback is Railway direct IP.
+  if (_bypassProxyDuringCall.value) return opts;
   if (_proxyEnabled && /amazon\.(com|co\.uk|de|ca)/.test(url || '')) {
     return { ...opts, agent: _proxyAgent };
   }
@@ -1362,7 +1370,20 @@ function extractVariantImages(h) {
   return imgSet;
 }
 
-async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinData = null, primeOnly = false) {
+async function scrapeAmazonProduct(inputUrl, preloadedHtml = null, clientAsinData = null, primeOnly = false, bypassProxy = false) {
+  // bypassProxy=true means any server-side fetchPage calls inside this scrape
+  // skip the residential proxy. Used by bulk import / single import paths so
+  // those don't burn paid proxy bandwidth — the browser is supposed to provide
+  // clientHtml for those, and any missing fallbacks use Railway's direct IP.
+  if (bypassProxy) _bypassProxyDuringCall.value = true;
+  try {
+    return await _scrapeAmazonProductImpl(inputUrl, preloadedHtml, clientAsinData, primeOnly);
+  } finally {
+    _bypassProxyDuringCall.value = false;
+  }
+}
+
+async function _scrapeAmazonProductImpl(inputUrl, preloadedHtml = null, clientAsinData = null, primeOnly = false) {
   let url = (inputUrl || '').trim();
   if (!url) return null;
 
@@ -6401,8 +6422,11 @@ module.exports = async (req, res) => {
       if (clientHtml) console.log(`[scrape] using browser HTML (${clientHtml.length} chars)`);
       if (primeOnly)  console.log(`[scrape] primeOnly mode ON — skipping non-Prime ASINs`);
 
+      // bypassProxy=true: import paths skip residential proxy. Browser fetched
+      // HTML is used when available; any server-side fallbacks use Railway IP
+      // (which works for first-time imports — proxy is reserved for smartSync).
       try {
-        const product = await scrapeAmazonProduct(url, clientHtml, clientAsinData, primeOnly);
+        const product = await scrapeAmazonProduct(url, clientHtml, clientAsinData, primeOnly, true);
         if (!product || !product.title) {
           return res.json({ success: false, error: 'Amazon blocked the request (bot detection). Wait 30 seconds and try again, or paste the URL directly.' });
         }
