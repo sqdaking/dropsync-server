@@ -43,6 +43,78 @@ function _withProxy(opts, url) {
   return opts;
 }
 
+// ── 7-DAY ASIN PRICE CACHE ────────────────────────────────────────────────
+// Caches Amazon scrape data per ASIN in Postgres for 7 days. Cuts residential
+// proxy bandwidth ~90% since most ASINs don't change daily. Cache miss → fetch
+// via proxy + store. Cache hit < 7 days old → return cached.
+// Force-refresh available via `bypassCache: true` in request body.
+const { Pool } = require('pg');
+let _cachePool = null;
+let _cacheReady = false;
+let _cacheStats = { hits: 0, misses: 0, errors: 0, stores: 0 };
+async function _initCache() {
+  if (_cacheReady || !process.env.DATABASE_URL) return;
+  try {
+    _cachePool = new Pool({ connectionString: process.env.DATABASE_URL, max: 4, idleTimeoutMillis: 30000 });
+    await _cachePool.query(`
+      CREATE TABLE IF NOT EXISTS asin_cache (
+        asin TEXT PRIMARY KEY,
+        data JSONB NOT NULL,
+        fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_asin_cache_fetched_at ON asin_cache(fetched_at);
+    `);
+    _cacheReady = true;
+    console.log('[cache] ASIN cache table ready (7-day TTL)');
+  } catch(e) {
+    console.warn('[cache] init failed:', e.message);
+    _cacheReady = false;
+  }
+}
+_initCache(); // fire and forget at startup
+
+async function _asinCacheGet(asin) {
+  if (!_cacheReady || !asin) return null;
+  try {
+    const r = await _cachePool.query(
+      `SELECT data, EXTRACT(EPOCH FROM (NOW() - fetched_at))/3600 AS age_h
+         FROM asin_cache WHERE asin = $1 AND fetched_at > NOW() - INTERVAL '7 days'`,
+      [asin]
+    );
+    if (r.rows.length === 0) { _cacheStats.misses++; return null; }
+    _cacheStats.hits++;
+    return { ...r.rows[0].data, _cacheAgeHours: parseFloat(r.rows[0].age_h) };
+  } catch(e) {
+    _cacheStats.errors++;
+    return null;
+  }
+}
+
+async function _asinCacheSet(asin, data) {
+  if (!_cacheReady || !asin || !data) return;
+  try {
+    await _cachePool.query(
+      `INSERT INTO asin_cache (asin, data, fetched_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (asin) DO UPDATE SET data = EXCLUDED.data, fetched_at = NOW()`,
+      [asin, JSON.stringify(data)]
+    );
+    _cacheStats.stores++;
+  } catch(e) {
+    _cacheStats.errors++;
+  }
+}
+
+// Periodic cleanup of expired cache entries (runs once on first request)
+async function _asinCachePurge() {
+  if (!_cacheReady) return;
+  try {
+    const r = await _cachePool.query(`DELETE FROM asin_cache WHERE fetched_at < NOW() - INTERVAL '7 days'`);
+    if (r.rowCount > 0) console.log(`[cache] purged ${r.rowCount} expired entries`);
+  } catch(e) {}
+}
+setTimeout(_asinCachePurge, 30000); // 30s after boot
+setInterval(_asinCachePurge, 6 * 3600 * 1000); // every 6h
+
 // DropSync AI Agent — Amazon → eBay Dropshipping Backend
 // Clean architecture: per-ASIN prices+images, AI category detection, auto policies
 
@@ -6140,6 +6212,40 @@ module.exports = async (req, res) => {
       }
     }
 
+    // ── CACHE MANAGEMENT ──────────────────────────────────────────────────
+    // Stats: /api/ebay?action=cache_stats
+    if (action === 'cache_stats') {
+      if (!_cacheReady) return res.json({ ready: false });
+      try {
+        const r = await _cachePool.query(`
+          SELECT COUNT(*) AS total,
+                 COUNT(*) FILTER (WHERE fetched_at > NOW() - INTERVAL '7 days') AS fresh,
+                 COUNT(*) FILTER (WHERE fetched_at > NOW() - INTERVAL '1 day') AS last_24h,
+                 pg_size_pretty(pg_total_relation_size('asin_cache')) AS size
+            FROM asin_cache
+        `);
+        return res.json({ ready: true, stats: _cacheStats, ...r.rows[0] });
+      } catch(e) { return res.status(500).json({ error: e.message }); }
+    }
+    // Clear cache for specific ASINs: POST { asins: ['B0XXX', 'B0YYY'] }
+    if (action === 'cache_clear') {
+      if (!_cacheReady) return res.json({ ready: false });
+      const asins = body.asins;
+      if (!Array.isArray(asins) || asins.length === 0) {
+        if (body.all === true) {
+          try {
+            const r = await _cachePool.query(`DELETE FROM asin_cache`);
+            return res.json({ deleted: r.rowCount, all: true });
+          } catch(e) { return res.status(500).json({ error: e.message }); }
+        }
+        return res.status(400).json({ error: 'Provide asins:[] or all:true' });
+      }
+      try {
+        const r = await _cachePool.query(`DELETE FROM asin_cache WHERE asin = ANY($1::text[])`, [asins]);
+        return res.json({ deleted: r.rowCount, asins });
+      } catch(e) { return res.status(500).json({ error: e.message }); }
+    }
+
     if (action === 'auth') {
       const E = getEbayUrls(); // production only
       const REDIRECT = E.REDIRECT || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
@@ -7126,11 +7232,37 @@ module.exports = async (req, res) => {
       }
 
       if (uniqueAsins.length > 0 && !_hasClientData) {
-        console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1}: ASINs ${asinOffset+1}–${asinOffset+uniqueAsins.length} of ${allUniqueAsins.length} ──`);
+        // Optional cache bypass for force-refresh requests
+        const bypassCache = body.bypassCache === true;
+        // First pass: check 7-day cache for each ASIN before deciding what to fetch
+        const toFetch = [];
+        let cacheHits = 0;
+        if (!bypassCache) {
+          await Promise.all(uniqueAsins.map(async asin => {
+            const cached = await _asinCacheGet(asin);
+            if (cached && typeof cached.price === 'number') {
+              asinPrice[asin]   = cached.price;
+              asinInStock[asin] = cached.inStock !== false && cached.price > 0;
+              cacheHits++;
+            } else {
+              toFetch.push(asin);
+            }
+          }));
+          if (cacheHits > 0) console.log(`[smartSync] cache hit ${cacheHits}/${uniqueAsins.length} ASINs (saved ${cacheHits * 1.5}MB proxy bandwidth)`);
+        } else {
+          toFetch.push(...uniqueAsins);
+        }
+        const _asinsToFetch = toFetch.length > 0 ? toFetch : [];
+
+        if (_asinsToFetch.length === 0) {
+          console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1}: all ${uniqueAsins.length} ASINs from cache, skipping proxy ──`);
+        } else {
+          console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1}: fetching ${_asinsToFetch.length} ASINs via proxy (${cacheHits} from cache) ──`);
+        }
         const BATCH = 8;
         let fetchOk = 0, fetchFail = 0;
-        for (let i = 0; i < uniqueAsins.length; i += BATCH) {
-          await Promise.all(uniqueAsins.slice(i, i + BATCH).map(async (asin, bi) => {
+        for (let i = 0; i < _asinsToFetch.length; i += BATCH) {
+          await Promise.all(_asinsToFetch.slice(i, i + BATCH).map(async (asin, bi) => {
             await sleep(bi * 100);
             // 2 attempts max — blocked ASINs are set qty=0 this cycle (Out-of-Stock
             // Control hides the variant) and re-tried normally on the next sync.
@@ -7151,13 +7283,19 @@ module.exports = async (req, res) => {
             const _total = price + (shipping || 0);
             asinPrice[asin]   = _total;
             asinInStock[asin] = !oos && price > 0;
+            // Cache the result for 7 days (only if we got real data — never cache failures)
+            if (price > 0) {
+              _asinCacheSet(asin, { price: _total, shipping, inStock: !oos && price > 0 });
+            }
             if (shipping > 0) console.log(`[smartSync] ${asin} → $${price} +$${shipping} ship = $${_total.toFixed(2)} inStock=${!oos}`);
             else               console.log(`[smartSync] ${asin} → $${price} inStock=${!oos}`);
             fetchOk++;
           }));
-          if (i + BATCH < uniqueAsins.length) await sleep(1000);
+          if (i + BATCH < _asinsToFetch.length) await sleep(1000);
         }
-        console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1} done: ${fetchOk} ok, ${fetchFail} blocked (qty=0 this cycle) ──`);
+        if (_asinsToFetch.length > 0) {
+          console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1} done: ${fetchOk} ok, ${fetchFail} blocked, cache ${cacheHits} hits ──`);
+        }
       }
 
       // (removed _bestCost / _bestEbay sibling-price fallback — per user rule
