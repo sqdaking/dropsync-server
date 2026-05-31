@@ -5192,6 +5192,25 @@ async function _relayTick() {
     return;
   }
 
+  // ── ACTIVITY FILTER: only sync listings with recent eBay activity ───────────
+  // Big bandwidth saver. Listings that haven't been viewed or sold in 30 days
+  // probably don't need their prices refreshed — they're dead weight. Skip them
+  // and only spend proxy bandwidth on listings buyers actually look at.
+  // Toggle via S.activityFilter (default ON, set to false in Settings to disable).
+  if (S.activityFilter !== false) {
+    const _MS_30D = 30 * 24 * 60 * 60 * 1000;
+    const _MS_60D = 60 * 24 * 60 * 60 * 1000;
+    const _hasRecentSale = p.lastSoldAt && (Date.now() - new Date(p.lastSoldAt).getTime() < _MS_60D);
+    const _hasRecentView = p.lastViewedAt && (Date.now() - new Date(p.lastViewedAt).getTime() < _MS_30D);
+    const _isNew = !p.lastSyncedAt || (Date.now() - new Date(p.lastSyncedAt).getTime() < 7*24*60*60*1000); // new listings: sync regardless
+    if (!_hasRecentSale && !_hasRecentView && !_isNew) {
+      console.log(`[relay] [${_relayCursor}/${listed.length}] skip "${(p.title||'').slice(0,40)}" — no recent eBay activity (saves proxy MB)`);
+      _relayRunning = false;
+      _relayTimer = setTimeout(_relayTick, 100);
+      return;
+    }
+  }
+
   try {
     console.log(`[relay] Revising [${_relayCursor}/${listed.length}]: "${(p.title||'').slice(0,45)}"`);
     await smartSyncProduct(p);
