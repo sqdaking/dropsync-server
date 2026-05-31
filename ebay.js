@@ -1,8 +1,46 @@
 // DropSync eBay handler — runs on Railway Express server
-// Polyfill fetch with node-fetch if global fetch is not available (Node < 18)
-if (typeof fetch === 'undefined') {
-  const _nf = require('node-fetch');
-  global.fetch = _nf.default || _nf;
+// We force node-fetch (v2) instead of Node's built-in fetch because the
+// built-in (Undici-based) fetch IGNORES the `agent` option silently, which
+// means our residential proxy would be bypassed. node-fetch@2 respects agent.
+const _nodeFetch = require('node-fetch');
+const _nfFn = _nodeFetch.default || _nodeFetch;
+// Replace global fetch with node-fetch so existing code paths use it transparently
+global.fetch = _nfFn;
+
+// ── RESIDENTIAL PROXY (DataImpulse / Smartproxy / generic HTTPS proxy) ──────
+// Routes all Amazon fetches through a residential IP so Amazon doesn't see
+// Railway's datacenter IP. Set these env vars in Railway:
+//   PROXY_HOST = gw.dataimpulse.com
+//   PROXY_PORT = 823
+//   PROXY_USER = <your login>
+//   PROXY_PASS = <your password>
+// If any are missing, falls back to direct fetch (Railway IP, often blocked).
+let _proxyAgent = null;
+let _proxyEnabled = false;
+const _proxyHost = process.env.PROXY_HOST || '';
+const _proxyPort = process.env.PROXY_PORT || '';
+const _proxyUser = process.env.PROXY_USER || '';
+const _proxyPass = process.env.PROXY_PASS || '';
+if (_proxyHost && _proxyPort && _proxyUser && _proxyPass) {
+  try {
+    const { HttpsProxyAgent } = require('https-proxy-agent');
+    const _auth = `${encodeURIComponent(_proxyUser)}:${encodeURIComponent(_proxyPass)}`;
+    _proxyAgent = new HttpsProxyAgent(`http://${_auth}@${_proxyHost}:${_proxyPort}`);
+    _proxyEnabled = true;
+    console.log(`[proxy] residential proxy ENABLED via ${_proxyHost}:${_proxyPort}`);
+  } catch(e) {
+    console.warn(`[proxy] could not initialize HttpsProxyAgent: ${e.message} — install https-proxy-agent in package.json`);
+  }
+} else {
+  console.log('[proxy] residential proxy DISABLED (no PROXY_HOST/PORT/USER/PASS env vars)');
+}
+
+// Helper: fetch options with proxy agent attached for Amazon URLs
+function _withProxy(opts, url) {
+  if (_proxyEnabled && /amazon\.(com|co\.uk|de|ca)/.test(url || '')) {
+    return { ...opts, agent: _proxyAgent };
+  }
+  return opts;
 }
 
 // DropSync AI Agent — Amazon → eBay Dropshipping Backend
@@ -60,17 +98,9 @@ async function fetchPage(url, ua, maxAttempts) {
   const _asinTag = asin ? ` [${asin}]` : '';
 
   // ── RELAY FIRST: try browser-fetched HTML before burning a direct attempt ──
-  // RELAY QUEUE DISABLED. The Chrome extension now handles all Amazon fetches
-  // directly from the user's residential IP via clientAsinData on each call.
-  // This server-side path is no longer used — keeping the check here so any
-  // legacy callers fail fast instead of timing out the queue.
-  const _isAmazonUrl = /amazon\.(com|co\.uk|de|ca)/.test(url);
-  if (_isAmazonUrl) {
-    console.log(`[fetch] amazon URL${_asinTag} — extension expected to handle; server-side fetch disabled`);
-    return '';
-  }
-  // Non-Amazon URLs (e.g. category pages from dealsScrape) fall through to
-  // direct fetch below. Those don't get blocked the same way Amazon does.
+  // Extension/relay queue removed — fall through to direct fetch for all URLs.
+  // Direct fetch will get blocked some of the time (Railway IP) but it's the
+  // only path available now. Amazon URLs proceed below same as any other.
 
   // Vary Accept-Language + platform per request to avoid uniform fingerprint
   const _langList = ['en-US,en;q=0.9', 'en-US,en;q=0.8,fr;q=0.5', 'en-GB,en;q=0.9', 'en-US,en;q=0.9,es;q=0.7', 'en-US,en;q=0.9,de;q=0.5'];
@@ -148,10 +178,10 @@ async function fetchPage(url, ua, maxAttempts) {
       const extra = i === 3 ? { 'Cookie': 'session-id=000-0000000-0000000; i18n-prefs=USD; lc-main=en_US' }
                   : i === 4 ? { 'Cookie': 'i18n-prefs=USD', 'X-Forwarded-For': '' }
                   : undefined;
-      const r = await fetch(tryUrl, {
+      const r = await fetch(tryUrl, _withProxy({
         headers: makeHeaders(UA_LIST[uaIdx|0], referer, extra),
         redirect: 'follow',
-      });
+      }, tryUrl));
       const html = await r.text();
       if (!isBlocked(html)) {
         // ok fetch logged by caller's batch summary — suppress here to save log lines
