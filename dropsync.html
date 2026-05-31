@@ -2211,12 +2211,18 @@ async function bulkFetchDeals(dept) {
         //      its data is in window._extensionScrapeResult — send as clientAsinData
         //   2. Returns an HTML string → send as pageHtml so server parses it
         //   3. Returns null → fall back to server fetching Amazon itself (current behavior)
-        // Browser-side prefetch DISABLED: server now uses residential proxy
-        // (DataImpulse) to fetch Amazon directly. Sending null pageHtml +
-        // null clientAsinData tells server to fetch everything itself, which
-        // it can now do reliably through the proxy.
-        const _pageHtml = null;
-        const _clientAsinData = null;
+        // BULK IMPORT (first publish): browser fetches Amazon directly (user's
+        // own IP via codetabs/corsproxy). Server-side residential proxy is
+        // reserved for smartSync revises only — bulk import doesn't need it.
+        let _pageHtml = null;
+        let _clientAsinData = null;
+        try {
+          const _bUrl = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
+          const _bRes = await fetchAmazonInBrowser(_bUrl).catch(() => null);
+          if (typeof _bRes === 'string' && _bRes.length > 5000) {
+            _pageHtml = _bRes;
+          }
+        } catch(_be) { /* fall through to server-only path */ }
 
         const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
           method: 'POST', headers: {'Content-Type':'application/json'},
