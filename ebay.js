@@ -6094,6 +6094,52 @@ module.exports = async (req, res) => {
   try {
 
     // ── AUTH ──────────────────────────────────────────────────────────────────
+    // ── DIAGNOSTIC: fetch one Amazon page via proxy and inspect HTML ─────
+    // Visit: /api/ebay?action=diag_proxy&asin=B0BYS5BL13
+    if (action === 'diag_proxy') {
+      const asin = req.query.asin || req.body.asin || 'B0BYS5BL13';
+      const url = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
+      try {
+        const r = await fetch(url, _withProxy({
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+          redirect: 'follow',
+        }, url));
+        const html = await r.text();
+        const markers = {
+          'a-price-whole': /class="a-price-whole">([^<]+)/.exec(html)?.[0]?.slice(0, 80),
+          'priceblock_ourprice': /id="priceblock_ourprice"[^>]*>([^<]+)/.exec(html)?.[0]?.slice(0, 80),
+          'corePriceDisplay': /id="corePriceDisplay_desktop_feature_div"/.test(html),
+          'apex_desktop': /id="apex_desktop"/.test(html),
+          'dollar_price': /\$[0-9]{1,4}\.[0-9]{2}/.exec(html)?.[0],
+          'a-offscreen': /class="a-offscreen">\$([0-9.]+)/.exec(html)?.[0]?.slice(0, 60),
+          'priceToPay': /class="priceToPay/.test(html),
+        };
+        const blockSignals = {
+          'captcha': /captcha/i.test(html.slice(0, 5000)),
+          'robot_check': /robot check/i.test(html.slice(0, 5000)),
+          'sorry_page': /Sorry, we just need to make sure/i.test(html),
+          'title_robot': /<title>Robot Check</i.test(html),
+          'access_denied': /Access Denied/i.test(html.slice(0, 5000)),
+        };
+        return res.json({
+          asin,
+          status: r.status,
+          length: html.length,
+          proxyEnabled: _proxyEnabled,
+          markers,
+          blockSignals,
+          htmlStart: html.slice(0, 500),
+          htmlSample50k: html.slice(50000, 50500),
+        });
+      } catch(e) {
+        return res.status(500).json({ error: e.message, stack: e.stack });
+      }
+    }
+
     if (action === 'auth') {
       const E = getEbayUrls(); // production only
       const REDIRECT = E.REDIRECT || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
