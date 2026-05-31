@@ -151,7 +151,12 @@ const randUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 let _relayHandle = null; // { isAlive: () => bool, db: { enqueueRelayFetch, awaitRelayResult } }
 function setRelayHandle(h) { _relayHandle = h; }
 
-async function fetchPage(url, ua, maxAttempts) {
+async function fetchPage(url, ua, maxAttempts, opts) {
+  // opts.mobile=true → use Amazon's mobile pages (~300KB vs 1.5MB desktop).
+  // Same prices/availability, much lighter HTML. Used by smartSync to slash
+  // residential proxy bandwidth. Has slightly different markup so callers
+  // need extractors that handle both desktop + mobile selectors.
+  const mobile = opts && opts.mobile === true;
   const isBlocked = (html) => {
     if (!html || html.length < 1000) return true;
     if (html.includes('Type the characters')) return true;
@@ -186,13 +191,20 @@ async function fetchPage(url, ua, maxAttempts) {
 
   // Serverless CDN IPs rotate per invocation (residential-grade).
   // Use varied UA + headers + URL forms + delays to maximize hit rate.
-  const urlVariants = asin ? [
+  const urlVariants = asin ? (mobile ? [
+    // Mobile pages: ~300KB vs ~1.5MB desktop. Same data.
+    `https://www.amazon.com/gp/aw/d/${asin}/?th=1`,
+    `https://www.amazon.com/dp/${asin}/?aod=1&th=1`,
+    `https://www.amazon.com/gp/aw/d/${asin}`,
+    `https://www.amazon.com/dp/${asin}?th=1&psc=1`,
+    url,
+  ] : [
     `https://www.amazon.com/dp/${asin}?th=1&psc=1`,
     `https://www.amazon.com/dp/${asin}`,
     `https://www.amazon.com/dp/${asin}?psc=1`,
     `https://www.amazon.com/dp/${asin}?th=1`,
     url,
-  ] : [url];
+  ]) : [url];
 
   const referers = [
     null,
@@ -202,7 +214,33 @@ async function fetchPage(url, ua, maxAttempts) {
     'https://www.bing.com/search?q=amazon',
   ];
 
-  const makeHeaders = (agent, referer, extra) => ({
+  // Mobile UAs (used when opts.mobile=true) — Safari on iOS / Chrome on Android.
+  // Amazon serves true mobile HTML for these. ~300KB vs 1.5MB desktop pages.
+  const MOBILE_UAS = [
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; SM-S918U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36',
+  ];
+
+  const makeHeaders = (agent, referer, extra) => {
+    if (mobile) {
+      const mua = MOBILE_UAS[Math.floor(Math.random() * MOBILE_UAS.length)];
+      return {
+        'User-Agent': mua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': _lang,
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Cache-Control': 'no-cache',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': referer ? 'cross-site' : 'none',
+        'Upgrade-Insecure-Requests': '1',
+        ...(referer ? { 'Referer': referer } : {}),
+        ...(extra || {}),
+      };
+    }
+    return {
     'User-Agent': agent || ua || randUA(),
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': _lang,
@@ -224,7 +262,8 @@ async function fetchPage(url, ua, maxAttempts) {
     'Device-Memory': ['4', '8', '16'][Math.floor(Math.random() * 3)],
     ...(referer ? { 'Referer': referer } : {}),
     ...(extra || {}),
-  });
+  };
+  };
 
   // ── SERVER DIRECT FETCH: upfront delay only ─────────────────────────────────
   // Tweakable knobs:
@@ -7144,7 +7183,8 @@ module.exports = async (req, res) => {
       // successful scrape, so we use those to build the ASIN list and proceed
       // to per-ASIN fetching. Only genuinely-unreachable ASINs end up as
       // force-OOS via the fetchFailed path in STEP 2.
-      const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
+      // Use mobile pages (~300KB vs ~1.5MB desktop) for residential proxy bandwidth savings.
+      const html = await fetchPage(sourceUrl, randUA(), undefined, { mobile: true }).catch(() => null);
       const _parentHtmlOk = !!(html && html.length >= 5000);
 
       // Extract unique ASINs from the parent page's dimensionToAsinMap.
@@ -7187,6 +7227,21 @@ module.exports = async (req, res) => {
       // load on Amazon (less rate-limit triggering) and faster cycle turnaround,
       // at the cost of more cycles for very large listings (1000+ variations).
       // Frontend stores asinOffset, sends it each cycle, resets when all done.
+      // ── VARIANT CAP per cycle ─────────────────────────────────────────────
+      // Big listings (50-500 variants) burn massive proxy bandwidth if every
+      // variant gets fetched every cycle. Hard cap to MAX_VARIANTS_PER_SYNC
+      // most-likely-to-sell variants (or all of them if listing is small).
+      // The cache handles longer-term coverage — variants not fetched this
+      // cycle keep their last cached price (up to 7 days old).
+      const MAX_VARIANTS_PER_SYNC = parseInt(process.env.MAX_VARIANTS_PER_SYNC) || 15;
+      if (allUniqueAsins.length > MAX_VARIANTS_PER_SYNC) {
+        const _before = allUniqueAsins.length;
+        // Keep the first N — these correspond to twister's natural variant order,
+        // which roughly matches Amazon's "most-popular variants first".
+        allUniqueAsins = allUniqueAsins.slice(0, MAX_VARIANTS_PER_SYNC);
+        console.log(`[smartSync] variant cap: ${_before} ASINs → ${allUniqueAsins.length} (set MAX_VARIANTS_PER_SYNC env var to change)`);
+      }
+
       const ASIN_BATCH_SIZE = 50;
       const asinOffset = parseInt(body.asinOffset || 0);
       const _slice = allUniqueAsins.slice(asinOffset, asinOffset + ASIN_BATCH_SIZE);
@@ -7267,7 +7322,7 @@ module.exports = async (req, res) => {
             // 2 attempts max — blocked ASINs are set qty=0 this cycle (Out-of-Stock
             // Control hides the variant) and re-tried normally on the next sync.
             // This is NOT a real OOS event: no markedOos flag, no OOS webhook.
-            const h = await fetchPage(`https://www.amazon.com/dp/${asin}?th=1&psc=1`, randUA(), 2);
+            const h = await fetchPage(`https://www.amazon.com/dp/${asin}?th=1&psc=1`, randUA(), 2, { mobile: true });
             if (!h) {
               asinPrice[asin]   = 0;     // ← explicit 0 so _haveFreshPrice sees it
               asinInStock[asin] = false;
