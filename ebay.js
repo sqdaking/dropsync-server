@@ -32,11 +32,20 @@ if (ALI_ENABLED) console.log(`[ali] AliExpress integration ENABLED (App Key: ${A
 else console.log('[ali] AliExpress integration DISABLED (missing ALIEXPRESS_APP_KEY/SECRET env vars)');
 
 // Build HMAC-SHA256 signature for AliExpress signed-API endpoints.
-// AliExpress requires sorted-param-concat then HMAC with App Secret as key.
+// AliExpress has TWO signing styles:
+//   1) System API (gateway /sync): sorted params concat → HMAC
+//   2) REST API (/rest/auth/token/*): "{path}" + sorted params concat → HMAC
+// The REST style is needed for token create/refresh; the System style is used
+// for everything else once we have an access_token.
 const crypto = require('crypto');
 function _aliSign(params, secret) {
   const sorted = Object.keys(params).sort().filter(k => params[k] !== '' && params[k] != null);
   const concat = sorted.map(k => `${k}${params[k]}`).join('');
+  return crypto.createHmac('sha256', secret).update(concat).digest('hex').toUpperCase();
+}
+function _aliSignRest(path, params, secret) {
+  const sorted = Object.keys(params).sort().filter(k => params[k] !== '' && params[k] != null);
+  const concat = path + sorted.map(k => `${k}${params[k]}`).join('');
   return crypto.createHmac('sha256', secret).update(concat).digest('hex').toUpperCase();
 }
 
@@ -103,9 +112,13 @@ async function _aliGetAccessToken() {
     sign_method: 'sha256',
     timestamp: Date.now(),
   };
-  params.sign = _aliSign(params, ALI_APP_SECRET);
-  const url = `${ALI_REFRESH_URL}?${new URLSearchParams(params).toString()}`;
-  const r = await fetch(url, { method: 'POST' });
+  params.sign = _aliSignRest('/auth/token/refresh', params, ALI_APP_SECRET);
+  const formBody = new URLSearchParams(params).toString();
+  const r = await fetch(ALI_REFRESH_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: formBody,
+  });
   const j = await r.json();
   if (!j.access_token) throw new Error(`AliExpress refresh failed: ${JSON.stringify(j)}`);
   await _aliSaveTokens({
@@ -6587,19 +6600,34 @@ module.exports = async (req, res) => {
       if (!code) return res.status(400).send('<h1>Missing code</h1><p>AliExpress did not return an authorization code. Try again from Settings.</p>');
       if (!ALI_ENABLED) return res.status(500).send('<h1>Server not configured</h1>');
       try {
+        // AliExpress /rest/auth/token/create requires REST-style signing
+        // (path prefix in signed string) plus all params as form-encoded POST
+        // body, not query string. Also requires sign_method=sha256.
         const params = {
           app_key:      ALI_APP_KEY,
           code,
           sign_method:  'sha256',
           timestamp:    Date.now(),
         };
-        params.sign = _aliSign(params, ALI_APP_SECRET);
-        const url = `${ALI_TOKEN_URL}?${new URLSearchParams(params).toString()}`;
-        const r = await fetch(url, { method: 'POST' });
+        params.sign = _aliSignRest('/auth/token/create', params, ALI_APP_SECRET);
+        const formBody = new URLSearchParams(params).toString();
+        const r = await fetch(ALI_TOKEN_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: formBody,
+        });
         const j = await r.json();
         if (!j.access_token) {
           console.error('[ali] token exchange failed:', JSON.stringify(j));
-          return res.status(400).send(`<h1>Token exchange failed</h1><pre>${JSON.stringify(j, null, 2)}</pre>`);
+          return res.status(400).send(`<h1>Token exchange failed</h1><pre>${JSON.stringify(j, null, 2)}</pre>
+            <p><b>Common causes:</b></p>
+            <ul>
+              <li>App Secret env var is wrong in Railway (most likely)</li>
+              <li>App is still in sandbox mode in AliExpress dashboard</li>
+              <li>Callback URL doesn't exactly match the one registered with AliExpress</li>
+            </ul>
+            <p>Try the auth flow again from Settings.</p>
+          `);
         }
         await _aliSaveTokens({
           access_token: j.access_token,
