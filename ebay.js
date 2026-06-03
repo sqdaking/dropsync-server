@@ -28,13 +28,29 @@ const ALI_ENABLED = !!(ALI_APP_KEY && ALI_APP_SECRET);
 if (ALI_ENABLED) console.log(`[ali] AliExpress integration ENABLED (App Key: ${ALI_APP_KEY})`);
 else console.log('[ali] AliExpress integration DISABLED (missing ALIEXPRESS_APP_KEY/SECRET env vars)');
 
-// Lazy-load the SDK so missing/broken install fails loud at use time, not boot
+// Lazy-load the SDK so missing/broken install fails loud at use time, not boot.
+// Handle both CJS (named) and ESM (default-wrapped) export shapes — newer
+// builds of ae_sdk are TypeScript-compiled to CJS but may put exports under
+// `default` depending on bundling.
 let _aeSdk = null;
 function _getAeSdk() {
   if (_aeSdk) return _aeSdk;
-  try { _aeSdk = require('ae_sdk'); }
+  let mod;
+  try { mod = require('ae_sdk'); }
   catch(e) { throw new Error(`ae_sdk not installed: ${e.message}. Run 'npm install' on the server.`); }
-  return _aeSdk;
+  // Possible shapes:
+  //   { AESystemClient, DropshipperClient, AffiliateClient }  ← named CJS
+  //   { default: { AESystemClient, ... } }                    ← ESM via interop
+  //   { default: AESystemClient }                              ← single-default
+  const candidates = [mod, mod.default, mod.default?.default].filter(Boolean);
+  for (const c of candidates) {
+    if (c.AESystemClient || c.DropshipperClient || c.AffiliateClient) {
+      _aeSdk = c;
+      console.log('[ali] ae_sdk loaded, exports:', Object.keys(c).filter(k => /Client$/.test(k)).join(', '));
+      return _aeSdk;
+    }
+  }
+  throw new Error(`ae_sdk loaded but no client classes found. Module keys: ${Object.keys(mod).join(', ')}. Check ae_sdk version.`);
 }
 
 // Lazy-init AliExpress tokens table (uses _cachePool which is already
