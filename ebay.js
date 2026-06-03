@@ -9925,36 +9925,37 @@ module.exports = async (req, res) => {
       return res.json({ tests: results });
     }
 
-    // ── AliExpress: fetch product list via OFFICIAL API ───────────────────────
-    // Uses `aliexpress.ds.recommend.feed.get` with feed_name="DS bestseller" and
-    // numeric category_id filters. All results filtered to US (country=US,
-    // ship_to_country=US, ship_from preference=US). No scraping, no blocks.
+    // ── AliExpress: fetch product list via OFFICIAL TEXT SEARCH API ──────────
+    // The feed API (aliexpress.ds.recommend.feed.get) requires AppKey
+    // whitelisting via feedapply@aliexpress.com — yours isn't whitelisted yet,
+    // so it returns empty. Until then, use aliexpress.ds.text.search which
+    // works without whitelist and returns real US-targeted results.
+    // Maps dept buttons → search keywords that match each category.
     if (action === 'aeScrapeDeals') {
       const { dept = null, customUrls = null, customName = null, exclude = [], count = 25 } = body;
       const excludeSet = new Set(exclude);
 
-      // Map our dept ids → AliExpress NUMERIC category IDs (verified working
-      // values from the AliExpress category tree). The feed_name stays
-      // "DS bestseller" — the category_id is what filters by department.
-      const DEPT_TO_CATEGORY = {
-        women_fashion:     '100003109',  // Women's Clothing
-        men_fashion:       '100003070',  // Men's Clothing
-        shoes:             '322',        // Shoes
-        bags:              '1524',       // Luggage & Bags
-        jewelry:           '1509',       // Jewelry & Accessories
-        watches:           '1511',       // Watches
-        home:              '15',         // Home & Garden
-        kitchen:           '13',         // Tools / Home Improvement
-        beauty:            '66',         // Beauty & Health
-        toys:              '26',         // Toys & Hobbies
-        electronics:       '44',         // Consumer Electronics
-        phone_accessories: '509',        // Cellphones & Accessories
-        sports:            '18',         // Sports & Entertainment
-        automotive:        '34',         // Automobiles & Motorcycles
-        pets:              '200003655',  // Home & Garden > Pet
-        baby:              '1501',       // Mother & Kids
-        garden:            '15',         // Home & Garden (same root)
-        tools:             '1420',       // Tools
+      // Department → search keyword pool. Multiple keywords per dept means
+      // each fetch hits 2-3 different searches → more variety in results.
+      const DEPT_TO_KEYWORDS = {
+        women_fashion:     ['women dress', 'women blouse', 'women jumpsuit'],
+        men_fashion:       ['men shirt', 'men hoodie', 'men jacket'],
+        shoes:             ['women shoes', 'men sneakers', 'sandals'],
+        bags:              ['women handbag', 'backpack', 'crossbody bag'],
+        jewelry:           ['necklace', 'earrings', 'bracelet'],
+        watches:           ['wristwatch', 'smart watch', 'mens watch'],
+        home:              ['home decor', 'wall art', 'throw pillow'],
+        kitchen:           ['kitchen gadget', 'kitchen organizer', 'cooking tool'],
+        beauty:            ['makeup', 'skincare', 'hair accessories'],
+        toys:              ['plush toy', 'kids toy', 'educational toy'],
+        electronics:       ['phone case', 'wireless earbuds', 'led light'],
+        phone_accessories: ['phone case', 'phone holder', 'phone charger'],
+        sports:            ['yoga mat', 'fitness band', 'sports water bottle'],
+        automotive:        ['car accessories', 'car phone holder', 'car cleaning'],
+        pets:              ['pet toy', 'dog accessories', 'cat toy'],
+        baby:              ['baby clothes', 'baby toy', 'baby accessories'],
+        garden:            ['garden tool', 'plant pot', 'outdoor decor'],
+        tools:              ['hand tool', 'screwdriver set', 'pliers'],
       };
 
       // Build query plan
@@ -9962,92 +9963,66 @@ module.exports = async (req, res) => {
       if (Array.isArray(customUrls) && customUrls.length > 0) {
         console.log(`[aeScrapeDeals] custom URLs (${customName || 'unnamed'}): ${customUrls.length} URL${customUrls.length!==1?'s':''}`);
         for (const url of customUrls) {
-          const catMatch = url.match(/\/category\/(\d+)/);
           const searchMatch = url.match(/SearchText=([^&]+)/i);
-          if (catMatch) queries.push({ type: 'feed', categoryId: catMatch[1], label: customName || `cat:${catMatch[1]}` });
-          else if (searchMatch) {
-            const kw = decodeURIComponent(searchMatch[1].replace(/\+/g,' '));
-            queries.push({ type: 'search', keyword: kw, label: customName || `search:${kw.slice(0,30)}` });
-          } else {
-            // No category or search → fall back to bestsellers (no category filter)
-            queries.push({ type: 'feed', categoryId: null, label: customName || 'general' });
+          const catMatch = url.match(/\/category\/(\d+)/);
+          if (searchMatch) {
+            queries.push({ keyword: decodeURIComponent(searchMatch[1].replace(/\+/g,' ')), label: customName || 'search' });
+          } else if (catMatch) {
+            // Category URL → use the customName as search keyword (best we can do without feed access)
+            queries.push({ keyword: customName || 'product', label: customName || 'cat' });
+          } else if (customName) {
+            queries.push({ keyword: customName, label: customName });
           }
         }
-      } else if (dept && DEPT_TO_CATEGORY[dept]) {
-        queries.push({ type: 'feed', categoryId: DEPT_TO_CATEGORY[dept], label: dept });
+      } else if (dept && DEPT_TO_KEYWORDS[dept]) {
+        for (const kw of DEPT_TO_KEYWORDS[dept]) {
+          queries.push({ keyword: kw, label: dept });
+        }
       } else {
-        // No dept selected → sample top categories
-        queries.push({ type: 'feed', categoryId: '100003109', label: 'women_fashion' });
-        queries.push({ type: 'feed', categoryId: '100003070', label: 'men_fashion' });
-        queries.push({ type: 'feed', categoryId: '15',         label: 'home' });
-        queries.push({ type: 'feed', categoryId: '44',         label: 'electronics' });
+        // No dept selected → sample popular keywords
+        queries.push({ keyword: 'phone case',  label: 'phone' });
+        queries.push({ keyword: 'women dress', label: 'women' });
+        queries.push({ keyword: 'home decor',  label: 'home' });
+        queries.push({ keyword: 'kitchen gadget', label: 'kitchen' });
       }
 
       const productMap = {};
       const pageSize = Math.min(50, Math.max(20, count));
 
-      // Process queries serially with 600ms pacing to stay under rate limits
-      // (AliExpress's AppApiCallLimit fires at ~3-5 calls/sec)
       for (const q of queries) {
         try {
-          let apiResp;
-          if (q.type === 'feed') {
-            // The dropship recommendation API — uses feed_name="DS bestseller" with
-            // optional category_id filter. All recommendations are dropship-ready.
-            const params = {
-              feed_name:        'DS bestseller',
-              page_no:          1,
-              page_size:        pageSize,
-              target_currency:  'USD',
-              target_language:  'EN',
-              country:          'US',
-              sort:             'orderDesc', // sort by sales for trending products
-            };
-            if (q.categoryId) params.category_id = q.categoryId;
-            console.log(`[aeScrapeDeals] calling recommend.feed.get with:`, JSON.stringify(params));
-            apiResp = await _aliCall('aliexpress.ds.recommend.feed.get', params)
-              .catch(e => { console.warn(`[aeScrapeDeals] feed ${q.label} (cat=${q.categoryId}) failed: ${e.message}`); return null; });
-          } else {
-            // Text search
-            apiResp = await _aliCall('aliexpress.ds.text.search', {
-              keyWord:    q.keyword,
-              local:      'en_US',
-              countryCode:'US',
-              currency:   'USD',
-              pageSize:   pageSize,
-              pageIndex:  1,
-            }).catch(e => { console.warn(`[aeScrapeDeals] search "${q.keyword}" failed: ${e.message}`); return null; });
-          }
+          const apiResp = await _aliCall('aliexpress.ds.text.search', {
+            keyWord:     q.keyword,
+            local:       'en_US',
+            countryCode: 'US',
+            currency:    'USD',
+            pageSize:    pageSize,
+            pageIndex:   1,
+            sortBy:      'orderDesc', // bestsellers first
+          }).catch(e => { console.warn(`[aeScrapeDeals] search "${q.keyword}" failed: ${e.message}`); return null; });
           if (!apiResp) { await sleep(700); continue; }
 
-          // DIAGNOSTIC: log raw response shape (first 800 chars) so we can
-          // see exactly what AliExpress returned. Remove once stable.
-          console.log(`[aeScrapeDeals] ${q.label} RAW:`, JSON.stringify(apiResp).slice(0, 800));
-
-          // Peel response layers
-          const root = apiResp.aliexpress_ds_recommend_feed_get_response?.result
-                    || apiResp.aliexpress_ds_text_search_response?.data
+          // Peel response
+          const root = apiResp.aliexpress_ds_text_search_response?.data
+                    || apiResp.aliexpress_ds_text_search_response?.result
+                    || apiResp.data
                     || apiResp.result
                     || apiResp;
-          const itemsRaw = root.products
-                        || root.product_list_response?.products
-                        || root.data
-                        || [];
-          // AliExpress can wrap arrays as {integer: [...]} or {traffic_product_d_t_o: [...]}
-          const productList = Array.isArray(itemsRaw)
-            ? itemsRaw
-            : (itemsRaw.integer || itemsRaw.traffic_product_d_t_o || itemsRaw.product || []);
+          const productsRaw = root.products;
+          const productList = Array.isArray(productsRaw)
+            ? productsRaw
+            : (productsRaw?.selection_search_product || productsRaw?.product || productsRaw?.traffic_product_d_t_o || []);
 
           let added = 0;
           for (const item of productList) {
-            const aeId = String(item.product_id || item.itemId || item.id || '');
+            const aeId = String(item.itemId || item.product_id || item.id || '');
             if (!aeId || excludeSet.has(aeId) || productMap[aeId]) continue;
-            const title  = item.product_title || item.subject || item.title || '';
-            const price  = parseFloat(item.target_sale_price || item.sale_price || item.app_sale_price || item.price || 0);
-            const image  = item.product_main_image_url || item.image_url || item.main_image || (item.images?.[0]) || '';
-            const orders = parseInt(item.lastest_volume || item.orders || item.trade_count || 0);
-            const rating = parseFloat(String(item.evaluate_rate || '0').replace(/%/g,'') || 0);
-            if (price <= 0) continue; // skip if no price
+            const title  = item.title || item.product_title || item.subject || '';
+            const price  = parseFloat(item.salePrice || item.sale_price || item.target_sale_price || item.price || 0);
+            const image  = item.itemMainPic || item.product_main_image_url || item.image_url || item.main_image || '';
+            const orders = parseInt(item.orders || item.lastest_volume || item.trade_count || 0);
+            const rating = parseFloat(String(item.score || item.evaluate_rate || 0).replace(/%/g,''));
+            if (price <= 0) continue;
             productMap[aeId] = {
               aeId,
               title,
@@ -10060,10 +10035,9 @@ module.exports = async (req, res) => {
             };
             added++;
           }
-          console.log(`[aeScrapeDeals] ${q.type}:${q.label} (cat=${q.categoryId || 'none'}) → +${added} pool=${Object.keys(productMap).length}`);
+          console.log(`[aeScrapeDeals] search:"${q.keyword}" (${q.label}) → +${added} pool=${Object.keys(productMap).length} totalAvail=${root.totalCount || '?'}`);
           if (Object.keys(productMap).length >= count + 50) break;
-          // Pacing between queries to avoid AppApiCallLimit
-          await sleep(700);
+          await sleep(700); // pacing
         } catch(e) {
           console.error(`[aeScrapeDeals] ${q.label} error:`, e.message);
         }
