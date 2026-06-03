@@ -16,37 +16,25 @@ const _proxyAgent = null;
 console.log('[proxy] DISABLED — server uses direct fetch; AliExpress uses official API');
 
 // ── ALIEXPRESS DROPSHIPPING INTEGRATION ───────────────────────────────────
-// Official API (no scraping). OAuth2 with auto-refresh tokens stored in
-// Postgres. Same workflow as eBay auth — connect once, server keeps tokens
-// fresh, all subsequent API calls use them automatically.
+// Uses the ae_sdk npm package which handles AliExpress IOP signing correctly.
+// Custom signing was producing IncompleteSignature errors — the SDK is
+// known-good (used in production by other dropshippers).
 const ALI_APP_KEY    = process.env.ALIEXPRESS_APP_KEY    || '';
 const ALI_APP_SECRET = process.env.ALIEXPRESS_APP_SECRET || '';
 const ALI_REDIRECT_URI = process.env.ALIEXPRESS_REDIRECT_URI ||
   'https://dropsync-server-production.up.railway.app/api/aliexpress/callback';
 const ALI_AUTH_URL = 'https://api-sg.aliexpress.com/oauth/authorize';
-const ALI_TOKEN_URL = 'https://api-sg.aliexpress.com/rest/auth/token/create';
-const ALI_REFRESH_URL = 'https://api-sg.aliexpress.com/rest/auth/token/refresh';
-const ALI_API_GATEWAY = 'https://api-sg.aliexpress.com/sync';
 const ALI_ENABLED = !!(ALI_APP_KEY && ALI_APP_SECRET);
 if (ALI_ENABLED) console.log(`[ali] AliExpress integration ENABLED (App Key: ${ALI_APP_KEY})`);
 else console.log('[ali] AliExpress integration DISABLED (missing ALIEXPRESS_APP_KEY/SECRET env vars)');
 
-// Build HMAC-SHA256 signature for AliExpress signed-API endpoints.
-// AliExpress has TWO signing styles:
-//   1) System API (gateway /sync): sorted params concat → HMAC
-//   2) REST API (/rest/auth/token/*): "{path}" + sorted params concat → HMAC
-// The REST style is needed for token create/refresh; the System style is used
-// for everything else once we have an access_token.
-const crypto = require('crypto');
-function _aliSign(params, secret) {
-  const sorted = Object.keys(params).sort().filter(k => params[k] !== '' && params[k] != null);
-  const concat = sorted.map(k => `${k}${params[k]}`).join('');
-  return crypto.createHmac('sha256', secret).update(concat).digest('hex').toUpperCase();
-}
-function _aliSignRest(path, params, secret) {
-  const sorted = Object.keys(params).sort().filter(k => params[k] !== '' && params[k] != null);
-  const concat = path + sorted.map(k => `${k}${params[k]}`).join('');
-  return crypto.createHmac('sha256', secret).update(concat).digest('hex').toUpperCase();
+// Lazy-load the SDK so missing/broken install fails loud at use time, not boot
+let _aeSdk = null;
+function _getAeSdk() {
+  if (_aeSdk) return _aeSdk;
+  try { _aeSdk = require('ae_sdk'); }
+  catch(e) { throw new Error(`ae_sdk not installed: ${e.message}. Run 'npm install' on the server.`); }
+  return _aeSdk;
 }
 
 // Lazy-init AliExpress tokens table (uses _cachePool which is already
@@ -98,63 +86,84 @@ async function _aliLoadTokens() {
   return r.rows[0] || null;
 }
 
+// Exchange OAuth code for tokens using ae_sdk's known-good signing.
+async function _aliExchangeCode(code) {
+  const sdk = _getAeSdk();
+  const sys = new sdk.AESystemClient({
+    app_key:    ALI_APP_KEY,
+    app_secret: ALI_APP_SECRET,
+  });
+  const r = await sys.generateToken({ code });
+  if (!r.ok) throw new Error(r.message || JSON.stringify(r.error_response || r));
+  // Peel response payload (AE wraps under method-name keys)
+  const inner = r.data?.aliexpress_system_oauth2_token_create_response
+             || r.data?.access_token_create_response
+             || r.data;
+  return {
+    access_token:  inner.access_token,
+    refresh_token: inner.refresh_token,
+    expires_in:    inner.expires_in,
+    user_id:       inner.user_id || inner.account || null,
+  };
+}
+
 // Get a fresh access_token — auto-refreshes if within 24h of expiry.
 async function _aliGetAccessToken() {
   const t = await _aliLoadTokens();
   if (!t) throw new Error('AliExpress not connected — visit Settings to authorize');
   const ms_remaining = new Date(t.expires_at).getTime() - Date.now();
-  if (ms_remaining > 24 * 3600 * 1000) return t.access_token; // still fresh
+  if (ms_remaining > 24 * 3600 * 1000) return t.access_token;
   // Refresh
   console.log(`[ali] token expires in ${(ms_remaining / 3600000).toFixed(1)}h, refreshing…`);
-  const params = {
-    app_key: ALI_APP_KEY,
-    refresh_token: t.refresh_token,
-    sign_method: 'sha256',
-    timestamp: Date.now(),
-  };
-  params.sign = _aliSignRest('/auth/token/refresh', params, ALI_APP_SECRET);
-  const formBody = new URLSearchParams(params).toString();
-  const r = await fetch(ALI_REFRESH_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: formBody,
+  const sdk = _getAeSdk();
+  const sys = new sdk.AESystemClient({
+    app_key:    ALI_APP_KEY,
+    app_secret: ALI_APP_SECRET,
   });
-  const j = await r.json();
-  if (!j.access_token) throw new Error(`AliExpress refresh failed: ${JSON.stringify(j)}`);
+  const r = await sys.refreshToken({ refresh_token: t.refresh_token });
+  if (!r.ok) throw new Error(`AliExpress refresh failed: ${r.message || JSON.stringify(r)}`);
+  const inner = r.data?.aliexpress_system_oauth2_token_refresh_response
+             || r.data?.refresh_token_response
+             || r.data;
   await _aliSaveTokens({
-    access_token: j.access_token,
-    refresh_token: j.refresh_token || t.refresh_token,
-    expires_in: j.expires_in,
-    seller_id: j.user_id || t.seller_id,
+    access_token:  inner.access_token,
+    refresh_token: inner.refresh_token || t.refresh_token,
+    expires_in:    inner.expires_in,
+    seller_id:     inner.user_id || t.seller_id,
   });
-  return j.access_token;
+  return inner.access_token;
 }
 
-// Call a signed AliExpress API endpoint with auto-token + auto-sign.
-// methodName: e.g. 'aliexpress.ds.product.get'
-// extraParams: per-method params (e.g. { product_id: '1005006789012345', ship_to_country: 'US' })
-async function _aliCall(methodName, extraParams = {}) {
-  const accessToken = await _aliGetAccessToken();
-  const params = {
-    app_key:     ALI_APP_KEY,
-    method:      methodName,
-    access_token: accessToken,
-    sign_method: 'sha256',
-    timestamp:   Date.now(),
-    format:      'json',
-    v:           '2.0',
-    ...extraParams,
-  };
-  params.sign = _aliSign(params, ALI_APP_SECRET);
-  const url = `${ALI_API_GATEWAY}?${new URLSearchParams(params).toString()}`;
-  const r = await fetch(url, { method: 'POST' });
-  const j = await r.json();
-  // AliExpress wraps responses inconsistently — error_response on failure,
-  // method-name-prefixed object on success.
-  if (j.error_response) {
-    throw new Error(`AliExpress API ${methodName}: ${j.error_response.msg || j.error_response.code} (${j.error_response.sub_code || ''})`);
-  }
-  return j;
+// Get a dropshipper client with the current access token applied.
+async function _aliDropshipper() {
+  const sdk = _getAeSdk();
+  const session = await _aliGetAccessToken();
+  return new sdk.DropshipperClient({
+    app_key:    ALI_APP_KEY,
+    app_secret: ALI_APP_SECRET,
+    session,
+  });
+}
+
+// Fetch product + freight via SDK. Returns raw API responses for _aliToDropSyncProduct.
+async function _aliFetchProductAndFreight(productId, shipTo = 'US', currency = 'USD') {
+  const client = await _aliDropshipper();
+  const [pResp, fResp] = await Promise.all([
+    client.productDetails({
+      product_id: productId,
+      ship_to_country: shipTo,
+      target_currency: currency,
+      target_language: 'en',
+    }),
+    client.shippingInfo({
+      country_code: shipTo,
+      product_id: productId,
+      product_num: 1,
+      send_goods_country_code: 'CN',
+    }).catch(e => { console.warn(`[ali] freight query failed: ${e.message}`); return null; }),
+  ]);
+  if (!pResp.ok) throw new Error(`AliExpress product fetch: ${pResp.message || JSON.stringify(pResp.error_response)}`);
+  return { apiResp: pResp.data, freightResp: fResp?.ok ? fResp.data : null };
 }
 
 // Convert AliExpress product API response into DropSync's internal product
@@ -6600,55 +6609,42 @@ module.exports = async (req, res) => {
       if (!code) return res.status(400).send('<h1>Missing code</h1><p>AliExpress did not return an authorization code. Try again from Settings.</p>');
       if (!ALI_ENABLED) return res.status(500).send('<h1>Server not configured</h1>');
       try {
-        // AliExpress /rest/auth/token/create requires REST-style signing
-        // (path prefix in signed string) plus all params as form-encoded POST
-        // body, not query string. Also requires sign_method=sha256.
-        const params = {
-          app_key:      ALI_APP_KEY,
-          code,
-          sign_method:  'sha256',
-          timestamp:    Date.now(),
-        };
-        params.sign = _aliSignRest('/auth/token/create', params, ALI_APP_SECRET);
-        const formBody = new URLSearchParams(params).toString();
-        const r = await fetch(ALI_TOKEN_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: formBody,
-        });
-        const j = await r.json();
-        if (!j.access_token) {
-          console.error('[ali] token exchange failed:', JSON.stringify(j));
-          return res.status(400).send(`<h1>Token exchange failed</h1><pre>${JSON.stringify(j, null, 2)}</pre>
-            <p><b>Common causes:</b></p>
-            <ul>
-              <li>App Secret env var is wrong in Railway (most likely)</li>
-              <li>App is still in sandbox mode in AliExpress dashboard</li>
-              <li>Callback URL doesn't exactly match the one registered with AliExpress</li>
-            </ul>
-            <p>Try the auth flow again from Settings.</p>
-          `);
-        }
+        // Use ae_sdk for token exchange — handles AliExpress IOP signing
+        const tokens = await _aliExchangeCode(code);
         await _aliSaveTokens({
-          access_token: j.access_token,
-          refresh_token: j.refresh_token,
-          expires_in: j.expires_in,
-          seller_id: j.user_id || j.account || null,
+          access_token: tokens.access_token,
+          refresh_token: tokens.refresh_token,
+          expires_in: tokens.expires_in,
+          seller_id: tokens.user_id,
         });
         // Redirect back to DropSync UI with success flag
         const back = `https://dropsync-server-production.up.railway.app/?ali_connected=1`;
         return res.send(`
           <html><body style="font-family: -apple-system, sans-serif; padding: 40px; text-align: center; background: #0f172a; color: #e2e8f0;">
             <h1 style="color: #10b981;">✓ AliExpress Connected</h1>
-            <p>Seller ID: ${j.user_id || 'connected'}</p>
-            <p>Tokens valid until ${new Date(Date.now() + (j.expires_in || 86400) * 1000).toLocaleString()}</p>
+            <p>Seller ID: ${tokens.user_id || 'connected'}</p>
+            <p>Tokens valid until ${new Date(Date.now() + (tokens.expires_in || 86400) * 1000).toLocaleString()}</p>
             <p><a href="${back}" style="background: #10b981; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none;">Back to DropSync</a></p>
             <script>setTimeout(() => location.href='${back}', 3000);</script>
           </body></html>
         `);
       } catch(e) {
         console.error('[ali] callback error:', e);
-        return res.status(500).send(`<h1>Error</h1><pre>${e.message}</pre>`);
+        return res.status(500).send(`
+          <html><body style="font-family: -apple-system, sans-serif; padding: 40px; max-width: 700px; margin: 0 auto; background: #0f172a; color: #e2e8f0;">
+            <h1 style="color: #ef4444;">Token exchange failed</h1>
+            <p>AliExpress rejected our authentication request:</p>
+            <pre style="background: #1e293b; padding: 16px; border-radius: 8px; overflow-x: auto;">${e.message}</pre>
+            <h3>Most likely causes (in order):</h3>
+            <ol>
+              <li><b>App Secret env var is wrong in Railway.</b> Reset it in AliExpress dashboard, copy carefully, paste into Railway → Variables, redeploy.</li>
+              <li><b>App is still in sandbox/draft mode.</b> Check AliExpress dashboard — app status must be "Online".</li>
+              <li><b>Callback URL mismatch.</b> Must be exactly: <code>https://dropsync-server-production.up.railway.app/api/aliexpress/callback</code></li>
+              <li><b>Authorization code expired</b> (codes are one-time and short-lived). Try the auth flow again.</li>
+            </ol>
+            <p><a href="/" style="background: #6366f1; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none;">Back to DropSync</a></p>
+          </body></html>
+        `);
       }
     }
     // Disconnect — clear stored tokens
@@ -6677,19 +6673,7 @@ module.exports = async (req, res) => {
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or aliProductId' });
       try {
         // Pull fresh AliExpress data
-        const [apiResp, freightResp] = await Promise.all([
-          _aliCall('aliexpress.ds.product.get', {
-            product_id: aliProductId,
-            ship_to_country: 'US',
-            target_currency: 'USD',
-            target_language: 'en',
-          }),
-          _aliCall('aliexpress.ds.freight.query', {
-            queryDeliveryReq: JSON.stringify({
-              quantity: '1', productId: aliProductId, shipToCountry: 'US', productNum: 1,
-            }),
-          }).catch(() => null),
-        ]);
+        const { apiResp, freightResp } = await _aliFetchProductAndFreight(aliProductId, 'US', 'USD');
         const product = _aliToDropSyncProduct(apiResp, '', freightResp);
         const markupPct  = parseFloat(mkRaw ?? 35);
         const handling   = parseFloat(handRaw ?? 2);
@@ -6802,24 +6786,11 @@ module.exports = async (req, res) => {
       const productId = body.product_id || req.query.product_id || _aliExtractProductId(rawUrl);
       if (!productId) return res.status(400).json({ error: 'Could not extract product_id from URL. Provide a valid AliExpress item URL or product_id.' });
       try {
-        // Parallel: fetch product details + shipping cost
+        // Parallel: fetch product details + shipping cost via SDK
         const shipTo = body.ship_to_country || 'US';
-        const [apiResp, freightResp] = await Promise.all([
-          _aliCall('aliexpress.ds.product.get', {
-            product_id:       productId,
-            ship_to_country:  shipTo,
-            target_currency:  body.currency || 'USD',
-            target_language:  'en',
-          }),
-          _aliCall('aliexpress.ds.freight.query', {
-            queryDeliveryReq: JSON.stringify({
-              quantity:        '1',
-              productId:       productId,
-              shipToCountry:   shipTo,
-              productNum:      1,
-            }),
-          }).catch(e => { console.warn(`[ali] freight query failed: ${e.message}`); return null; }),
-        ]);
+        const { apiResp, freightResp } = await _aliFetchProductAndFreight(
+          productId, shipTo, body.currency || 'USD'
+        );
         const product = _aliToDropSyncProduct(apiResp, rawUrl || `https://www.aliexpress.com/item/${productId}.html`, freightResp);
         return res.json({ success: true, product });
       } catch(e) {
