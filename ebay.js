@@ -216,7 +216,12 @@ async function _aliFetchProductAndFreight(productId, shipTo = 'US', currency = '
     }),
     _aliCall('aliexpress.ds.freight.query', {
       queryDeliveryReq: JSON.stringify({
-        quantity: '1', productId: productId, shipToCountry: shipTo, productNum: 1,
+        quantity:      '1',
+        productId:     productId,
+        shipToCountry: shipTo,
+        productNum:    1,
+        currency:      currency,
+        language:      'en_US',
       }),
     }).catch(e => { console.warn(`[ali] freight query failed: ${e.message}`); return null; }),
   ]);
@@ -226,7 +231,7 @@ async function _aliFetchProductAndFreight(productId, shipTo = 'US', currency = '
 // Convert AliExpress product API response into DropSync's internal product
 // schema (same shape that scrapeAmazonProduct returns) so the existing eBay
 // publish + sync flow works without changes.
-function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo) {
+function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo, fallbackProductId) {
   // The API wraps the actual data under `aliexpress_ds_product_get_response.result`
   // — peel layers defensively.
   const root = apiResp.aliexpress_ds_product_get_response?.result
@@ -240,6 +245,19 @@ function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo) {
              : (skuInfo.ae_item_sku_info_d_t_o || skuInfo.ae_item_sku_info_dto || []);
   const mediaInfo = root.ae_multimedia_info_dto   || root.ae_multimedia_info   || {};
   const storeInfo = root.ae_store_info            || {};
+
+  // Resolve product ID — try every field name AliExpress uses across endpoints,
+  // then fall back to whatever we passed in (we always know the ID we
+  // requested). This prevents "undefined" in URLs.
+  const productId = String(
+    baseInfo.product_id
+    || baseInfo.productId
+    || root.product_id
+    || root.productId
+    || apiResp.product_id
+    || fallbackProductId
+    || ''
+  );
 
   // ── SHIPPING COST PARSING ───────────────────────────────────────────────
   // freightInfo is the response from aliexpress.ds.freight.query — separate API
@@ -317,8 +335,8 @@ function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo) {
     title:        baseInfo.subject || baseInfo.product_title || baseInfo.title || 'Untitled AliExpress Product',
     description:  baseInfo.detail || baseInfo.product_detail || '',
     images,
-    sourceUrl:    sourceUrl || `https://www.aliexpress.com/item/${baseInfo.product_id || ''}.html`,
-    asin:         String(baseInfo.product_id || ''),  // we use ASIN field as ID, even for AliExpress
+    sourceUrl:    sourceUrl || (productId ? `https://www.aliexpress.com/item/${productId}.html` : ''),
+    asin:         productId,  // we use ASIN field as ID, even for AliExpress
     price:        Object.values(comboPrices)[0] || 0,
     shipping:     shippingCost,        // raw shipping cost
     shippingLabel,
@@ -332,10 +350,10 @@ function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo) {
     brand:        baseInfo.brand_name || '',
     weight:       { value: 0, unit: 'LB' }, // AliExpress weights aren't in the basic API, default
     _source:      'aliexpress',
-    aliProductId: String(baseInfo.product_id || ''),
+    aliProductId: productId,
     aliStoreId:   storeInfo.store_id || '',
   };
-  console.log(`[ali] product ${product.aliProductId}: "${product.title.slice(0,50)}" — ${skus.length} SKUs, ${variations.length} dims, $${product.price} (incl $${shippingCost} ship: ${shippingLabel || 'n/a'})`);
+  console.log(`[ali] product ${productId || '?'}: "${product.title.slice(0,50)}" — ${skus.length} SKUs, ${variations.length} dims, $${product.price} (incl $${shippingCost} ship: ${shippingLabel || 'n/a'})`);
   return product;
 }
 
@@ -6731,7 +6749,7 @@ module.exports = async (req, res) => {
       try {
         // Pull fresh AliExpress data
         const { apiResp, freightResp } = await _aliFetchProductAndFreight(aliProductId, 'US', 'USD');
-        const product = _aliToDropSyncProduct(apiResp, '', freightResp);
+        const product = _aliToDropSyncProduct(apiResp, '', freightResp, aliProductId);
         const markupPct  = parseFloat(mkRaw ?? 35);
         const handling   = parseFloat(handRaw ?? 2);
         const defaultQty = parseInt(qtyRaw) || 5;
@@ -6848,7 +6866,7 @@ module.exports = async (req, res) => {
         const { apiResp, freightResp } = await _aliFetchProductAndFreight(
           productId, shipTo, body.currency || 'USD'
         );
-        const product = _aliToDropSyncProduct(apiResp, rawUrl || `https://www.aliexpress.com/item/${productId}.html`, freightResp);
+        const product = _aliToDropSyncProduct(apiResp, rawUrl || `https://www.aliexpress.com/item/${productId}.html`, freightResp, productId);
         return res.json({ success: true, product });
       } catch(e) {
         console.error('[ali] import failed:', e.message);
