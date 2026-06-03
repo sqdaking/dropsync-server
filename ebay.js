@@ -7,35 +7,271 @@ const _nfFn = _nodeFetch.default || _nodeFetch;
 // Replace global fetch with node-fetch so existing code paths use it transparently
 global.fetch = _nfFn;
 
-// ── RESIDENTIAL PROXY (DataImpulse / Smartproxy / generic HTTPS proxy) ──────
-// Routes all Amazon fetches through a residential IP so Amazon doesn't see
-// Railway's datacenter IP. Set these env vars in Railway:
-//   PROXY_HOST = gw.dataimpulse.com
-//   PROXY_PORT = 823
-//   PROXY_USER = <your login>
-//   PROXY_PASS = <your password>
-// If any are missing, falls back to direct fetch (Railway IP, often blocked).
-let _proxyAgent = null;
-let _proxyEnabled = false;
-const _proxyHost = process.env.PROXY_HOST || '';
-const _proxyPort = process.env.PROXY_PORT || '';
-const _proxyUser = process.env.PROXY_USER || '';
-const _proxyPass = process.env.PROXY_PASS || '';
-if (_proxyHost && _proxyPort && _proxyUser && _proxyPass) {
-  try {
-    const { HttpsProxyAgent } = require('https-proxy-agent');
-    const _auth = `${encodeURIComponent(_proxyUser)}:${encodeURIComponent(_proxyPass)}`;
-    _proxyAgent = new HttpsProxyAgent(`http://${_auth}@${_proxyHost}:${_proxyPort}`);
-    _proxyEnabled = true;
-    console.log(`[proxy] residential proxy ENABLED via ${_proxyHost}:${_proxyPort}`);
-  } catch(e) {
-    console.warn(`[proxy] could not initialize HttpsProxyAgent: ${e.message} — install https-proxy-agent in package.json`);
-  }
-} else {
-  console.log('[proxy] residential proxy DISABLED (no PROXY_HOST/PORT/USER/PASS env vars)');
+// ── PROXY DISABLED ─────────────────────────────────────────────────────────
+// Residential proxy removed. Server uses direct fetch for all Amazon URLs.
+// AliExpress uses official API (no fetching). DataImpulse is no longer in
+// the flow — _withProxy is a passthrough now.
+const _proxyEnabled = false;
+const _proxyAgent = null;
+console.log('[proxy] DISABLED — server uses direct fetch; AliExpress uses official API');
+
+// ── ALIEXPRESS DROPSHIPPING INTEGRATION ───────────────────────────────────
+// Official API (no scraping). OAuth2 with auto-refresh tokens stored in
+// Postgres. Same workflow as eBay auth — connect once, server keeps tokens
+// fresh, all subsequent API calls use them automatically.
+const ALI_APP_KEY    = process.env.ALIEXPRESS_APP_KEY    || '';
+const ALI_APP_SECRET = process.env.ALIEXPRESS_APP_SECRET || '';
+const ALI_REDIRECT_URI = process.env.ALIEXPRESS_REDIRECT_URI ||
+  'https://dropsync-server-production.up.railway.app/api/aliexpress/callback';
+const ALI_AUTH_URL = 'https://api-sg.aliexpress.com/oauth/authorize';
+const ALI_TOKEN_URL = 'https://api-sg.aliexpress.com/rest/auth/token/create';
+const ALI_REFRESH_URL = 'https://api-sg.aliexpress.com/rest/auth/token/refresh';
+const ALI_API_GATEWAY = 'https://api-sg.aliexpress.com/sync';
+const ALI_ENABLED = !!(ALI_APP_KEY && ALI_APP_SECRET);
+if (ALI_ENABLED) console.log(`[ali] AliExpress integration ENABLED (App Key: ${ALI_APP_KEY})`);
+else console.log('[ali] AliExpress integration DISABLED (missing ALIEXPRESS_APP_KEY/SECRET env vars)');
+
+// Build HMAC-SHA256 signature for AliExpress signed-API endpoints.
+// AliExpress requires sorted-param-concat then HMAC with App Secret as key.
+const crypto = require('crypto');
+function _aliSign(params, secret) {
+  const sorted = Object.keys(params).sort().filter(k => params[k] !== '' && params[k] != null);
+  const concat = sorted.map(k => `${k}${params[k]}`).join('');
+  return crypto.createHmac('sha256', secret).update(concat).digest('hex').toUpperCase();
 }
 
-// Per-call proxy bypass flag — checked by _withProxy. Set to true by import
+// Lazy-init AliExpress tokens table (uses _cachePool which is already
+// initialized in _initCache above).
+let _aliTokensReady = false;
+async function _initAliTokens() {
+  if (_aliTokensReady || !_cachePool) return;
+  try {
+    await _cachePool.query(`
+      CREATE TABLE IF NOT EXISTS aliexpress_tokens (
+        id INTEGER PRIMARY KEY DEFAULT 1,
+        access_token TEXT NOT NULL,
+        refresh_token TEXT NOT NULL,
+        expires_at TIMESTAMPTZ NOT NULL,
+        seller_id TEXT,
+        connected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CHECK (id = 1)
+      );
+    `);
+    _aliTokensReady = true;
+    console.log('[ali] tokens table ready');
+  } catch(e) {
+    console.warn('[ali] token table init failed:', e.message);
+  }
+}
+setTimeout(_initAliTokens, 5000);
+
+async function _aliSaveTokens({ access_token, refresh_token, expires_in, seller_id }) {
+  if (!_aliTokensReady) await _initAliTokens();
+  const expires_at = new Date(Date.now() + (parseInt(expires_in) || 3600 * 24 * 30) * 1000);
+  await _cachePool.query(
+    `INSERT INTO aliexpress_tokens (id, access_token, refresh_token, expires_at, seller_id, connected_at)
+       VALUES (1, $1, $2, $3, $4, NOW())
+       ON CONFLICT (id) DO UPDATE
+         SET access_token = EXCLUDED.access_token,
+             refresh_token = EXCLUDED.refresh_token,
+             expires_at = EXCLUDED.expires_at,
+             seller_id = COALESCE(EXCLUDED.seller_id, aliexpress_tokens.seller_id),
+             connected_at = NOW()`,
+    [access_token, refresh_token, expires_at, seller_id || null]
+  );
+  console.log(`[ali] tokens saved (expires ${expires_at.toISOString()})`);
+}
+
+async function _aliLoadTokens() {
+  if (!_aliTokensReady) await _initAliTokens();
+  if (!_aliTokensReady) return null;
+  const r = await _cachePool.query(`SELECT * FROM aliexpress_tokens WHERE id = 1`);
+  return r.rows[0] || null;
+}
+
+// Get a fresh access_token — auto-refreshes if within 24h of expiry.
+async function _aliGetAccessToken() {
+  const t = await _aliLoadTokens();
+  if (!t) throw new Error('AliExpress not connected — visit Settings to authorize');
+  const ms_remaining = new Date(t.expires_at).getTime() - Date.now();
+  if (ms_remaining > 24 * 3600 * 1000) return t.access_token; // still fresh
+  // Refresh
+  console.log(`[ali] token expires in ${(ms_remaining / 3600000).toFixed(1)}h, refreshing…`);
+  const params = {
+    app_key: ALI_APP_KEY,
+    refresh_token: t.refresh_token,
+    sign_method: 'sha256',
+    timestamp: Date.now(),
+  };
+  params.sign = _aliSign(params, ALI_APP_SECRET);
+  const url = `${ALI_REFRESH_URL}?${new URLSearchParams(params).toString()}`;
+  const r = await fetch(url, { method: 'POST' });
+  const j = await r.json();
+  if (!j.access_token) throw new Error(`AliExpress refresh failed: ${JSON.stringify(j)}`);
+  await _aliSaveTokens({
+    access_token: j.access_token,
+    refresh_token: j.refresh_token || t.refresh_token,
+    expires_in: j.expires_in,
+    seller_id: j.user_id || t.seller_id,
+  });
+  return j.access_token;
+}
+
+// Call a signed AliExpress API endpoint with auto-token + auto-sign.
+// methodName: e.g. 'aliexpress.ds.product.get'
+// extraParams: per-method params (e.g. { product_id: '1005006789012345', ship_to_country: 'US' })
+async function _aliCall(methodName, extraParams = {}) {
+  const accessToken = await _aliGetAccessToken();
+  const params = {
+    app_key:     ALI_APP_KEY,
+    method:      methodName,
+    access_token: accessToken,
+    sign_method: 'sha256',
+    timestamp:   Date.now(),
+    format:      'json',
+    v:           '2.0',
+    ...extraParams,
+  };
+  params.sign = _aliSign(params, ALI_APP_SECRET);
+  const url = `${ALI_API_GATEWAY}?${new URLSearchParams(params).toString()}`;
+  const r = await fetch(url, { method: 'POST' });
+  const j = await r.json();
+  // AliExpress wraps responses inconsistently — error_response on failure,
+  // method-name-prefixed object on success.
+  if (j.error_response) {
+    throw new Error(`AliExpress API ${methodName}: ${j.error_response.msg || j.error_response.code} (${j.error_response.sub_code || ''})`);
+  }
+  return j;
+}
+
+// Convert AliExpress product API response into DropSync's internal product
+// schema (same shape that scrapeAmazonProduct returns) so the existing eBay
+// publish + sync flow works without changes.
+function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo) {
+  // The API wraps the actual data under `aliexpress_ds_product_get_response.result`
+  // — peel layers defensively.
+  const root = apiResp.aliexpress_ds_product_get_response?.result
+            || apiResp.result
+            || apiResp;
+  if (!root) throw new Error('AliExpress: empty product response');
+  const baseInfo  = root.ae_item_base_info_dto    || root.ae_item_base_info    || {};
+  const skuInfo   = root.ae_item_sku_info_dtos    || root.ae_item_sku_info_dtos?.ae_item_sku_info_d_t_o
+                  || root.ae_item_sku_info        || [];
+  const skus = Array.isArray(skuInfo) ? skuInfo
+             : (skuInfo.ae_item_sku_info_d_t_o || skuInfo.ae_item_sku_info_dto || []);
+  const mediaInfo = root.ae_multimedia_info_dto   || root.ae_multimedia_info   || {};
+  const storeInfo = root.ae_store_info            || {};
+
+  // ── SHIPPING COST PARSING ───────────────────────────────────────────────
+  // freightInfo is the response from aliexpress.ds.freight.query — separate API
+  // call we make alongside product.get. It returns one or more shipping options.
+  // We pick the cheapest US-deliverable option (Standard/AliExpress Saver).
+  let shippingCost = 0;
+  let shippingLabel = '';
+  let shippingDays  = '';
+  if (freightInfo) {
+    const fRoot = freightInfo.aliexpress_ds_freight_query_response?.result
+                || freightInfo.result || freightInfo;
+    const fList = fRoot.delivery_options
+                || fRoot.aeop_freight_calculate_result_for_buyer_d_t_o_list
+                || fRoot.freight_list
+                || [];
+    const opts = Array.isArray(fList) ? fList : (fList.aeop_freight_calculate_result_for_buyer_d_t_o || []);
+    // Find cheapest valid option (skip "free" entries with zero — they're sometimes placeholders)
+    const valid = opts.filter(o => o && (parseFloat(o.freight_amount?.value ?? o.freight ?? o.shipping_fee ?? 0) >= 0));
+    valid.sort((a, b) => {
+      const ap = parseFloat(a.freight_amount?.value ?? a.freight ?? a.shipping_fee ?? 0);
+      const bp = parseFloat(b.freight_amount?.value ?? b.freight ?? b.shipping_fee ?? 0);
+      return ap - bp;
+    });
+    if (valid.length > 0) {
+      const cheapest = valid[0];
+      shippingCost = parseFloat(cheapest.freight_amount?.value ?? cheapest.freight ?? cheapest.shipping_fee ?? 0);
+      shippingLabel = cheapest.service_name || cheapest.company || cheapest.shipping_company || '';
+      shippingDays  = cheapest.estimated_delivery_time || cheapest.delivery_time || '';
+    }
+  }
+
+  // Gallery: array of CDN image URLs (semicolon-separated string in API)
+  const imageStr = mediaInfo.image_urls || mediaInfo.image_url || '';
+  const images = (typeof imageStr === 'string'
+                  ? imageStr.split(/[;,]\s*/).filter(u => /^https?:/.test(u))
+                  : []).slice(0, 24);
+  // Variants → comboPrices, comboInStock, comboAsin (we reuse "asin" key
+  // to mean "SKU id" for AliExpress — eBay layer doesn't care)
+  const comboPrices = {};
+  const comboInStock = {};
+  const comboAsin = {};
+  const comboShipping = {}; // per-SKU shipping cost (AliExpress shipping is usually per-product, but we track per-SKU)
+  const variations = []; // dimension definitions for the UI/eBay aspects
+  const dimValues = {};  // dim name -> Set of values
+  for (const sku of skus) {
+    const skuId = sku.sku_id || sku.id || '';
+    const price = parseFloat(sku.offer_sale_price || sku.sku_price || sku.price || 0);
+    const stock = parseInt(sku.sku_available_stock || sku.stock || sku.ipm_sku_stock || 0);
+    const propsArr = sku.ae_sku_property_dtos
+                  || sku.ae_sku_property_dtos?.ae_sku_property_d_t_o
+                  || sku.sku_attr_value
+                  || [];
+    const props = Array.isArray(propsArr) ? propsArr : (propsArr.ae_sku_property_d_t_o || []);
+    // Build a combo key from props (e.g. "Red|Large")
+    const keyParts = [];
+    for (const p of props) {
+      const dimName = p.sku_property_name || p.attr_name || 'Variant';
+      const valName = p.property_value_definition_name || p.sku_property_value || p.attr_value || '';
+      if (!dimValues[dimName]) dimValues[dimName] = new Set();
+      if (valName) dimValues[dimName].add(valName);
+      keyParts.push(valName || '');
+    }
+    const comboKey = keyParts.join('|') || skuId;
+    // FOLD SHIPPING INTO PRICE — same model as Amazon. Markup applies to (price + shipping).
+    const totalCost = price + shippingCost;
+    if (price > 0) comboPrices[comboKey] = totalCost;
+    comboInStock[comboKey] = stock > 0;
+    comboAsin[comboKey] = skuId;
+    comboShipping[comboKey] = shippingCost;
+  }
+  for (const [name, vals] of Object.entries(dimValues)) {
+    variations.push({ name, values: Array.from(vals) });
+  }
+  const product = {
+    title:        baseInfo.subject || baseInfo.product_title || baseInfo.title || 'Untitled AliExpress Product',
+    description:  baseInfo.detail || baseInfo.product_detail || '',
+    images,
+    sourceUrl:    sourceUrl || `https://www.aliexpress.com/item/${baseInfo.product_id || ''}.html`,
+    asin:         String(baseInfo.product_id || ''),  // we use ASIN field as ID, even for AliExpress
+    price:        Object.values(comboPrices)[0] || 0,
+    shipping:     shippingCost,        // raw shipping cost
+    shippingLabel,
+    shippingDays,
+    variations,
+    comboPrices,
+    comboInStock,
+    comboAsin,
+    comboShipping,
+    inStock:      Object.values(comboInStock).some(Boolean),
+    brand:        baseInfo.brand_name || '',
+    weight:       { value: 0, unit: 'LB' }, // AliExpress weights aren't in the basic API, default
+    _source:      'aliexpress',
+    aliProductId: String(baseInfo.product_id || ''),
+    aliStoreId:   storeInfo.store_id || '',
+  };
+  console.log(`[ali] product ${product.aliProductId}: "${product.title.slice(0,50)}" — ${skus.length} SKUs, ${variations.length} dims, $${product.price} (incl $${shippingCost} ship: ${shippingLabel || 'n/a'})`);
+  return product;
+}
+
+// Extract a product_id from any AliExpress URL form.
+function _aliExtractProductId(url) {
+  if (!url) return null;
+  // Common forms:
+  //  https://www.aliexpress.com/item/1005006789012345.html
+  //  https://www.aliexpress.us/item/3256807123456789.html
+  //  https://m.aliexpress.com/item/1005006789012345.html?...
+  const m = url.match(/\/item\/(\d{10,16})/);
+  return m ? m[1] : null;
+}
+
+
 // paths so they fall back to Railway direct IP instead of burning paid proxy
 // bandwidth.
 const _bypassProxyDuringCall = { value: false };
@@ -183,9 +419,17 @@ async function fetchPage(url, ua, maxAttempts, opts) {
   const _asinTag = asin ? ` [${asin}]` : '';
 
   // ── RELAY FIRST: try browser-fetched HTML before burning a direct attempt ──
-  // Extension/relay queue removed — fall through to direct fetch for all URLs.
-  // Direct fetch will get blocked some of the time (Railway IP) but it's the
-  // only path available now. Amazon URLs proceed below same as any other.
+  // ── AMAZON FETCHING DISABLED ON SERVER ────────────────────────────────────
+  // Server NEVER fetches Amazon URLs anymore. Browser handles all of it via
+  // codetabs/corsproxy + sends results in clientAsinData. If browser isn't
+  // running, Amazon listings just skip this cycle — better than burning
+  // Railway's IP and pushing wrong prices.
+  const _isAmazonUrl = /amazon\.(com|co\.uk|de|ca)/.test(url);
+  if (_isAmazonUrl) {
+    console.log(`[fetch] amazon URL${_asinTag} — server-side fetch disabled, browser must provide HTML`);
+    return '';
+  }
+  // Non-Amazon URLs (deals scrape, etc.) can still use direct fetch.
 
   // Vary Accept-Language + platform per request to avoid uniform fingerprint
   const _langList = ['en-US,en;q=0.9', 'en-US,en;q=0.8,fr;q=0.5', 'en-GB,en;q=0.9', 'en-US,en;q=0.9,es;q=0.7', 'en-US,en;q=0.9,de;q=0.5'];
@@ -6306,6 +6550,256 @@ module.exports = async (req, res) => {
       } catch(e) { return res.status(500).json({ error: e.message }); }
     }
 
+    // ── ALIEXPRESS ACTIONS ────────────────────────────────────────────────
+    // Status check — returns whether tokens exist + seller info
+    if (action === 'ali_status') {
+      if (!ALI_ENABLED) return res.json({ enabled: false, reason: 'No App Key/Secret env vars set' });
+      try {
+        const t = await _aliLoadTokens();
+        if (!t) return res.json({ enabled: true, connected: false });
+        return res.json({
+          enabled: true,
+          connected: true,
+          seller_id: t.seller_id,
+          expires_at: t.expires_at,
+          connected_at: t.connected_at,
+        });
+      } catch(e) { return res.status(500).json({ error: e.message }); }
+    }
+    // Build authorize URL the user visits to grant permission
+    if (action === 'ali_authorize') {
+      if (!ALI_ENABLED) return res.status(400).json({ error: 'AliExpress not configured on server' });
+      const state = Math.random().toString(36).slice(2, 12);
+      const params = new URLSearchParams({
+        response_type: 'code',
+        force_auth: 'true',
+        redirect_uri: ALI_REDIRECT_URI,
+        client_id: ALI_APP_KEY,
+        state,
+      });
+      const authorizeUrl = `${ALI_AUTH_URL}?${params.toString()}`;
+      console.log(`[ali] authorize URL generated (state=${state})`);
+      return res.json({ authorizeUrl, state });
+    }
+    // OAuth callback handler — AliExpress redirects here with ?code=ABC
+    if (action === 'ali_callback') {
+      const code = req.query.code || req.body.code;
+      if (!code) return res.status(400).send('<h1>Missing code</h1><p>AliExpress did not return an authorization code. Try again from Settings.</p>');
+      if (!ALI_ENABLED) return res.status(500).send('<h1>Server not configured</h1>');
+      try {
+        const params = {
+          app_key:      ALI_APP_KEY,
+          code,
+          sign_method:  'sha256',
+          timestamp:    Date.now(),
+        };
+        params.sign = _aliSign(params, ALI_APP_SECRET);
+        const url = `${ALI_TOKEN_URL}?${new URLSearchParams(params).toString()}`;
+        const r = await fetch(url, { method: 'POST' });
+        const j = await r.json();
+        if (!j.access_token) {
+          console.error('[ali] token exchange failed:', JSON.stringify(j));
+          return res.status(400).send(`<h1>Token exchange failed</h1><pre>${JSON.stringify(j, null, 2)}</pre>`);
+        }
+        await _aliSaveTokens({
+          access_token: j.access_token,
+          refresh_token: j.refresh_token,
+          expires_in: j.expires_in,
+          seller_id: j.user_id || j.account || null,
+        });
+        // Redirect back to DropSync UI with success flag
+        const back = `https://dropsync-server-production.up.railway.app/?ali_connected=1`;
+        return res.send(`
+          <html><body style="font-family: -apple-system, sans-serif; padding: 40px; text-align: center; background: #0f172a; color: #e2e8f0;">
+            <h1 style="color: #10b981;">✓ AliExpress Connected</h1>
+            <p>Seller ID: ${j.user_id || 'connected'}</p>
+            <p>Tokens valid until ${new Date(Date.now() + (j.expires_in || 86400) * 1000).toLocaleString()}</p>
+            <p><a href="${back}" style="background: #10b981; color: white; padding: 10px 20px; border-radius: 6px; text-decoration: none;">Back to DropSync</a></p>
+            <script>setTimeout(() => location.href='${back}', 3000);</script>
+          </body></html>
+        `);
+      } catch(e) {
+        console.error('[ali] callback error:', e);
+        return res.status(500).send(`<h1>Error</h1><pre>${e.message}</pre>`);
+      }
+    }
+    // Disconnect — clear stored tokens
+    if (action === 'ali_disconnect') {
+      try {
+        if (_cachePool) await _cachePool.query(`DELETE FROM aliexpress_tokens WHERE id = 1`);
+        console.log('[ali] disconnected, tokens cleared');
+        return res.json({ disconnected: true });
+      } catch(e) { return res.status(500).json({ error: e.message }); }
+    }
+    // Force refresh the token (for debugging)
+    if (action === 'ali_refresh') {
+      try {
+        const tok = await _aliGetAccessToken();
+        return res.json({ ok: true, token_preview: tok.slice(0, 12) + '…' });
+      } catch(e) { return res.status(500).json({ error: e.message }); }
+    }
+    // ── ALI SYNC: refresh price/stock for a single AliExpress-sourced listing ──
+    // Called by the daily cron job (and manually via the Sync button on a listing).
+    // Re-fetches the product from AliExpress API, applies markup, pushes price+qty
+    // changes to eBay via bulkUpdatePriceQuantity. No scraping, no proxy.
+    if (action === 'ali_sync') {
+      const { access_token, ebaySku, ebayListingId, aliProductId,
+              markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw } = body;
+      if (!access_token || !ebaySku || !aliProductId)
+        return res.status(400).json({ error: 'Missing access_token, ebaySku, or aliProductId' });
+      try {
+        // Pull fresh AliExpress data
+        const [apiResp, freightResp] = await Promise.all([
+          _aliCall('aliexpress.ds.product.get', {
+            product_id: aliProductId,
+            ship_to_country: 'US',
+            target_currency: 'USD',
+            target_language: 'en',
+          }),
+          _aliCall('aliexpress.ds.freight.query', {
+            queryDeliveryReq: JSON.stringify({
+              quantity: '1', productId: aliProductId, shipToCountry: 'US', productNum: 1,
+            }),
+          }).catch(() => null),
+        ]);
+        const product = _aliToDropSyncProduct(apiResp, '', freightResp);
+        const markupPct  = parseFloat(mkRaw ?? 35);
+        const handling   = parseFloat(handRaw ?? 2);
+        const defaultQty = parseInt(qtyRaw) || 5;
+        // Build per-SKU updates: ebaySku→{price, qty}
+        const updates = [];
+        for (const [comboKey, totalCost] of Object.entries(product.comboPrices || {})) {
+          const inStock = product.comboInStock?.[comboKey] !== false;
+          const aliSkuId = product.comboAsin?.[comboKey];
+          if (!aliSkuId) continue;
+          // ebay SKU for this variant: {ebaySku}-{aliSkuId}
+          const variantEbaySku = `${ebaySku}-${aliSkuId}`;
+          const sellPrice = (totalCost + handling) * (1 + markupPct / 100);
+          updates.push({
+            ebaySku: variantEbaySku,
+            aliSkuId,
+            comboKey,
+            cost: totalCost,
+            price: Math.round(sellPrice * 100) / 100,
+            qty: inStock ? defaultQty : 0,
+          });
+        }
+        // Find offer IDs for each ebaySku, then bulkUpdatePriceQuantity
+        const EBAY_API = getEbayUrls().EBAY_API;
+        const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+        const updateRequests = [];
+        for (const u of updates) {
+          // Look up offer ID
+          const oR = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(u.ebaySku)}`, { headers: auth });
+          const oD = await oR.json();
+          const off = (oD.offers || [])[0];
+          if (!off?.offerId) {
+            console.log(`[ali_sync] ${ebaySku}: no offer for ${u.ebaySku} — skipping`);
+            continue;
+          }
+          updateRequests.push({
+            offerId: off.offerId,
+            price: { value: u.price.toFixed(2), currency: 'USD' },
+            availableQuantity: u.qty,
+          });
+        }
+        if (updateRequests.length === 0) {
+          return res.json({ success: false, error: 'No matching eBay offers found' });
+        }
+        // bulkUpdatePriceQuantity supports up to 25 per call
+        const results = [];
+        for (let i = 0; i < updateRequests.length; i += 25) {
+          const batch = updateRequests.slice(i, i + 25);
+          const upR = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_update_price_quantity`, {
+            method: 'POST', headers: auth,
+            body: JSON.stringify({ requests: batch.map(b => ({ offers: [{ offerId: b.offerId, price: b.price, availableQuantity: b.availableQuantity }] })) }),
+          });
+          const upD = await upR.json();
+          results.push(upD);
+        }
+        console.log(`[ali_sync] ${ebaySku} (ali:${aliProductId}) → ${updates.length} variants updated`);
+        return res.json({
+          success: true,
+          updated: updates.length,
+          inStock: updates.filter(u => u.qty > 0).length,
+          oos: updates.filter(u => u.qty === 0).length,
+          sampleUpdate: updates[0],
+        });
+      } catch(e) {
+        console.error(`[ali_sync] failed:`, e.message);
+        return res.status(500).json({ success: false, error: e.message });
+      }
+    }
+    // ── ALI BULK SYNC: process all aliexpress-sourced listings (for cron) ──
+    // Returns a count of products that need syncing; the cron does this in
+    // chunks to stay within rate limits.
+    if (action === 'ali_bulk_sync') {
+      const { access_token, products, limit } = body;
+      if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+      if (!Array.isArray(products)) return res.status(400).json({ error: 'products array required' });
+      const aliProducts = products.filter(p => p._source === 'aliexpress' && p.aliProductId && p.ebaySku);
+      const toProcess = aliProducts.slice(0, parseInt(limit) || 25);
+      const results = { ok: 0, failed: 0, errors: [] };
+      for (const p of toProcess) {
+        try {
+          // Reuse the single-sync handler logic via internal call
+          const mockReq = { method: 'POST', body: {
+            ...p,
+            access_token,
+            ebaySku: p.ebaySku,
+            ebayListingId: p.ebayListingId,
+            aliProductId: p.aliProductId,
+            markup: p.markup,
+            handlingCost: p.handlingCost,
+            quantity: p.quantity,
+          }, query: { action: 'ali_sync' }, headers: {} };
+          let captured = null;
+          const mockRes = { json: (j) => captured = j, status: (s) => ({ json: (j) => captured = { ...j, _status: s } }) };
+          // Re-enter the handler with action=ali_sync
+          await module.exports({ ...mockReq, query: { ...mockReq.query, action: 'ali_sync' } }, mockRes);
+          if (captured?.success) results.ok++;
+          else { results.failed++; results.errors.push({ sku: p.ebaySku, err: captured?.error }); }
+        } catch(e) {
+          results.failed++;
+          results.errors.push({ sku: p.ebaySku, err: e.message });
+        }
+        await new Promise(r => setTimeout(r, 200)); // tiny pacing
+      }
+      return res.json({ success: true, ...results, processed: toProcess.length, totalAliProducts: aliProducts.length });
+    }
+    // Import a product by URL (or raw product_id) — returns same shape as Amazon scrape.
+    // Also fetches shipping cost via aliexpress.ds.freight.query so total cost is accurate.
+    if (action === 'ali_import') {
+      const rawUrl = (body.url || req.query.url || '').trim();
+      const productId = body.product_id || req.query.product_id || _aliExtractProductId(rawUrl);
+      if (!productId) return res.status(400).json({ error: 'Could not extract product_id from URL. Provide a valid AliExpress item URL or product_id.' });
+      try {
+        // Parallel: fetch product details + shipping cost
+        const shipTo = body.ship_to_country || 'US';
+        const [apiResp, freightResp] = await Promise.all([
+          _aliCall('aliexpress.ds.product.get', {
+            product_id:       productId,
+            ship_to_country:  shipTo,
+            target_currency:  body.currency || 'USD',
+            target_language:  'en',
+          }),
+          _aliCall('aliexpress.ds.freight.query', {
+            queryDeliveryReq: JSON.stringify({
+              quantity:        '1',
+              productId:       productId,
+              shipToCountry:   shipTo,
+              productNum:      1,
+            }),
+          }).catch(e => { console.warn(`[ali] freight query failed: ${e.message}`); return null; }),
+        ]);
+        const product = _aliToDropSyncProduct(apiResp, rawUrl || `https://www.aliexpress.com/item/${productId}.html`, freightResp);
+        return res.json({ success: true, product });
+      } catch(e) {
+        console.error('[ali] import failed:', e.message);
+        return res.status(500).json({ success: false, error: e.message });
+      }
+    }
+
     if (action === 'auth') {
       const E = getEbayUrls(); // production only
       const REDIRECT = E.REDIRECT || `${req.headers['x-forwarded-proto']||'https'}://${req.headers.host}/api/ebay?action=callback`;
@@ -7180,6 +7674,22 @@ module.exports = async (req, res) => {
       if (!access_token || !ebaySku || !sourceUrl)
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
 
+      // BROWSER-ONLY POLICY: smartSync for Amazon requires browser-prefetched
+      // ASIN data (clientAsinData). If browser didn't provide it, we skip this
+      // sync cycle entirely — server NEVER touches Amazon directly. Listings
+      // sync next cycle when the browser tab is open.
+      const _isAmazonSource = /amazon\.(com|co\.uk|de|ca)/.test(sourceUrl);
+      const _hasClientAsinData = clientAsinData && typeof clientAsinData === 'object'
+        && Object.keys(clientAsinData).length > 0;
+      if (_isAmazonSource && !_hasClientAsinData) {
+        console.log(`[smartSync] ${ebaySku}: Amazon source but no browser data — skipping (open the DropSync tab to enable sync)`);
+        return res.json({
+          success: false,
+          skipped: true,
+          reason: 'Amazon source requires browser tab open to provide HTML. Sync skipped.',
+        });
+      }
+
       const EBAY_API   = getEbayUrls().EBAY_API;
       const markupPct  = parseFloat(mkRaw  ?? 23);
       const handling   = parseFloat(handRaw ?? 2);
@@ -7207,8 +7717,11 @@ module.exports = async (req, res) => {
       // successful scrape, so we use those to build the ASIN list and proceed
       // to per-ASIN fetching. Only genuinely-unreachable ASINs end up as
       // force-OOS via the fetchFailed path in STEP 2.
-      // Use mobile pages (~300KB vs ~1.5MB desktop) for residential proxy bandwidth savings.
-      const html = await fetchPage(sourceUrl, randUA(), undefined, { mobile: true }).catch(() => null);
+      // REVERTED FROM MOBILE: mobile pages (~300KB) saved bandwidth but the
+      // price parser couldn't reliably extract from mobile markup — it was
+      // returning $9.99 promo prices instead of real product prices.
+      // Desktop pages cost more bandwidth but give accurate prices.
+      const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
       const _parentHtmlOk = !!(html && html.length >= 5000);
 
       // Extract unique ASINs from the parent page's dimensionToAsinMap.
@@ -7346,7 +7859,7 @@ module.exports = async (req, res) => {
             // 2 attempts max — blocked ASINs are set qty=0 this cycle (Out-of-Stock
             // Control hides the variant) and re-tried normally on the next sync.
             // This is NOT a real OOS event: no markedOos flag, no OOS webhook.
-            const h = await fetchPage(`https://www.amazon.com/dp/${asin}?th=1&psc=1`, randUA(), 2, { mobile: true });
+            const h = await fetchPage(`https://www.amazon.com/dp/${asin}?th=1&psc=1`, randUA(), 2);
             if (!h) {
               asinPrice[asin]   = 0;     // ← explicit 0 so _haveFreshPrice sees it
               asinInStock[asin] = false;
@@ -7362,9 +7875,14 @@ module.exports = async (req, res) => {
             const _total = price + (shipping || 0);
             asinPrice[asin]   = _total;
             asinInStock[asin] = !oos && price > 0;
-            // Cache the result for 7 days (only if we got real data — never cache failures)
-            if (price > 0) {
+            // Cache the result for 7 days (only if we got real data).
+            // Skip caching for prices that match known parser-default values
+            // ($9.99 is the broken mobile-page extraction default — never cache
+            // those, force a re-fetch next cycle in case it was wrong).
+            if (price > 0 && price !== 9.99) {
               _asinCacheSet(asin, { price: _total, shipping, inStock: !oos && price > 0 });
+            } else if (price === 9.99) {
+              console.warn(`[smartSync] ${asin} got $9.99 — suspect parser default, NOT caching`);
             }
             if (shipping > 0) console.log(`[smartSync] ${asin} → $${price} +$${shipping} ship = $${_total.toFixed(2)} inStock=${!oos}`);
             else               console.log(`[smartSync] ${asin} → $${price} inStock=${!oos}`);

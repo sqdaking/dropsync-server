@@ -441,6 +441,14 @@ app.get('/api/amazon', async (req, res) => {
 const handleEbay = require('./ebay');
 app.all('/api/ebay', handleEbay);
 
+// ── AliExpress OAuth callback — AliExpress redirects sellers here after auth
+// Forwards to ebay.js handler with action=ali_callback. Separate route so the
+// callback URL is clean and registered with AliExpress exactly as required.
+app.get('/api/aliexpress/callback', (req, res, next) => {
+  req.query.action = 'ali_callback';
+  return handleEbay(req, res, next);
+});
+
 // Inject the relay handle into ebay.js so fetchPage() can route Amazon URLs
 // through the browser-fetched queue when a tab is alive. Without this wire,
 // fetchPage falls back to direct fetch behavior (current pre-relay behavior).
@@ -454,6 +462,84 @@ if (typeof handleEbay.setRelayHandle === 'function') {
   });
   console.log('[Server] relay handle wired into ebay.js fetchPage');
 }
+
+// ── DAILY ALIEXPRESS SYNC ─────────────────────────────────────────────────
+// AliExpress prices change often. Run a cron daily at 03:00 UTC that:
+// 1. Pulls all listings with _source='aliexpress' from db
+// 2. Resyncs each via the AliExpress API (no scraping, no proxy)
+// 3. Updates eBay listing price/qty via bulkUpdatePriceQuantity
+// Self-contained — doesn't require the browser tab to be open.
+const cron = require('node-cron');
+let _aliSyncRunning = false;
+async function runDailyAliSync() {
+  if (_aliSyncRunning) { console.log('[ali_cron] previous run still in flight — skipping'); return; }
+  _aliSyncRunning = true;
+  console.log('[ali_cron] starting daily AliExpress sync…');
+  try {
+    // Get a valid eBay token (worker has the refresh logic)
+    let accessToken;
+    try { accessToken = await getValidToken(); }
+    catch(e) { console.warn('[ali_cron] no eBay token available — aborting:', e.message); _aliSyncRunning = false; return; }
+    // Fetch all listed products via the existing db API. Paginate to avoid OOM.
+    const aliProducts = [];
+    let offset = 0;
+    const pageSize = 500;
+    while (true) {
+      const page = await db.getProducts({ status: 'listed', limit: pageSize, offset });
+      if (!page || page.length === 0) break;
+      for (const p of page) {
+        const d = p.data || p;
+        if (d._source === 'aliexpress' && d.aliProductId && d.ebaySku) {
+          aliProducts.push(p);
+        }
+      }
+      if (page.length < pageSize) break;
+      offset += pageSize;
+    }
+    console.log(`[ali_cron] found ${aliProducts.length} AliExpress listings to sync`);
+    if (aliProducts.length === 0) { _aliSyncRunning = false; return; }
+    // Process in chunks of 25 to spread API load
+    let ok = 0, failed = 0;
+    for (let i = 0; i < aliProducts.length; i += 25) {
+      const chunk = aliProducts.slice(i, i + 25);
+      const payload = {
+        access_token: accessToken,
+        products: chunk.map(p => ({
+          ...(p.data || p),
+          ebaySku: p.data?.ebaySku || p.ebaySku,
+          ebayListingId: p.data?.ebayListingId || p.ebayListingId,
+          aliProductId: p.data?.aliProductId || p.aliProductId,
+          _source: 'aliexpress',
+        })),
+        limit: 25,
+      };
+      // Internal call rather than HTTP
+      let captured;
+      const mockReq = { method: 'POST', body: payload, query: { action: 'ali_bulk_sync' }, headers: {} };
+      const mockRes = { json: j => captured = j, status: s => ({ json: j => captured = { ...j, _status: s } }) };
+      await handleEbay(mockReq, mockRes);
+      ok += captured?.ok || 0;
+      failed += captured?.failed || 0;
+      if (captured?.errors?.length) console.log('[ali_cron] errors:', captured.errors.slice(0, 5));
+      // Pause 2s between chunks to keep AliExpress happy
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    console.log(`[ali_cron] DAILY SYNC DONE: ${ok} ok, ${failed} failed of ${aliProducts.length} total`);
+  } catch(e) {
+    console.error('[ali_cron] fatal:', e.message);
+  } finally {
+    _aliSyncRunning = false;
+  }
+}
+// Schedule: every day at 03:00 UTC (low traffic, before US morning checks)
+cron.schedule('0 3 * * *', runDailyAliSync, { timezone: 'UTC' });
+console.log('[ali_cron] daily AliExpress sync scheduled at 03:00 UTC');
+// Also expose a manual trigger endpoint: GET /api/aliexpress/sync-now
+app.get('/api/aliexpress/sync-now', async (req, res) => {
+  if (_aliSyncRunning) return res.json({ status: 'already_running' });
+  runDailyAliSync(); // fire and forget
+  res.json({ status: 'started', note: 'AliExpress daily sync started in background. Watch server logs.' });
+});
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function start() {

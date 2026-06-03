@@ -1065,13 +1065,12 @@ function _browserExtractAsinData(html) {
 // Fetches main page + every ASIN page from browser (your IP, not the server's).
 // Returns { [asin]: { price, inStock } } — server uses this, skips its own Amazon fetches.
 async function prefetchAsinPrices(mainHtml) {
-  // DISABLED: residential proxy on server (DataImpulse) now handles all Amazon
-  // fetching directly. Browser-side prefetch via codetabs/corsproxy was a
-  // workaround for when the server couldn't reach Amazon — no longer needed.
-  // Returning empty object means server's smartSync will fetch each ASIN
-  // itself through the residential proxy, which is more reliable than the
-  // bulk-extraction regex (which was returning 0 prices on most parent pages).
-  return {};
+  // RE-ENABLED — browser is now the ONLY way to get Amazon data to the
+  // server. DataImpulse proxy is removed. Server refuses to fetch Amazon
+  // directly. This function bulk-extracts variant prices from the parent
+  // HTML, then individually fetches missing ASINs via CORS proxies (codetabs
+  // etc.) using your residential IP.
+  return await _legacyPrefetchAsinPrices(mainHtml);
 }
 
 async function _legacyPrefetchAsinPrices(mainHtml) {
@@ -1241,9 +1240,70 @@ function validateAmazonUrl(raw, { allowEdit = false } = {}) {
   return result;
 }
 
+// ── ALIEXPRESS IMPORT ──────────────────────────────────────────────────────
+// Called when an AliExpress URL is pasted in the Import field. Hits the
+// official AliExpress dropshipping API server-side — no scraping, no proxy,
+// no risk of blocks. Returns the same product shape as Amazon scrape so the
+// rest of the import UI (variant matrix, push button) works unchanged.
+async function doAliImport(rawUrl) {
+  if (!S.serverUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
+  _scraping = true; IMP = null;
+  renderImport();
+  setStatus('<div class="spinner" style="width:14px;height:14px;flex-shrink:0"></div> <span>Fetching AliExpress product via official API…</span>');
+  try {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=ali_import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: rawUrl, ship_to_country: 'US', currency: 'USD' }),
+    });
+    const d = await safeJson(r);
+    if (!d.success || !d.product) {
+      const errMsg = d.error || 'AliExpress import failed';
+      if (errMsg.includes('not connected')) {
+        setStatus(`❌ AliExpress not connected. Go to Settings → Connect AliExpress.`, 'error');
+        toast('Connect AliExpress in Settings first', 'error', 6000);
+      } else {
+        setStatus(`❌ ${errMsg}`, 'error');
+        toast(errMsg, 'error', 6000);
+      }
+      _scraping = false; renderImport();
+      return;
+    }
+    const product = d.product;
+    // Mark this as an AliExpress product so push uses AliExpress markup/policies.
+    product._source = 'aliexpress';
+    product.url = rawUrl;
+    product.markup = S.aliMarkup ?? 35;
+    IMP = product;
+    _scraping = false;
+    renderImport();
+    const vc = product.variations?.length ? product.variations.reduce((acc, v) => acc * (v.values?.length || 1), 1) : 1;
+    const priceCount = Object.keys(product.comboPrices || {}).length;
+    const inStockCount = Object.values(product.comboInStock || {}).filter(Boolean).length;
+    setStatus(
+      `✓ Imported AliExpress "${(product.title || '').slice(0,50)}" — ${vc} variants${priceCount ? ` · ${priceCount} priced` : ''}${inStockCount ? ` · ${inStockCount} in stock` : ''} · scroll down to push →`,
+      'success'
+    );
+    toast(`✅ Imported from AliExpress (${product.aliProductId})`, 'success');
+  } catch(e) {
+    setStatus(`❌ AliExpress import failed: ${e.message}`, 'error');
+    toast(`Import failed: ${e.message}`, 'error', 6000);
+    _scraping = false; renderImport();
+  }
+}
+
 async function doScrape() {
   const rawUrl = ($('imp-url')?.value || '').trim();
-  if (!rawUrl) { toast('Paste an Amazon URL first', 'error'); return; }
+  if (!rawUrl) { toast('Paste a product URL first', 'error'); return; }
+
+  // ── ALIEXPRESS URL DETECTION ────────────────────────────────────────────
+  // If the URL is from aliexpress.com / aliexpress.us, route to the
+  // AliExpress API import flow instead of Amazon scraping. Same end shape,
+  // different source, different markup/policies.
+  if (/aliexpress\.(com|us|ru|jp|kr|de|fr|es|it)\//i.test(rawUrl)) {
+    return doAliImport(rawUrl);
+  }
+
   const urlResult = validateAmazonUrl(rawUrl);
   if (!urlResult) return;
   const url = urlResult.url;
@@ -1290,7 +1350,8 @@ async function doScrape() {
     }
     IMP = d.product;
     IMP.url = url;
-    IMP.markup = S.markup;
+    // Use source-specific markup: AliExpress gets aliMarkup, Amazon/others get markup.
+    IMP.markup = (IMP._source === 'aliexpress') ? (S.aliMarkup ?? 35) : (S.markup ?? 23);
 
     // ── Duplicate detection for multi-ASIN listings ──────────────────────
     // Two different variant ASINs from the same parent listing share parentAsin
@@ -1595,15 +1656,20 @@ async function doPush() {
   try {
     const prod = buildProd();
     const token = await ensureToken();
+    // Source-specific policies + markup + handling. AliExpress products use
+    // separate eBay policies (longer handling time, AliExpress return policy)
+    // and a higher default markup since AliExpress prices are lower.
+    const _isAli = prod._source === 'aliexpress';
     const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token: token, product: prod,
-        fulfillmentPolicyId: S.fulfillmentPolicyId,
-        paymentPolicyId:     S.paymentPolicyId,
-        returnPolicyId:      S.returnPolicyId,
-        markup:        IMP.markup != null ? IMP.markup : (S.markup || 23),
-        handlingCost:  S.handlingCost || 2,
+        fulfillmentPolicyId: _isAli ? (S.aliFulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
+        paymentPolicyId:     _isAli ? (S.aliPaymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
+        returnPolicyId:      _isAli ? (S.aliReturnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
+        markup:        IMP.markup != null ? IMP.markup : (_isAli ? (S.aliMarkup ?? 35) : (S.markup || 23)),
+        handlingCost:  _isAli ? (S.aliHandlingCost ?? 2) : (S.handlingCost || 2),
+        quantity:      _isAli ? (S.aliQuantity ?? 5)     : (S.quantity || 1),
         existingEbaySku: IMP.ebaySku || null,
       }),
     });
@@ -7319,23 +7385,29 @@ async function smartSyncProduct(p) {
   try {
     const token = await ensureToken();
 
-    // ── PRE-FETCH AMAZON DATA VIA EXTENSION ──────────────────────────────────
-    // If the Chrome extension is installed, fetch all child ASINs ourselves
-    // (residential IP) and send the data to the server so it doesn't need to
-    // fetch them itself (Railway IP gets blocked). This is the single biggest
-    // reliability win — without this, server tries to fetch each ASIN and
-    // typically gets blocked, ending with $0 prices and qty=0 everywhere.
+    // ── PRE-FETCH AMAZON DATA VIA BROWSER (CODETABS/CORSPROXY) ──────────────
+    // Server NEVER fetches Amazon — it's our job. Use fetchAmazonInBrowser
+    // (which routes through codetabs.com CORS proxy) to grab the parent page,
+    // then prefetchAsinPrices to gather all variant prices. Ship to server
+    // as clientAsinData. If browser fetch fails entirely, server skips this
+    // sync cycle (no fallback to direct fetch — would hit Railway IP block).
     let _clientAsinData = null;
     try {
-      if (await _extensionAvailable()) {
-        const parentHtml = await _fetchAmazonViaExtension(p.sourceUrl).catch(() => null);
-        if (parentHtml && parentHtml.length > 5000) {
-          _clientAsinData = await prefetchAsinPrices(parentHtml);
-          const _n = Object.keys(_clientAsinData || {}).length;
-          if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices via extension for ${p.ebaySku}`);
-        }
+      const parentHtml = await fetchAmazonInBrowser(p.sourceUrl).catch(() => null);
+      if (parentHtml && parentHtml.length > 5000) {
+        _clientAsinData = await prefetchAsinPrices(parentHtml);
+        const _n = Object.keys(_clientAsinData || {}).length;
+        if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku}`);
+        else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices extracted`);
+      } else {
+        console.warn(`[smartSync] ${p.ebaySku}: could not fetch Amazon parent page (codetabs/corsproxy all failed)`);
       }
     } catch(_pe) { console.warn(`[smartSync] prefetch failed:`, _pe.message); }
+    if (!_clientAsinData || Object.keys(_clientAsinData).length === 0) {
+      // Don't even ask the server to sync — it would skip anyway. Just log.
+      console.log(`[smartSync] ${p.ebaySku}: skipping (no browser data, server would refuse)`);
+      return { skipped: true, reason: 'browser fetch failed' };
+    }
 
     const r = await fetch(`${S.serverUrl}/api/ebay?action=smartSync`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -8016,6 +8088,73 @@ function renderSettings() {
   $('content').innerHTML = `
     <div style="max-width:600px;display:flex;flex-direction:column;gap:16px">
 
+      <!-- AliExpress Connection -->
+      <div class="card">
+        <div class="card-header"><span class="card-title">🌏 AliExpress Connection</span></div>
+        <div class="card-body">
+          <div id="ali-conn-status" style="margin-bottom:16px">
+            <div class="status-bar info">Checking AliExpress status…</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-primary" onclick="connectAliExpress()">🌏 Connect AliExpress</button>
+            <button class="btn btn-outline btn-sm" onclick="checkAliStatus()">🔄 Check Status</button>
+            <button class="btn btn-ghost btn-sm" style="color:var(--red)" onclick="disconnectAliExpress()">Disconnect</button>
+          </div>
+          <div style="font-size:11px;color:var(--text3);margin-top:8px">
+            Official AliExpress dropshipping API. No scraping, no proxy needed — works reliably from Railway.
+          </div>
+        </div>
+      </div>
+
+      <!-- AliExpress Pricing & Policies -->
+      <div class="card">
+        <div class="card-header"><span class="card-title">🌏 AliExpress Pricing & Policies</span></div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:12px">
+          <div style="font-size:12px;color:var(--text3);margin-bottom:4px">
+            These settings apply only to listings sourced from AliExpress. Amazon listings use the separate settings above.
+          </div>
+          <div>
+            <label>AliExpress Markup % <span style="color:var(--text3);font-weight:400">(default 35% — higher than Amazon since AliExpress prices are lower)</span></label>
+            <input class="input" type="number" id="ali-markup" min="0" max="500" step="1" value="${S.aliMarkup ?? 35}"
+              onchange="S.aliMarkup=parseFloat(this.value)||35;save();toast('AliExpress markup saved','success')">
+          </div>
+          <div>
+            <label>AliExpress Handling Cost ($) <span style="color:var(--text3);font-weight:400">(per order, added before markup)</span></label>
+            <input class="input" type="number" id="ali-handling" min="0" max="100" step="0.5" value="${S.aliHandlingCost ?? 2}"
+              onchange="S.aliHandlingCost=parseFloat(this.value)||2;save();toast('AliExpress handling saved','success')">
+          </div>
+          <div>
+            <label>AliExpress Default Quantity <span style="color:var(--text3);font-weight:400">(eBay listing qty per in-stock variant)</span></label>
+            <input class="input" type="number" id="ali-quantity" min="1" max="999" step="1" value="${S.aliQuantity ?? 5}"
+              onchange="S.aliQuantity=parseInt(this.value)||5;save();toast('AliExpress quantity saved','success')">
+          </div>
+          <div>
+            <label>eBay Fulfillment Policy <span style="color:var(--text3);font-weight:400">(shipping policy for AliExpress listings)</span></label>
+            <select class="input" id="ali-fp" onchange="S.aliFulfillmentPolicyId=this.value;save();toast('Shipping policy saved','success')">
+              <option value="">— Use default —</option>
+              ${(S.fulfillmentPolicies || []).map(p => `<option value="${p.fulfillmentPolicyId}" ${S.aliFulfillmentPolicyId === p.fulfillmentPolicyId ? 'selected' : ''}>${p.name}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label>eBay Return Policy <span style="color:var(--text3);font-weight:400">(returns for AliExpress listings)</span></label>
+            <select class="input" id="ali-rp" onchange="S.aliReturnPolicyId=this.value;save();toast('Return policy saved','success')">
+              <option value="">— Use default —</option>
+              ${(S.returnPolicies || []).map(p => `<option value="${p.returnPolicyId}" ${S.aliReturnPolicyId === p.returnPolicyId ? 'selected' : ''}>${p.name}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label>eBay Payment Policy</label>
+            <select class="input" id="ali-pp" onchange="S.aliPaymentPolicyId=this.value;save();toast('Payment policy saved','success')">
+              <option value="">— Use default —</option>
+              ${(S.paymentPolicies || []).map(p => `<option value="${p.paymentPolicyId}" ${S.aliPaymentPolicyId === p.paymentPolicyId ? 'selected' : ''}>${p.name}</option>`).join('')}
+            </select>
+          </div>
+          <div style="font-size:11px;color:var(--text3);margin-top:4px">
+            <b>Tip:</b> AliExpress shipping can take 2-4 weeks. Use a shipping policy with a longer handling time and clearly disclose dispatch timing in your listings to avoid eBay defects.
+          </div>
+        </div>
+      </div>
+
       <!-- eBay Connection -->
       <div class="card">
         <div class="card-header"><span class="card-title">⚡ eBay Connection</span></div>
@@ -8503,6 +8642,98 @@ async function savePricingDefaults() {
   }
 }
 
+
+// ── ALIEXPRESS CONNECTION ──────────────────────────────────────────────────
+async function connectAliExpress() {
+  if (!S.serverUrl) { toast('Set Railway URL first in Settings', 'error'); return; }
+  try {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=ali_authorize`);
+    const d = await safeJson(r);
+    if (!d.authorizeUrl) throw new Error(d.error || 'No authorize URL returned');
+    // Open AliExpress login in a popup; the OAuth callback runs server-side
+    // and redirects to DropSync with ?ali_connected=1 — we poll for that.
+    const popup = window.open(d.authorizeUrl, 'ali-auth', 'width=700,height=800,left=200,top=100');
+    if (!popup) { toast('Popup blocked — please allow popups for this site', 'error'); return; }
+    toast('Authorize DropSync on the AliExpress page that opened', 'info', 8000);
+    // Poll status every 2s — when the callback completes, ali_status will return connected:true
+    let polls = 0;
+    const interval = setInterval(async () => {
+      polls++;
+      if (polls > 120) { clearInterval(interval); return; } // give up after 4 min
+      try {
+        if (popup.closed) {
+          await checkAliStatus();
+          clearInterval(interval);
+          return;
+        }
+        const r2 = await fetch(`${S.serverUrl}/api/ebay?action=ali_status`);
+        const j = await r2.json();
+        if (j.connected) {
+          clearInterval(interval);
+          try { popup.close(); } catch(_) {}
+          await checkAliStatus();
+          toast(`✅ Connected to AliExpress${j.seller_id ? ' (seller ' + j.seller_id + ')' : ''}`, 'success', 6000);
+        }
+      } catch(_) {}
+    }, 2000);
+  } catch(e) {
+    toast(`Connect failed: ${e.message}`, 'error');
+  }
+}
+
+async function disconnectAliExpress() {
+  if (!confirm('Disconnect AliExpress? You will need to re-authorize to import or sync AliExpress listings.')) return;
+  try {
+    await fetch(`${S.serverUrl}/api/ebay?action=ali_disconnect`, { method: 'POST' });
+    toast('Disconnected from AliExpress', 'info');
+    checkAliStatus();
+  } catch(e) {
+    toast(`Disconnect failed: ${e.message}`, 'error');
+  }
+}
+
+async function checkAliStatus() {
+  const box = document.getElementById('ali-conn-status');
+  if (!box || !S.serverUrl) return;
+  try {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=ali_status`);
+    const j = await r.json();
+    if (!j.enabled) {
+      box.innerHTML = `<div class="status-bar info">⚠️ AliExpress not configured on server (missing env vars: ALIEXPRESS_APP_KEY / ALIEXPRESS_APP_SECRET)</div>`;
+      return;
+    }
+    if (j.connected) {
+      const expIn = Math.round((new Date(j.expires_at).getTime() - Date.now()) / 86400000);
+      box.innerHTML = `<div class="status-bar success">✅ Connected${j.seller_id ? ' as ' + j.seller_id : ''} · token valid ${expIn} more days</div>`;
+    } else {
+      box.innerHTML = `<div class="status-bar info">Not connected. Click below to authorize AliExpress.</div>`;
+    }
+  } catch(e) {
+    box.innerHTML = `<div class="status-bar error">Status check failed: ${e.message}</div>`;
+  }
+}
+
+// Auto-check AliExpress status whenever settings page renders
+(function _hookAliStatusCheck(){
+  const origRender = window.renderSettings;
+  if (typeof origRender === 'function' && !origRender._aliHooked) {
+    window.renderSettings = function() {
+      origRender.apply(this, arguments);
+      setTimeout(checkAliStatus, 200);
+    };
+    window.renderSettings._aliHooked = true;
+  }
+})();
+
+// Handle ?ali_connected=1 query param after OAuth redirect lands on the app
+if (typeof window !== 'undefined' && window.location.search.includes('ali_connected=1')) {
+  setTimeout(() => {
+    toast('✅ AliExpress connected!', 'success', 6000);
+    if (S.view === 'settings') renderSettings();
+    // Clean up the URL
+    try { history.replaceState({}, '', window.location.pathname); } catch(_) {}
+  }, 500);
+}
 
 async function connectEbay() {
   if (!S.serverUrl) { toast('Set Railway URL first in Settings', 'error'); return; }
