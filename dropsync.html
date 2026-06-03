@@ -9789,56 +9789,30 @@ function aeExtractFromDom(html, aeId) {
 }
 
 async function fetchAliExpressInBrowser(aeId) {
-  // Use server-side fetch — browser popup is always cross-origin blocked
-  // (aliexpress.us ≠ DropSync origin → win.document throws SecurityError every time)
-  // Server fetches aliexpress.com with global-site cookie to get window.runParams data
+  // Use the OFFICIAL AliExpress API (ali_import action) — returns ALL variants,
+  // prices, stock, shipping reliably. No scraping. The old aeScrapeProduct
+  // path (HTML scrape) often returned only 1 variant because AliExpress's
+  // pages render variants via JS that we couldn't reliably parse server-side.
   try {
-    if (S.serverUrl) {
-      const r = await fetch(`${S.serverUrl}/api/ebay?action=aeScrapeProduct`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ aeId }),
-      });
-      const d = await r.json().catch(() => ({}));
-      if (d.success && d.product) {
-        console.log(`[fetchAliExpressInBrowser] ${aeId} server-scraped: "${d.product.title?.slice(0,40)}" vars=${d.product.variations?.length||0}`);
-        return d.product;
-      }
+    if (!S.serverUrl) return null;
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=ali_import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_id: aeId, ship_to_country: 'US', currency: 'USD' }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d.success && d.product) {
+      const vc = d.product.variations?.length || 0;
+      const skuCount = Object.keys(d.product.comboPrices || {}).length;
+      console.log(`[fetchAliExpressInBrowser] ${aeId} via API: "${d.product.title?.slice(0,40)}" — ${vc} variation dims, ${skuCount} SKUs, $${d.product.price}`);
+      return d.product;
     }
+    if (d.error) console.warn(`[fetchAliExpressInBrowser] ${aeId} API error:`, d.error);
   } catch(e) {
-    console.warn(`[fetchAliExpressInBrowser] server fetch failed: ${e.message}`);
+    console.warn(`[fetchAliExpressInBrowser] ${aeId} fetch failed:`, e.message);
   }
   return null;
-
-  // OLD: popup approach — BROKEN due to cross-origin SecurityError
-  // win.document always throws when opener is on different origin than aliexpress.us
-  return new Promise((resolve) => {
-    const url = `https://www.aliexpress.us/item/${aeId}.html`;
-    const win = window.open(url, '_blank', 'width=800,height=600,noopener=no');
-    if (!win) { resolve(null); return; }
-    const maxWait = 15000;
-    const startTime = Date.now();
-    let done = false;
-    const tryExtract = () => {
-      if (done) return;
-      if (Date.now() - startTime > maxWait) { done = true; try { win.close(); } catch(e) {} resolve(null); return; }
-      try {
-        const doc = win.document;
-        if (!doc || doc.readyState === 'loading') { setTimeout(tryExtract, 500); return; }
-        const hasVariations = doc.querySelector('[class*="sku-item--property"]');
-        const hasTitle = [...doc.querySelectorAll('h1')].some(h => h.textContent.trim().length > 10);
-        if (!hasVariations && !hasTitle && Date.now() - startTime < 8000) { setTimeout(tryExtract, 800); return; }
-        const html = doc.documentElement.outerHTML;
-        done = true; try { win.close(); } catch(e) {}
-        resolve(aeExtractFromDom(html, aeId));
-      } catch(e) {
-        if (Date.now() - startTime > maxWait) { done = true; try { win.close(); } catch(e2) {} resolve(null); } else { setTimeout(tryExtract, 800); }
-      }
-    };
-    setTimeout(tryExtract, 3000); // Initial wait for React render
-  });
 }
-
 function aeLog(msg, type='info') {
   const el = $('ae-log');
   if (!el) return;
