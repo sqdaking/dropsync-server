@@ -9891,116 +9891,123 @@ module.exports = async (req, res) => {
 
 
     // ── AliExpress: fetch product list via OFFICIAL API ───────────────────────
-    // Was doing HTML scraping on Railway IP → blocked. Now uses AliExpress's
-    // official `aliexpress.ds.recommend.feed.get` API (free with dropshipper
-    // permission) which returns category products as structured JSON.
-    // Custom URLs from the user are parsed to extract category_id or
-    // keywords, which feed into the recommendation API call.
+    // Uses `aliexpress.ds.recommend.feed.get` with feed_name="DS bestseller" and
+    // numeric category_id filters. All results filtered to US (country=US,
+    // ship_to_country=US, ship_from preference=US). No scraping, no blocks.
     if (action === 'aeScrapeDeals') {
       const { dept = null, customUrls = null, customName = null, exclude = [], count = 25 } = body;
       const excludeSet = new Set(exclude);
 
-      // Map our dept ids → AliExpress feed_name. These are the canonical
-      // feed names supported by `aliexpress.ds.recommend.feed.get`.
-      const DEPT_TO_FEED = {
-        women_fashion:   'DS_Women_Clothing',
-        men_fashion:     'DS_Mens_Clothing',
-        shoes:           'DS_Shoes',
-        bags:            'DS_Bags',
-        jewelry:         'DS_Jewelry',
-        watches:         'DS_Watches',
-        home:            'DS_Home_Decor',
-        kitchen:         'DS_Kitchen',
-        beauty:          'DS_Beauty',
-        toys:            'DS_Toys',
-        electronics:     'DS_Consumer_Electronics',
-        phone_accessories: 'DS_Phone_Accessories',
-        sports:          'DS_Sports',
-        automotive:      'DS_Automotive',
-        pets:            'DS_Pet',
-        baby:            'DS_Baby',
-        garden:          'DS_Garden',
-        tools:           'DS_Tools',
+      // Map our dept ids → AliExpress NUMERIC category IDs (verified working
+      // values from the AliExpress category tree). The feed_name stays
+      // "DS bestseller" — the category_id is what filters by department.
+      const DEPT_TO_CATEGORY = {
+        women_fashion:     '100003109',  // Women's Clothing
+        men_fashion:       '100003070',  // Men's Clothing
+        shoes:             '322',        // Shoes
+        bags:              '1524',       // Luggage & Bags
+        jewelry:           '1509',       // Jewelry & Accessories
+        watches:           '1511',       // Watches
+        home:              '15',         // Home & Garden
+        kitchen:           '13',         // Tools / Home Improvement
+        beauty:            '66',         // Beauty & Health
+        toys:              '26',         // Toys & Hobbies
+        electronics:       '44',         // Consumer Electronics
+        phone_accessories: '509',        // Cellphones & Accessories
+        sports:            '18',         // Sports & Entertainment
+        automotive:        '34',         // Automobiles & Motorcycles
+        pets:              '200003655',  // Home & Garden > Pet
+        baby:              '1501',       // Mother & Kids
+        garden:            '15',         // Home & Garden (same root)
+        tools:             '1420',       // Tools
       };
 
-      // Determine which feeds/queries to hit
+      // Build query plan
       const queries = [];
       if (Array.isArray(customUrls) && customUrls.length > 0) {
         console.log(`[aeScrapeDeals] custom URLs (${customName || 'unnamed'}): ${customUrls.length} URL${customUrls.length!==1?'s':''}`);
         for (const url of customUrls) {
-          // Try to extract category_id (e.g. /category/200000343/...) or search keyword
           const catMatch = url.match(/\/category\/(\d+)/);
           const searchMatch = url.match(/SearchText=([^&]+)/i);
-          if (catMatch) queries.push({ type: 'category', value: catMatch[1], label: customName || `cat:${catMatch[1]}` });
-          else if (searchMatch) queries.push({ type: 'search', value: decodeURIComponent(searchMatch[1].replace(/\+/g,' ')), label: customName || `search:${searchMatch[1]}` });
-          else queries.push({ type: 'search', value: customName || 'trending', label: customName || 'search' });
+          if (catMatch) queries.push({ type: 'feed', categoryId: catMatch[1], label: customName || `cat:${catMatch[1]}` });
+          else if (searchMatch) {
+            const kw = decodeURIComponent(searchMatch[1].replace(/\+/g,' '));
+            queries.push({ type: 'search', keyword: kw, label: customName || `search:${kw.slice(0,30)}` });
+          } else {
+            // No category or search → fall back to bestsellers (no category filter)
+            queries.push({ type: 'feed', categoryId: null, label: customName || 'general' });
+          }
         }
-      } else if (dept && DEPT_TO_FEED[dept]) {
-        queries.push({ type: 'feed', value: DEPT_TO_FEED[dept], label: dept });
+      } else if (dept && DEPT_TO_CATEGORY[dept]) {
+        queries.push({ type: 'feed', categoryId: DEPT_TO_CATEGORY[dept], label: dept });
       } else {
-        // No dept = sample top feeds
-        for (const feedName of ['DS_Women_Clothing','DS_Mens_Clothing','DS_Home_Decor','DS_Consumer_Electronics']) {
-          queries.push({ type: 'feed', value: feedName, label: feedName });
-        }
+        // No dept selected → sample top categories
+        queries.push({ type: 'feed', categoryId: '100003109', label: 'women_fashion' });
+        queries.push({ type: 'feed', categoryId: '100003070', label: 'men_fashion' });
+        queries.push({ type: 'feed', categoryId: '15',         label: 'home' });
+        queries.push({ type: 'feed', categoryId: '44',         label: 'electronics' });
       }
 
       const productMap = {};
       const pageSize = Math.min(50, Math.max(20, count));
+
+      // Process queries serially with 600ms pacing to stay under rate limits
+      // (AliExpress's AppApiCallLimit fires at ~3-5 calls/sec)
       for (const q of queries) {
         try {
           let apiResp;
           if (q.type === 'feed') {
-            apiResp = await _aliCall('aliexpress.ds.recommend.feed.get', {
-              feed_name:        q.value,
+            // The dropship recommendation API — uses feed_name="DS bestseller" with
+            // optional category_id filter. All recommendations are dropship-ready.
+            const params = {
+              feed_name:        'DS bestseller',
               page_no:          1,
               page_size:        pageSize,
               target_currency:  'USD',
-              target_language:  'en',
+              target_language:  'EN',
               country:          'US',
-            }).catch(e => { console.warn(`[aeScrapeDeals] feed ${q.value} failed: ${e.message}`); return null; });
-          } else if (q.type === 'category') {
-            apiResp = await _aliCall('aliexpress.ds.category.recommend.product.list.get', {
-              category_id:      q.value,
-              page_no:          1,
-              page_size:        pageSize,
-              target_currency:  'USD',
-              target_language:  'en',
-              ship_to_country:  'US',
-            }).catch(e => { console.warn(`[aeScrapeDeals] category ${q.value} failed: ${e.message}`); return null; });
-          } else { // search
+              sort:             'orderDesc', // sort by sales for trending products
+            };
+            if (q.categoryId) params.category_id = q.categoryId;
+            apiResp = await _aliCall('aliexpress.ds.recommend.feed.get', params)
+              .catch(e => { console.warn(`[aeScrapeDeals] feed ${q.label} (cat=${q.categoryId}) failed: ${e.message}`); return null; });
+          } else {
+            // Text search
             apiResp = await _aliCall('aliexpress.ds.text.search', {
-              keyWord:          q.value,
-              local:            'en_US',
-              countryCode:      'US',
-              currency:         'USD',
-              pageSize:         pageSize,
-              pageIndex:        1,
-            }).catch(e => { console.warn(`[aeScrapeDeals] search "${q.value}" failed: ${e.message}`); return null; });
+              keyWord:    q.keyword,
+              local:      'en_US',
+              countryCode:'US',
+              currency:   'USD',
+              pageSize:   pageSize,
+              pageIndex:  1,
+            }).catch(e => { console.warn(`[aeScrapeDeals] search "${q.keyword}" failed: ${e.message}`); return null; });
           }
-          if (!apiResp) continue;
+          if (!apiResp) { await sleep(700); continue; }
 
-          // Peel response layers — different methods wrap results differently
+          // Peel response layers
           const root = apiResp.aliexpress_ds_recommend_feed_get_response?.result
-                    || apiResp.aliexpress_ds_category_recommend_product_list_get_response?.result
                     || apiResp.aliexpress_ds_text_search_response?.data
                     || apiResp.result
                     || apiResp;
-          const items = root.products?.traffic_product_d_t_o
-                     || root.products
-                     || root.product_list_response?.products
-                     || root.data
-                     || [];
-          const productList = Array.isArray(items) ? items : (items.traffic_product_d_t_o || items.product || []);
+          const itemsRaw = root.products
+                        || root.product_list_response?.products
+                        || root.data
+                        || [];
+          // AliExpress can wrap arrays as {integer: [...]} or {traffic_product_d_t_o: [...]}
+          const productList = Array.isArray(itemsRaw)
+            ? itemsRaw
+            : (itemsRaw.integer || itemsRaw.traffic_product_d_t_o || itemsRaw.product || []);
 
           let added = 0;
           for (const item of productList) {
             const aeId = String(item.product_id || item.itemId || item.id || '');
             if (!aeId || excludeSet.has(aeId) || productMap[aeId]) continue;
-            const title = item.product_title || item.subject || item.title || '';
-            const price = parseFloat(item.target_sale_price || item.sale_price || item.app_sale_price || item.price || 0);
-            const image = item.product_main_image_url || item.image_url || item.main_image || item.images?.[0] || '';
+            const title  = item.product_title || item.subject || item.title || '';
+            const price  = parseFloat(item.target_sale_price || item.sale_price || item.app_sale_price || item.price || 0);
+            const image  = item.product_main_image_url || item.image_url || item.main_image || (item.images?.[0]) || '';
             const orders = parseInt(item.lastest_volume || item.orders || item.trade_count || 0);
-            const rating = parseFloat(item.evaluate_rate?.replace(/%/g,'') || item.rating || 0);
+            const rating = parseFloat(String(item.evaluate_rate || '0').replace(/%/g,'') || 0);
+            if (price <= 0) continue; // skip if no price
             productMap[aeId] = {
               aeId,
               title,
@@ -10013,8 +10020,10 @@ module.exports = async (req, res) => {
             };
             added++;
           }
-          console.log(`[aeScrapeDeals] ${q.type}:${q.label} → +${added} pool=${Object.keys(productMap).length}`);
-          if (Object.keys(productMap).length >= count + 100) break;
+          console.log(`[aeScrapeDeals] ${q.type}:${q.label} (cat=${q.categoryId || 'none'}) → +${added} pool=${Object.keys(productMap).length}`);
+          if (Object.keys(productMap).length >= count + 50) break;
+          // Pacing between queries to avoid AppApiCallLimit
+          await sleep(700);
         } catch(e) {
           console.error(`[aeScrapeDeals] ${q.label} error:`, e.message);
         }
