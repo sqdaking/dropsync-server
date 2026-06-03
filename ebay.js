@@ -9890,6 +9890,41 @@ module.exports = async (req, res) => {
     }
 
 
+    // ── DIAGNOSTIC: try various AliExpress feed names to see what works ──
+    // Visit /api/ebay?action=ali_diag in a browser. Tries common feed names
+    // and prints what came back so we know which one your app has access to.
+    if (action === 'ali_diag') {
+      const tests = [
+        { method: 'aliexpress.ds.recommend.feed.get', params: { feed_name: 'DS bestseller', page_no: 1, page_size: 5, target_currency: 'USD', target_language: 'EN', country: 'US' } },
+        { method: 'aliexpress.ds.recommend.feed.get', params: { feed_name: 'AEDS_TopSell_US', page_no: 1, page_size: 5, target_currency: 'USD', target_language: 'EN', country: 'US' } },
+        { method: 'aliexpress.ds.recommend.feed.get', params: { feed_name: 'AEDS_DropshipperRecommendation', page_no: 1, page_size: 5, target_currency: 'USD', target_language: 'EN', country: 'US' } },
+        { method: 'aliexpress.ds.recommend.feed.get', params: { feed_name: 'DS bestseller', page_no: 1, page_size: 5 } }, // minimal params
+        { method: 'aliexpress.ds.feedname.get', params: {} }, // list available feed names if endpoint exists
+        { method: 'aliexpress.ds.text.search', params: { keyWord: 'phone case', local: 'en_US', countryCode: 'US', currency: 'USD', pageSize: 5, pageIndex: 1 } },
+      ];
+      const results = [];
+      for (const t of tests) {
+        try {
+          const resp = await _aliCall(t.method, t.params);
+          results.push({
+            method: t.method,
+            params: t.params,
+            ok: true,
+            response: JSON.stringify(resp).slice(0, 500),
+          });
+        } catch(e) {
+          results.push({
+            method: t.method,
+            params: t.params,
+            ok: false,
+            error: e.message,
+          });
+        }
+        await sleep(800); // pace
+      }
+      return res.json({ tests: results });
+    }
+
     // ── AliExpress: fetch product list via OFFICIAL API ───────────────────────
     // Uses `aliexpress.ds.recommend.feed.get` with feed_name="DS bestseller" and
     // numeric category_id filters. All results filtered to US (country=US,
@@ -9969,6 +10004,7 @@ module.exports = async (req, res) => {
               sort:             'orderDesc', // sort by sales for trending products
             };
             if (q.categoryId) params.category_id = q.categoryId;
+            console.log(`[aeScrapeDeals] calling recommend.feed.get with:`, JSON.stringify(params));
             apiResp = await _aliCall('aliexpress.ds.recommend.feed.get', params)
               .catch(e => { console.warn(`[aeScrapeDeals] feed ${q.label} (cat=${q.categoryId}) failed: ${e.message}`); return null; });
           } else {
