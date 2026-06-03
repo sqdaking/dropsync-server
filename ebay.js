@@ -28,29 +28,112 @@ const ALI_ENABLED = !!(ALI_APP_KEY && ALI_APP_SECRET);
 if (ALI_ENABLED) console.log(`[ali] AliExpress integration ENABLED (App Key: ${ALI_APP_KEY})`);
 else console.log('[ali] AliExpress integration DISABLED (missing ALIEXPRESS_APP_KEY/SECRET env vars)');
 
-// Lazy-load the SDK so missing/broken install fails loud at use time, not boot.
-// Handle both CJS (named) and ESM (default-wrapped) export shapes — newer
-// builds of ae_sdk are TypeScript-compiled to CJS but may put exports under
-// `default` depending on bundling.
-let _aeSdk = null;
-function _getAeSdk() {
-  if (_aeSdk) return _aeSdk;
-  let mod;
-  try { mod = require('ae_sdk'); }
-  catch(e) { throw new Error(`ae_sdk not installed: ${e.message}. Run 'npm install' on the server.`); }
-  // Possible shapes:
-  //   { AESystemClient, DropshipperClient, AffiliateClient }  ← named CJS
-  //   { default: { AESystemClient, ... } }                    ← ESM via interop
-  //   { default: AESystemClient }                              ← single-default
-  const candidates = [mod, mod.default, mod.default?.default].filter(Boolean);
-  for (const c of candidates) {
-    if (c.AESystemClient || c.DropshipperClient || c.AffiliateClient) {
-      _aeSdk = c;
-      console.log('[ali] ae_sdk loaded, exports:', Object.keys(c).filter(k => /Client$/.test(k)).join(', '));
-      return _aeSdk;
-    }
+// Build HMAC-SHA256 signature for AliExpress signed-API endpoints.
+// AliExpress has two signing styles documented across their docs/SDKs:
+//   1) System API (gateway /sync): HMAC-SHA256 of `sorted_params_concat`
+//   2) REST API (/rest/auth/token/*): HMAC-SHA256 of `path + sorted_params_concat`
+// `sorted_params_concat` = sorted-by-key params joined as "k1v1k2v2k3v3".
+const crypto = require('crypto');
+function _aliSign(params, secret) {
+  const sorted = Object.keys(params).sort().filter(k => params[k] !== '' && params[k] != null);
+  const concat = sorted.map(k => `${k}${params[k]}`).join('');
+  return crypto.createHmac('sha256', secret).update(concat, 'utf8').digest('hex').toUpperCase();
+}
+function _aliSignRest(path, params, secret) {
+  const sorted = Object.keys(params).sort().filter(k => params[k] !== '' && params[k] != null);
+  const concat = path + sorted.map(k => `${k}${params[k]}`).join('');
+  return crypto.createHmac('sha256', secret).update(concat, 'utf8').digest('hex').toUpperCase();
+}
+
+const ALI_TOKEN_URL = 'https://api-sg.aliexpress.com/rest/auth/token/create';
+const ALI_REFRESH_URL = 'https://api-sg.aliexpress.com/rest/auth/token/refresh';
+const ALI_API_GATEWAY = 'https://api-sg.aliexpress.com/sync';
+
+// Manual token exchange — POSTs to the /rest/auth/token/create endpoint with
+// path-prefixed HMAC signing. Logs verbosely so signature mismatches are easy
+// to diagnose. AliExpress's SDK doesn't include AESystemClient in v0.6.0 so
+// we sign manually.
+async function _aliExchangeCode(code) {
+  const params = {
+    app_key:     ALI_APP_KEY,
+    code:        code,
+    sign_method: 'sha256',
+    timestamp:   String(Date.now()),
+  };
+  params.sign = _aliSignRest('/auth/token/create', params, ALI_APP_SECRET);
+  console.log(`[ali] token-exchange params: app_key=${ALI_APP_KEY} code=${code.slice(0,15)}... ts=${params.timestamp} sign=${params.sign.slice(0,12)}...`);
+  // POST with form-encoded body
+  const r = await fetch(ALI_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params).toString(),
+  });
+  const j = await r.json().catch(() => ({}));
+  console.log(`[ali] token-exchange response:`, JSON.stringify(j).slice(0, 300));
+  if (!j.access_token) {
+    const err = j.error_response || j;
+    throw new Error(`${err.code || 'Error'}: ${err.message || err.msg || JSON.stringify(err)}`);
   }
-  throw new Error(`ae_sdk loaded but no client classes found. Module keys: ${Object.keys(mod).join(', ')}. Check ae_sdk version.`);
+  return {
+    access_token:  j.access_token,
+    refresh_token: j.refresh_token,
+    expires_in:    j.expires_in,
+    user_id:       j.user_id || j.account || null,
+  };
+}
+
+async function _aliRefreshToken(refreshTok) {
+  const params = {
+    app_key:       ALI_APP_KEY,
+    refresh_token: refreshTok,
+    sign_method:   'sha256',
+    timestamp:     String(Date.now()),
+  };
+  params.sign = _aliSignRest('/auth/token/refresh', params, ALI_APP_SECRET);
+  const r = await fetch(ALI_REFRESH_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params).toString(),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!j.access_token) {
+    const err = j.error_response || j;
+    throw new Error(`Refresh failed: ${err.code || ''} ${err.message || err.msg || JSON.stringify(err)}`);
+  }
+  return {
+    access_token:  j.access_token,
+    refresh_token: j.refresh_token || refreshTok,
+    expires_in:    j.expires_in,
+    user_id:       j.user_id || null,
+  };
+}
+
+// Call a System API endpoint (any aliexpress.* method) with auto-signing.
+// Uses the /sync gateway which signs WITHOUT path prefix.
+async function _aliCall(methodName, extraParams = {}) {
+  const accessToken = await _aliGetAccessToken();
+  const params = {
+    app_key:      ALI_APP_KEY,
+    method:       methodName,
+    access_token: accessToken,
+    sign_method:  'sha256',
+    timestamp:    String(Date.now()),
+    format:       'json',
+    v:            '2.0',
+    ...extraParams,
+  };
+  params.sign = _aliSign(params, ALI_APP_SECRET);
+  const r = await fetch(ALI_API_GATEWAY, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params).toString(),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (j.error_response) {
+    const e = j.error_response;
+    throw new Error(`AliExpress ${methodName}: ${e.code || ''} ${e.msg || e.message || JSON.stringify(e)} ${e.sub_code ? '('+e.sub_code+')' : ''}`);
+  }
+  return j;
 }
 
 // Lazy-init AliExpress tokens table (uses _cachePool which is already
@@ -102,26 +185,7 @@ async function _aliLoadTokens() {
   return r.rows[0] || null;
 }
 
-// Exchange OAuth code for tokens using ae_sdk's known-good signing.
-async function _aliExchangeCode(code) {
-  const sdk = _getAeSdk();
-  const sys = new sdk.AESystemClient({
-    app_key:    ALI_APP_KEY,
-    app_secret: ALI_APP_SECRET,
-  });
-  const r = await sys.generateToken({ code });
-  if (!r.ok) throw new Error(r.message || JSON.stringify(r.error_response || r));
-  // Peel response payload (AE wraps under method-name keys)
-  const inner = r.data?.aliexpress_system_oauth2_token_create_response
-             || r.data?.access_token_create_response
-             || r.data;
-  return {
-    access_token:  inner.access_token,
-    refresh_token: inner.refresh_token,
-    expires_in:    inner.expires_in,
-    user_id:       inner.user_id || inner.account || null,
-  };
-}
+// Exchange OAuth code for tokens — see implementation near top of file (_aliExchangeCode is defined above with manual HMAC signing).
 
 // Get a fresh access_token — auto-refreshes if within 24h of expiry.
 async function _aliGetAccessToken() {
@@ -131,55 +195,32 @@ async function _aliGetAccessToken() {
   if (ms_remaining > 24 * 3600 * 1000) return t.access_token;
   // Refresh
   console.log(`[ali] token expires in ${(ms_remaining / 3600000).toFixed(1)}h, refreshing…`);
-  const sdk = _getAeSdk();
-  const sys = new sdk.AESystemClient({
-    app_key:    ALI_APP_KEY,
-    app_secret: ALI_APP_SECRET,
-  });
-  const r = await sys.refreshToken({ refresh_token: t.refresh_token });
-  if (!r.ok) throw new Error(`AliExpress refresh failed: ${r.message || JSON.stringify(r)}`);
-  const inner = r.data?.aliexpress_system_oauth2_token_refresh_response
-             || r.data?.refresh_token_response
-             || r.data;
+  const fresh = await _aliRefreshToken(t.refresh_token);
   await _aliSaveTokens({
-    access_token:  inner.access_token,
-    refresh_token: inner.refresh_token || t.refresh_token,
-    expires_in:    inner.expires_in,
-    seller_id:     inner.user_id || t.seller_id,
+    access_token:  fresh.access_token,
+    refresh_token: fresh.refresh_token,
+    expires_in:    fresh.expires_in,
+    seller_id:     fresh.user_id || t.seller_id,
   });
-  return inner.access_token;
+  return fresh.access_token;
 }
 
-// Get a dropshipper client with the current access token applied.
-async function _aliDropshipper() {
-  const sdk = _getAeSdk();
-  const session = await _aliGetAccessToken();
-  return new sdk.DropshipperClient({
-    app_key:    ALI_APP_KEY,
-    app_secret: ALI_APP_SECRET,
-    session,
-  });
-}
-
-// Fetch product + freight via SDK. Returns raw API responses for _aliToDropSyncProduct.
+// Fetch product + freight via the System API (no SDK).
 async function _aliFetchProductAndFreight(productId, shipTo = 'US', currency = 'USD') {
-  const client = await _aliDropshipper();
-  const [pResp, fResp] = await Promise.all([
-    client.productDetails({
+  const [apiResp, freightResp] = await Promise.all([
+    _aliCall('aliexpress.ds.product.get', {
       product_id: productId,
       ship_to_country: shipTo,
       target_currency: currency,
       target_language: 'en',
     }),
-    client.shippingInfo({
-      country_code: shipTo,
-      product_id: productId,
-      product_num: 1,
-      send_goods_country_code: 'CN',
+    _aliCall('aliexpress.ds.freight.query', {
+      queryDeliveryReq: JSON.stringify({
+        quantity: '1', productId: productId, shipToCountry: shipTo, productNum: 1,
+      }),
     }).catch(e => { console.warn(`[ali] freight query failed: ${e.message}`); return null; }),
   ]);
-  if (!pResp.ok) throw new Error(`AliExpress product fetch: ${pResp.message || JSON.stringify(pResp.error_response)}`);
-  return { apiResp: pResp.data, freightResp: fResp?.ok ? fResp.data : null };
+  return { apiResp, freightResp };
 }
 
 // Convert AliExpress product API response into DropSync's internal product
