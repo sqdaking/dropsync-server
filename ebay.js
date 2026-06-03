@@ -9984,6 +9984,10 @@ module.exports = async (req, res) => {
           }
           if (!apiResp) { await sleep(700); continue; }
 
+          // DIAGNOSTIC: log raw response shape (first 800 chars) so we can
+          // see exactly what AliExpress returned. Remove once stable.
+          console.log(`[aeScrapeDeals] ${q.label} RAW:`, JSON.stringify(apiResp).slice(0, 800));
+
           // Peel response layers
           const root = apiResp.aliexpress_ds_recommend_feed_get_response?.result
                     || apiResp.aliexpress_ds_text_search_response?.data
