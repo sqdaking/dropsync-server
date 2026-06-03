@@ -9836,13 +9836,22 @@ module.exports = async (req, res) => {
 
     // ── AliExpress: fetch product list from category pages ─────────────────────
     if (action === 'aeScrapeDeals') {
-      const { dept = null, exclude = [], count = 25, maxDeliveryDays = 21, minRating = 4.5, minOrders = 50 } = body;
+      const { dept = null, customUrls = null, customName = null, exclude = [], count = 25, maxDeliveryDays = 21, minRating = 4.5, minOrders = 50 } = body;
       const excludeSet = new Set(exclude);
 
-      const deptUrls = dept && AE_DEPT_URLS[dept] ? AE_DEPT_URLS[dept] : null;
-      const normalizedPages = deptUrls
-        ? deptUrls.map(url => ({ url, dept: dept }))
-        : Object.entries(AE_DEPT_URLS).flatMap(([d, urls]) => urls.slice(0, 2).map(url => ({ url, dept: d })));
+      // Custom URLs: override the dept-based URL map. Lets the user paste any
+      // AliExpress search/category/store URL. We split queries between the
+      // provided URLs evenly so all of them get hit.
+      let normalizedPages;
+      if (Array.isArray(customUrls) && customUrls.length > 0) {
+        console.log(`[aeScrapeDeals] custom URLs (${customName || 'unnamed'}): ${customUrls.length} URL${customUrls.length!==1?'s':''}`);
+        normalizedPages = customUrls.map(url => ({ url, dept: customName || 'custom' }));
+      } else {
+        const deptUrls = dept && AE_DEPT_URLS[dept] ? AE_DEPT_URLS[dept] : null;
+        normalizedPages = deptUrls
+          ? deptUrls.map(url => ({ url, dept: dept }))
+          : Object.entries(AE_DEPT_URLS).flatMap(([d, urls]) => urls.slice(0, 2).map(url => ({ url, dept: d })));
+      }
 
       const productMap = {};
       const aeHeaders = {
