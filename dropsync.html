@@ -1273,7 +1273,7 @@ async function doAliImport(rawUrl) {
     // Mark this as an AliExpress product so push uses AliExpress markup/policies.
     product._source = 'aliexpress';
     product.url = rawUrl;
-    product.markup = S.aliMarkup ?? 35;
+    product.markup = S.ae_markup ?? 40;
     IMP = product;
     _scraping = false;
     renderImport();
@@ -1350,8 +1350,8 @@ async function doScrape() {
     }
     IMP = d.product;
     IMP.url = url;
-    // Use source-specific markup: AliExpress gets aliMarkup, Amazon/others get markup.
-    IMP.markup = (IMP._source === 'aliexpress') ? (S.aliMarkup ?? 35) : (S.markup ?? 23);
+    // Use source-specific markup: AliExpress gets ae_markup, Amazon/others get markup.
+    IMP.markup = (IMP._source === 'aliexpress') ? (S.ae_markup ?? 40) : (S.markup ?? 23);
 
     // ── Duplicate detection for multi-ASIN listings ──────────────────────
     // Two different variant ASINs from the same parent listing share parentAsin
@@ -1664,12 +1664,12 @@ async function doPush() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token: token, product: prod,
-        fulfillmentPolicyId: _isAli ? (S.aliFulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
-        paymentPolicyId:     _isAli ? (S.aliPaymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
-        returnPolicyId:      _isAli ? (S.aliReturnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
-        markup:        IMP.markup != null ? IMP.markup : (_isAli ? (S.aliMarkup ?? 35) : (S.markup || 23)),
-        handlingCost:  _isAli ? (S.aliHandlingCost ?? 2) : (S.handlingCost || 2),
-        quantity:      _isAli ? (S.aliQuantity ?? 5)     : (S.quantity || 1),
+        fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
+        paymentPolicyId:     _isAli ? (S.ae_paymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
+        returnPolicyId:      _isAli ? (S.ae_returnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
+        markup:        IMP.markup != null ? IMP.markup : (_isAli ? (S.ae_markup ?? 40) : (S.markup || 23)),
+        handlingCost:  _isAli ? (S.ae_handlingCost ?? 2) : (S.handlingCost || 2),
+        quantity:      _isAli ? (S.ae_quantity ?? 1)     : (S.quantity || 1),
         existingEbaySku: IMP.ebaySku || null,
       }),
     });
@@ -5350,14 +5350,25 @@ async function _relayTick() {
   try {
     console.log(`[relay] Revising [${_relayCursor}/${listed.length}]: "${(p.title||'').slice(0,45)}"`);
     await smartSyncProduct(p);
-    console.log(`[relay] ✓ done — next in 30s`);
+    // SLOW MODE for Amazon: longer base interval + random jitter so the
+    // request pattern doesn't look like a bot. Default 2-3 minutes between
+    // listings. User can override via S.relaySlowMs (base) — set lower if
+    // catalog is small and you have time.
+    const baseMs = (S.relaySlowMs != null) ? S.relaySlowMs : 120000; // 2 min default
+    const jitterMs = Math.floor(Math.random() * 60000);              // 0-60s jitter
+    const nextMs = baseMs + jitterMs;
+    console.log(`[relay] ✓ done — next in ${Math.round(nextMs/1000)}s (slow mode, randomized)`);
+    _relayRunning = false;
+    _relayTimer = setTimeout(_relayTick, nextMs);
+    _renderRelayStatus();
+    return;
   } catch(e) {
     console.warn(`[relay] failed for ${p.id}: ${e.message}`);
   }
 
   _relayRunning = false;
-  // 30s between revises — same cadence as worker
-  _relayTimer = setTimeout(_relayTick, 45000); // 45s — gives Amazon enough cooldown
+  // On failure, wait the standard slow interval before retrying
+  _relayTimer = setTimeout(_relayTick, (S.relaySlowMs != null ? S.relaySlowMs : 120000));
   _renderRelayStatus();
 }
 
@@ -8176,58 +8187,6 @@ function renderSettings() {
         </div>
       </div>
 
-      <!-- AliExpress Pricing & Policies -->
-      <div class="card">
-        <div class="card-header">
-          <span class="card-title">🌏 AliExpress Pricing & Policies</span>
-          <button class="btn btn-outline btn-sm" onclick="loadPolicies().then(()=>{renderSettings();toast('Policies loaded','success')})">↻ Load policies from eBay</button>
-        </div>
-        <div class="card-body" style="display:flex;flex-direction:column;gap:12px">
-          <div style="font-size:12px;color:var(--text3);margin-bottom:4px">
-            These settings apply only to listings sourced from AliExpress. Amazon listings use the separate settings above.
-          </div>
-          <div>
-            <label>AliExpress Markup % <span style="color:var(--text3);font-weight:400">(default 35% — higher than Amazon since AliExpress prices are lower)</span></label>
-            <input class="input" type="number" id="ali-markup" min="0" max="500" step="1" value="${S.aliMarkup ?? 35}"
-              onchange="S.aliMarkup=parseFloat(this.value)||35;save();toast('AliExpress markup saved','success')">
-          </div>
-          <div>
-            <label>AliExpress Handling Cost ($) <span style="color:var(--text3);font-weight:400">(per order, added before markup)</span></label>
-            <input class="input" type="number" id="ali-handling" min="0" max="100" step="0.5" value="${S.aliHandlingCost ?? 2}"
-              onchange="S.aliHandlingCost=parseFloat(this.value)||2;save();toast('AliExpress handling saved','success')">
-          </div>
-          <div>
-            <label>AliExpress Default Quantity <span style="color:var(--text3);font-weight:400">(eBay listing qty per in-stock variant)</span></label>
-            <input class="input" type="number" id="ali-quantity" min="1" max="999" step="1" value="${S.aliQuantity ?? 5}"
-              onchange="S.aliQuantity=parseInt(this.value)||5;save();toast('AliExpress quantity saved','success')">
-          </div>
-          <div>
-            <label>eBay Fulfillment Policy <span style="color:var(--text3);font-weight:400">(shipping policy for AliExpress listings)</span></label>
-            <select class="input" id="ali-fp" onchange="S.aliFulfillmentPolicyId=this.value;save();toast('Shipping policy saved','success')">
-              <option value="">— Use default —</option>
-              ${(S.fulfillmentPolicies || []).map(p => `<option value="${p.fulfillmentPolicyId}" ${S.aliFulfillmentPolicyId === p.fulfillmentPolicyId ? 'selected' : ''}>${p.name}</option>`).join('')}
-            </select>
-          </div>
-          <div>
-            <label>eBay Return Policy <span style="color:var(--text3);font-weight:400">(returns for AliExpress listings)</span></label>
-            <select class="input" id="ali-rp" onchange="S.aliReturnPolicyId=this.value;save();toast('Return policy saved','success')">
-              <option value="">— Use default —</option>
-              ${(S.returnPolicies || []).map(p => `<option value="${p.returnPolicyId}" ${S.aliReturnPolicyId === p.returnPolicyId ? 'selected' : ''}>${p.name}</option>`).join('')}
-            </select>
-          </div>
-          <div>
-            <label>eBay Payment Policy</label>
-            <select class="input" id="ali-pp" onchange="S.aliPaymentPolicyId=this.value;save();toast('Payment policy saved','success')">
-              <option value="">— Use default —</option>
-              ${(S.paymentPolicies || []).map(p => `<option value="${p.paymentPolicyId}" ${S.aliPaymentPolicyId === p.paymentPolicyId ? 'selected' : ''}>${p.name}</option>`).join('')}
-            </select>
-          </div>
-          <div style="font-size:11px;color:var(--text3);margin-top:4px">
-            <b>Tip:</b> AliExpress shipping can take 2-4 weeks. Use a shipping policy with a longer handling time and clearly disclose dispatch timing in your listings to avoid eBay defects.
-          </div>
-        </div>
-      </div>
-
       <!-- eBay Connection -->
       <div class="card">
         <div class="card-header"><span class="card-title">⚡ eBay Connection</span></div>
@@ -8418,6 +8377,13 @@ function renderSettings() {
                 onchange="S.workerConcurrency=Math.min(10,Math.max(1,parseInt(this.value)||1));save();
                   if(S.serverUrl)fetch(S.serverUrl+'/api/settings/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({worker_concurrency:String(S.workerConcurrency)})}).catch(()=>{})">
               <span style="font-size:11px;color:var(--text3)">products revised at once (1–10)</span>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;margin-top:10px;padding:10px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:8px">
+              <span style="font-size:12px;font-weight:600;color:#f59e0b">🐢 Amazon Slow Mode</span>
+              <input type="number" min="30" max="600" step="10" value="${Math.round((S.relaySlowMs ?? 120000)/1000)}"
+                style="width:70px;padding:4px 8px;border-radius:6px;border:1px solid var(--border);background:var(--bg2);color:var(--text1);font-size:13px;text-align:center"
+                onchange="S.relaySlowMs=Math.max(30,Math.min(600,parseInt(this.value)||120))*1000;save();toast('Amazon slow mode set to '+Math.round(S.relaySlowMs/1000)+'s + random jitter','success')">
+              <span style="font-size:11px;color:var(--text3)">seconds between Amazon listings (+random 0-60s jitter). Default 120s. Higher = safer from blocking.</span>
             </div>` : ''}
             <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
               <span id="relay-status" style="font-size:12px;font-weight:600;color:${_relayTimer ? 'var(--green)' : 'var(--red)'}">
