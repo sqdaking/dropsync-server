@@ -1888,6 +1888,76 @@ function deleteCustomBulkDept(index) {
   renderBulk();
 }
 
+// ── ALIEXPRESS CUSTOM URLS ─────────────────────────────────────────────────
+// Parallel to the Amazon custom-dept system above, but for AliExpress search,
+// category, and store URLs. Stored in S.customAeDepts.
+function showAddCustomAeDept() {
+  const existing = (S.customAeDepts || []).map((d,i) =>
+    `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">
+      <span style="font-size:13px;flex:1">🔗 <b>${d.name}</b> <span style="color:var(--text3);font-size:11px">(${d.urls?.length||0} URL${d.urls?.length!==1?'s':''})</span></span>
+      <button onclick="deleteCustomAeDept(${i});this.closest('.modal-overlay').remove();showAddCustomAeDept()" style="background:none;border:none;cursor:pointer;color:var(--red);font-size:14px">✕</button>
+    </div>`
+  ).join('') || '<p style="color:var(--text3);font-size:12px">No custom AliExpress sources yet.</p>';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;display:flex;align-items:center;justify-content:center';
+  overlay.innerHTML = `
+    <div style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px;width:520px;max-width:95vw;max-height:80vh;overflow-y:auto;display:flex;flex-direction:column;gap:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <h3 style="margin:0;font-size:16px;color:#ff6b00">🔗 Custom AliExpress Sources</h3>
+        <button onclick="this.closest('.modal-overlay').remove()" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:20px">✕</button>
+      </div>
+
+      ${existing ? `<div>${existing}</div>` : ''}
+
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <div style="font-size:12px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.06em">Add new AliExpress source</div>
+        <input id="custom-ae-name" placeholder="Name (e.g. Trendy Dresses)" class="input" style="font-size:13px" />
+        <textarea id="custom-ae-urls" placeholder="AliExpress URLs — one per line
+e.g. https://www.aliexpress.com/wholesale?SearchText=summer+dress
+https://www.aliexpress.com/category/200000343/women-tops-tees.html
+https://www.aliexpress.com/store/1102234567" class="input" style="font-size:12px;height:110px;resize:vertical;font-family:monospace"></textarea>
+        <div style="font-size:11px;color:var(--text3)">Paste any AliExpress search, category, or store URL. The server will fetch products via the official API and queue them for review.</div>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button onclick="this.closest('.modal-overlay').remove()" class="btn btn-ghost btn-sm">Cancel</button>
+          <button onclick="saveCustomAeDept()" class="btn btn-sm" style="background:#ff6b00;color:#fff;font-weight:700">Add Source</button>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+}
+
+function saveCustomAeDept() {
+  const name = document.getElementById('custom-ae-name')?.value?.trim();
+  const urlsRaw = document.getElementById('custom-ae-urls')?.value?.trim();
+  if (!name) { toast('Enter a name for this source', 'warn', 2000); return; }
+  if (!urlsRaw) { toast('Enter at least one URL', 'warn', 2000); return; }
+  const urls = urlsRaw.split('\n').map(u => u.trim()).filter(u => u.startsWith('http'));
+  if (!urls.length) { toast('No valid URLs found — must start with http', 'warn', 3000); return; }
+  if (!urls.every(u => /aliexpress\.(com|us)/i.test(u))) {
+    if (!confirm('Some URLs don\'t look like AliExpress URLs. Add them anyway?')) return;
+  }
+  if (!S.customAeDepts) S.customAeDepts = [];
+  S.customAeDepts.push({ name, urls });
+  save();
+  document.querySelector('.modal-overlay')?.remove();
+  window.AE_SELECTED_DEPT = 'custom_' + (S.customAeDepts.length - 1);
+  renderAeImport();
+  toast(`✅ Added "${name}" — ${urls.length} URL${urls.length!==1?'s':''}`, 'success', 3000);
+}
+
+function deleteCustomAeDept(index) {
+  if (!S.customAeDepts) return;
+  const name = S.customAeDepts[index]?.name;
+  S.customAeDepts.splice(index, 1);
+  save();
+  if (window.AE_SELECTED_DEPT === 'custom_' + index) window.AE_SELECTED_DEPT = 'all';
+  toast(`Removed "${name}"`, 'info', 2000);
+  renderAeImport();
+}
+
 function renderBulk() {
   bulkLoadState();
   const listedBulk = (S.products||[]).filter(p=>p.status==='listed' && p._bulk).length;
@@ -9440,7 +9510,7 @@ function renderAeImport() {
 
           <!-- Dept selector -->
           <div>
-            <div style="font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">SELECT DEPARTMENT</div>
+            <div style="font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">SELECT DEPARTMENT OR CUSTOM URL</div>
             <div style="display:flex;flex-wrap:wrap;gap:6px">
               ${AE_DEPTS.map(d => `
                 <button onclick="window.AE_SELECTED_DEPT='${d.id}';renderAeImport()" title="${d.label}"
@@ -9450,6 +9520,27 @@ function renderAeImport() {
                   color:${selDept===d.id?'#fff':'var(--text2)'}">
                   ${d.emoji} ${d.label}
                 </button>`).join('')}
+              ${(S.customAeDepts||[]).map((d,i) => {
+                const cid = 'custom_' + i;
+                const active = selDept === cid;
+                return `<span style="display:inline-flex;align-items:center;gap:2px">
+                  <button onclick="window.AE_SELECTED_DEPT='${cid}';renderAeImport()" title="${(d.urls||[]).join(', ').slice(0,80)}"
+                    style="display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:20px 0 0 20px;font-size:12px;font-weight:500;cursor:pointer;
+                    border:1.5px solid ${active?'#ff6b00':'var(--border)'};border-right:none;
+                    background:${active?'rgba(255,107,0,.2)':'transparent'};color:${active?'#ff6b00':'var(--text2)'}">
+                    🔗 ${d.name}
+                  </button>
+                  <button onclick="deleteCustomAeDept(${i})" title="Remove this custom source"
+                    style="padding:5px 8px;border-radius:0 20px 20px 0;font-size:11px;cursor:pointer;
+                    border:1.5px solid ${active?'#ff6b00':'var(--border)'};border-left:none;
+                    background:${active?'rgba(255,107,0,.2)':'transparent'};color:var(--text3)">✕</button>
+                </span>`;
+              }).join('')}
+              <button onclick="showAddCustomAeDept()" title="Add a custom AliExpress URL (search results, category, store, etc.)"
+                style="display:inline-flex;align-items:center;gap:5px;padding:5px 12px;border-radius:20px;font-size:12px;font-weight:500;cursor:pointer;
+                border:1.5px dashed var(--border);background:transparent;color:var(--text3)">
+                + Add URL
+              </button>
             </div>
           </div>
 
@@ -9461,7 +9552,14 @@ function renderAeImport() {
               ${AE.scraping||AE.pushing?'disabled':''}>
               ${AE.scraping
                 ? '<span style="display:inline-flex;align-items:center;gap:6px"><div class="spinner" style="width:12px;height:12px"></div> Scanning AliExpress…</span>'
-                : `${selDeptInfo.emoji} Fetch 25 from ${selDeptInfo.label}`}
+                : (() => {
+                    if (selDept && selDept.startsWith('custom_')) {
+                      const _ci = parseInt(selDept.replace('custom_',''));
+                      const _cd = (S.customAeDepts||[])[_ci];
+                      return _cd ? `🔗 Fetch 25 from ${_cd.name}` : `🔗 Fetch 25 from Custom`;
+                    }
+                    return `${selDeptInfo.emoji} Fetch 25 from ${selDeptInfo.label}`;
+                  })()}
             </button>
             ${qLen > 0 ? `<button class="btn btn-success" onclick="aePushAll()" ${AE.pushing?'disabled':''}>
               ${AE.pushing
@@ -9799,17 +9897,34 @@ async function aeFetchDeals(dept) {
   dept = dept || window.AE_SELECTED_DEPT || 'all';
   if (!S.serverUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
   if (AE.scraping) return;
+
+  // If custom URL dept selected, resolve to URLs list
+  let customUrls = null;
+  let displayName = dept;
+  if (dept && dept.startsWith('custom_')) {
+    const ci = parseInt(dept.replace('custom_', ''));
+    const cd = (S.customAeDepts || [])[ci];
+    if (!cd || !cd.urls?.length) {
+      toast('Custom source not found or has no URLs', 'error');
+      return;
+    }
+    customUrls = cd.urls;
+    displayName = cd.name;
+  }
+
   AE.scraping = true;
   renderAeImport();
 
   try {
-    aeLog(`Scanning AliExpress ${dept === 'all' ? 'all departments' : dept}…`);
+    aeLog(`Scanning AliExpress ${customUrls ? `from "${displayName}" (${customUrls.length} URL${customUrls.length!==1?'s':''})` : (dept === 'all' ? 'all departments' : dept)}…`);
     const usedSet = new Set([...AE.usedIds, ...(S.products||[]).filter(p=>p._source==='aliexpress').map(p=>p.aeId).filter(Boolean)]);
 
     const r = await fetch(`${S.serverUrl}/api/ebay?action=aeScrapeDeals`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({
-        dept: dept === 'all' ? null : dept,
+        dept: customUrls ? null : (dept === 'all' ? null : dept),
+        customUrls,                       // explicit URLs from custom source
+        customName: customUrls ? displayName : null,
         exclude: [...usedSet],
         count: 40,
         maxDeliveryDays: S.ae_maxDeliveryDays || 21,
