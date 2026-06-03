@@ -9805,7 +9805,19 @@ async function fetchAliExpressInBrowser(aeId) {
       const vc = d.product.variations?.length || 0;
       const skuCount = Object.keys(d.product.comboPrices || {}).length;
       console.log(`[fetchAliExpressInBrowser] ${aeId} via API: "${d.product.title?.slice(0,40)}" — ${vc} variation dims, ${skuCount} SKUs, $${d.product.price}`);
-      return d.product;
+      // Server uses `aliProductId` but bulk-import code expects `aeId` —
+      // also set `hasVariations` flag and `aeShipping` for compat.
+      const p = d.product;
+      p.aeId          = p.aliProductId || p.asin || aeId;
+      p.hasVariations = (p.variations?.length || 0) > 0 && Object.keys(p.comboPrices || {}).length > 0;
+      p.aeShipping    = p.shipping || 0;
+      // ebayTitle if not already present
+      if (!p.ebayTitle) {
+        p.ebayTitle = (p.title || '').replace(/[^a-zA-Z0-9 ,&\-().']/g,' ').replace(/\s+/g,' ').trim().slice(0,80);
+      }
+      // variationImages map (empty for now — could populate from sku images later)
+      p.variationImages = p.variationImages || {};
+      return p;
     }
     if (d.error) console.warn(`[fetchAliExpressInBrowser] ${aeId} API error:`, d.error);
   } catch(e) {
