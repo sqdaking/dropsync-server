@@ -544,10 +544,14 @@ async function fetchAmazonMini(asin) {
       const finalOpts = _proxyEnabled && _proxyAgent ? { ...opts, agent: _proxyAgent } : opts;
       const r = await fetch(ep, finalOpts);
       const html = await r.text();
+      // DIAGNOSTIC: log status + response info
+      const epName = ep.includes('aod') ? 'aod' : 'product/ajax';
+      const sample = html.slice(0, 80).replace(/\s+/g, ' ');
+      console.log(`[mini] ${asin} ${epName}: status=${r.status} len=${html.length} proxy=${!!finalOpts.agent} sample="${sample}"`);
       if (!html || html.length < 200) continue;
       // Detect block / captcha
       if (/api-services-support@amazon\.com|To discuss automated access|enter the characters/i.test(html)) {
-        console.log(`[mini] ${asin}: blocked at ${ep.split('?')[0].split('/').pop()}`);
+        console.log(`[mini] ${asin}: blocked at ${epName}`);
         continue;
       }
       // Extract price from mini-HTML
