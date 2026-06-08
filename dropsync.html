@@ -7467,28 +7467,26 @@ async function smartSyncProduct(p) {
     const token = await ensureToken();
 
     // ── PRE-FETCH AMAZON DATA VIA BROWSER (CODETABS/CORSPROXY) ──────────────
-    // Server NEVER fetches Amazon — it's our job. Use fetchAmazonInBrowser
-    // (which routes through codetabs.com CORS proxy) to grab the parent page,
-    // then prefetchAsinPrices to gather all variant prices. Ship to server
-    // as clientAsinData. If browser fetch fails entirely, server skips this
-    // sync cycle (no fallback to direct fetch — would hit Railway IP block).
+    // BROWSER-FIRST, SERVER-FALLBACK: Try fetching Amazon in the browser via
+    // codetabs/corsproxy. If that works, send prices to server as clientAsinData
+    // (server doesn't burn proxy bandwidth). If browser fails (all proxies
+    // blocked), let the server handle it via DataImpulse + mini-endpoints
+    // (~5-30KB per ASIN, way cheaper than full pages).
     let _clientAsinData = null;
     try {
       const parentHtml = await fetchAmazonInBrowser(p.sourceUrl).catch(() => null);
       if (parentHtml && parentHtml.length > 5000) {
         _clientAsinData = await prefetchAsinPrices(parentHtml);
         const _n = Object.keys(_clientAsinData || {}).length;
-        if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku}`);
-        else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices extracted`);
+        if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
+        else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices — server will mini-fetch`);
       } else {
-        console.warn(`[smartSync] ${p.ebaySku}: could not fetch Amazon parent page (codetabs/corsproxy all failed)`);
+        console.warn(`[smartSync] ${p.ebaySku}: browser fetch failed — server will mini-fetch via DataImpulse`);
       }
     } catch(_pe) { console.warn(`[smartSync] prefetch failed:`, _pe.message); }
-    if (!_clientAsinData || Object.keys(_clientAsinData).length === 0) {
-      // Don't even ask the server to sync — it would skip anyway. Just log.
-      console.log(`[smartSync] ${p.ebaySku}: skipping (no browser data, server would refuse)`);
-      return { skipped: true, reason: 'browser fetch failed' };
-    }
+    // No bail-out here — server has the proxy + mini-endpoints. clientAsinData
+    // is sent if we have it (free); if we don't, server fetches each ASIN via
+    // its lightweight AJAX endpoint through residential proxy.
 
     const r = await fetch(`${S.serverUrl}/api/ebay?action=smartSync`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
