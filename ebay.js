@@ -7,13 +7,36 @@ const _nfFn = _nodeFetch.default || _nodeFetch;
 // Replace global fetch with node-fetch so existing code paths use it transparently
 global.fetch = _nfFn;
 
-// ── PROXY DISABLED ─────────────────────────────────────────────────────────
-// Residential proxy removed. Server uses direct fetch for all Amazon URLs.
-// AliExpress uses official API (no fetching). DataImpulse is no longer in
-// the flow — _withProxy is a passthrough now.
-const _proxyEnabled = false;
-const _proxyAgent = null;
-console.log('[proxy] DISABLED — server uses direct fetch; AliExpress uses official API');
+// ── RESIDENTIAL PROXY (DataImpulse) — MINI-ENDPOINT ONLY ──────────────────
+// Used ONLY for smartSync's price+stock mini-endpoint fetches (~5-30KB each
+// vs 1.5MB for full pages). Saves 99%+ vs full-page proxying. Bulk import
+// + push still use browser/codetabs (no proxy bandwidth). AliExpress uses
+// official API (no proxy).
+//
+// Env vars in Railway:
+//   PROXY_HOST = gw.dataimpulse.com
+//   PROXY_PORT = 823
+//   PROXY_USER = <your login>
+//   PROXY_PASS = <your password>
+let _proxyAgent = null;
+let _proxyEnabled = false;
+const _proxyHost = process.env.PROXY_HOST || '';
+const _proxyPort = process.env.PROXY_PORT || '';
+const _proxyUser = process.env.PROXY_USER || '';
+const _proxyPass = process.env.PROXY_PASS || '';
+if (_proxyHost && _proxyPort && _proxyUser && _proxyPass) {
+  try {
+    const { HttpsProxyAgent } = require('https-proxy-agent');
+    const _auth = `${encodeURIComponent(_proxyUser)}:${encodeURIComponent(_proxyPass)}`;
+    _proxyAgent = new HttpsProxyAgent(`http://${_auth}@${_proxyHost}:${_proxyPort}`);
+    _proxyEnabled = true;
+    console.log(`[proxy] DataImpulse ENABLED for mini-endpoint smartSync only via ${_proxyHost}:${_proxyPort}`);
+  } catch(e) {
+    console.warn(`[proxy] init failed: ${e.message}`);
+  }
+} else {
+  console.log('[proxy] DataImpulse disabled (no PROXY_* env vars set)');
+}
 
 // ── ALIEXPRESS DROPSHIPPING INTEGRATION ───────────────────────────────────
 // Uses the ae_sdk npm package which handles AliExpress IOP signing correctly.
@@ -491,6 +514,60 @@ const randUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 // vs ~25% from Railway IP. Falls back to direct fetch on relay timeout/miss.
 let _relayHandle = null; // { isAlive: () => bool, db: { enqueueRelayFetch, awaitRelayResult } }
 function setRelayHandle(h) { _relayHandle = h; }
+
+// ── MINI-ENDPOINT FETCH for price+stock only ──────────────────────────────
+// Pulls just price + stock from Amazon's lightweight AJAX endpoints (~5-30KB
+// vs ~1.5MB for a full product page). Used by smartSync to cut residential
+// proxy bandwidth ~99%. Goes through DataImpulse proxy (residential IP).
+// Returns { price, inStock, shippingCost } or null if blocked/missing.
+async function fetchAmazonMini(asin) {
+  if (!asin) return null;
+  // Try the offer-display endpoint first (~30KB, most reliable)
+  // Falls back to AOD ajax (~5KB) if blocked
+  const endpoints = [
+    `https://www.amazon.com/gp/product/ajax?asin=${asin}&deviceType=desktop&offerListingID=&isSubVariantQuoteCard=false`,
+    `https://www.amazon.com/gp/aod/ajax?asin=${asin}&pc=dp`,
+    `https://www.amazon.com/hz/m/gp/aod/ajax?asin=${asin}`,
+  ];
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+    'Accept': 'text/html,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'X-Requested-With': 'XMLHttpRequest',
+    'Referer': `https://www.amazon.com/dp/${asin}`,
+  };
+  for (const ep of endpoints) {
+    try {
+      const opts = { headers, redirect: 'follow' };
+      // Apply proxy for mini-endpoints (residential IP needed)
+      const finalOpts = _proxyEnabled && _proxyAgent ? { ...opts, agent: _proxyAgent } : opts;
+      const r = await fetch(ep, finalOpts);
+      const html = await r.text();
+      if (!html || html.length < 200) continue;
+      // Detect block / captcha
+      if (/api-services-support@amazon\.com|To discuss automated access|enter the characters/i.test(html)) {
+        console.log(`[mini] ${asin}: blocked at ${ep.split('?')[0].split('/').pop()}`);
+        continue;
+      }
+      // Extract price from mini-HTML
+      const price = extractPriceFromBuyBox(html) || extractPrice(html) || 0;
+      // Extract stock: look for "In Stock", "Currently unavailable", buy-box presence
+      const inStockText = /In Stock\b|Only \d+ left|\bIn stock soon\b|Add to Cart|aod-pinned-offer/i.test(html);
+      const oosText = /Currently unavailable|Out of stock|Unavailable|We don't know when/i.test(html);
+      const inStock = price > 0 && (inStockText || !oosText);
+      // Shipping cost — sometimes present in mini-endpoints
+      const shipMatch = html.match(/(?:Shipping|Delivery)[^$]{0,80}\$([\d.]+)/i);
+      const shippingCost = shipMatch ? parseFloat(shipMatch[1]) : 0;
+      console.log(`[mini] ${asin}: $${price.toFixed(2)} ${inStock ? 'IN' : 'OOS'} ${shippingCost > 0 ? `+$${shippingCost} ship` : ''} (${html.length}B from ${ep.split('?')[0].split('/').slice(-2).join('/')})`);
+      return { price, inStock, shippingCost, htmlSize: html.length };
+    } catch(e) {
+      // Try next endpoint
+    }
+  }
+  return null;
+}
+
 
 async function fetchPage(url, ua, maxAttempts, opts) {
   // opts.mobile=true → use Amazon's mobile pages (~300KB vs 1.5MB desktop).
@@ -7748,19 +7825,18 @@ module.exports = async (req, res) => {
       if (!access_token || !ebaySku || !sourceUrl)
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
 
-      // BROWSER-ONLY POLICY: smartSync for Amazon requires browser-prefetched
-      // ASIN data (clientAsinData). If browser didn't provide it, we skip this
-      // sync cycle entirely — server NEVER touches Amazon directly. Listings
-      // sync next cycle when the browser tab is open.
+      // PROXY-OR-BROWSER POLICY: smartSync for Amazon needs EITHER
+      // (a) the DataImpulse proxy enabled (server hits mini-endpoints), OR
+      // (b) browser-prefetched ASIN data passed in. If neither, skip cleanly.
       const _isAmazonSource = /amazon\.(com|co\.uk|de|ca)/.test(sourceUrl);
       const _hasClientAsinData = clientAsinData && typeof clientAsinData === 'object'
         && Object.keys(clientAsinData).length > 0;
-      if (_isAmazonSource && !_hasClientAsinData) {
-        console.log(`[smartSync] ${ebaySku}: Amazon source but no browser data — skipping (open the DropSync tab to enable sync)`);
+      if (_isAmazonSource && !_hasClientAsinData && !_proxyEnabled) {
+        console.log(`[smartSync] ${ebaySku}: Amazon source, no proxy AND no browser data — skipping`);
         return res.json({
           success: false,
           skipped: true,
-          reason: 'Amazon source requires browser tab open to provide HTML. Sync skipped.',
+          reason: 'Amazon source needs proxy or browser tab. Sync skipped.',
         });
       }
 
@@ -7782,40 +7858,27 @@ module.exports = async (req, res) => {
       const normSku = ebaySku.trim().replace(/\s+/g, '');
       console.log(`[smartSync] ${normSku} — ${sourceUrl}`);
 
-      // ── STEP 1: Scrape Amazon parent page ─────────────────────────────────
-      // If the parent scrape fails (Amazon block, rate limit, network error), we
-      // DO NOT bail out — the purpose of sync is to make eBay match Amazon's
-      // dictated state, so we need to keep going even when the parent page is
-      // unavailable. The frontend/worker already sends `comboAsin` and
-      // `fallbackComboPrices` as a backup ASIN source derived from the last
-      // successful scrape, so we use those to build the ASIN list and proceed
-      // to per-ASIN fetching. Only genuinely-unreachable ASINs end up as
-      // force-OOS via the fetchFailed path in STEP 2.
-      // REVERTED FROM MOBILE: mobile pages (~300KB) saved bandwidth but the
-      // price parser couldn't reliably extract from mobile markup — it was
-      // returning $9.99 promo prices instead of real product prices.
-      // Desktop pages cost more bandwidth but give accurate prices.
-      const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
-      const _parentHtmlOk = !!(html && html.length >= 5000);
-
-      // Extract unique ASINs from the parent page's dimensionToAsinMap.
-      // Window widened to 200k chars to cover listings with 900+ ASIN entries.
+      // ── STEP 1: Determine ASIN list ────────────────────────────────────────
+      // With mini-endpoint fetching, we don't need to scrape the parent page
+      // anymore — `body.comboAsin` from the frontend provides the full ASIN
+      // mapping from the last successful import. Each ASIN gets its own
+      // per-variant price fetch in STEP 2 below.
+      // Parent page fetch is only used as fallback if comboAsin is missing.
+      let allUniqueAsins = [];
       let dta = {};
-      if (_parentHtmlOk) {
-        const dtaM = html.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/);
-        try { dta = JSON.parse(dtaM?.[1] || '{}'); } catch(e) {}
-      }
-      let allUniqueAsins = [...new Set(Object.values(dta))].filter(Boolean);
-
-      // FALLBACK: if parent scrape failed OR the twister data was malformed,
-      // use the stored comboAsin from the body (sent by frontend/worker as
-      // the last known-good Amazon mapping). This lets sync still push fresh
-      // per-ASIN prices even when Amazon is blocking the parent page.
-      if (!allUniqueAsins.length && body.comboAsin && typeof body.comboAsin === 'object') {
-        const _fallbackAsins = [...new Set(Object.values(body.comboAsin))].filter(Boolean);
-        if (_fallbackAsins.length > 0) {
-          allUniqueAsins = _fallbackAsins;
-          console.log(`[smartSync] parent scrape ${_parentHtmlOk ? 'returned no dta' : 'BLOCKED'} — falling back to body.comboAsin (${allUniqueAsins.length} ASINs)`);
+      let _parentHtmlOk = false;
+      if (body.comboAsin && typeof body.comboAsin === 'object') {
+        allUniqueAsins = [...new Set(Object.values(body.comboAsin))].filter(Boolean);
+        console.log(`[smartSync] using stored comboAsin (${allUniqueAsins.length} ASINs) — skipping parent page fetch`);
+      } else {
+        // Fallback: fetch parent page to extract ASIN map. Costs ~1.5MB via proxy.
+        console.log(`[smartSync] no comboAsin in body — fetching parent page as fallback`);
+        const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
+        _parentHtmlOk = !!(html && html.length >= 5000);
+        if (_parentHtmlOk) {
+          const dtaM = html.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/);
+          try { dta = JSON.parse(dtaM?.[1] || '{}'); } catch(e) {}
+          allUniqueAsins = [...new Set(Object.values(dta))].filter(Boolean);
         }
       }
       const _urlAsin = sourceUrl.match(/\/dp\/([A-Z0-9]{10})/)?.[1];
@@ -7930,36 +7993,29 @@ module.exports = async (req, res) => {
         for (let i = 0; i < _asinsToFetch.length; i += BATCH) {
           await Promise.all(_asinsToFetch.slice(i, i + BATCH).map(async (asin, bi) => {
             await sleep(bi * 100);
-            // 2 attempts max — blocked ASINs are set qty=0 this cycle (Out-of-Stock
-            // Control hides the variant) and re-tried normally on the next sync.
-            // This is NOT a real OOS event: no markedOos flag, no OOS webhook.
-            const h = await fetchPage(`https://www.amazon.com/dp/${asin}?th=1&psc=1`, randUA(), 2);
-            if (!h) {
-              asinPrice[asin]   = 0;     // ← explicit 0 so _haveFreshPrice sees it
+            // MINI-ENDPOINT FETCH: pulls just price + stock from Amazon's
+            // lightweight AJAX endpoints (~5-30KB vs ~1.5MB for full page).
+            // Goes through DataImpulse proxy (residential IP). Falls back to
+            // null if blocked → ASIN treated as qty=0 this cycle, retried next.
+            const mini = await fetchAmazonMini(asin);
+            if (!mini || mini.price <= 0) {
+              asinPrice[asin]   = 0;
               asinInStock[asin] = false;
               _fetchFailed.add(asin);
               fetchFail++;
-              console.log(`[smartSync] ${asin} → fetch blocked, qty=0 (will retry next sync)`);
+              console.log(`[smartSync] ${asin} → mini-endpoint blocked or empty, qty=0`);
               return;
             }
-            const price = extractPriceFromBuyBox(h) || extractPrice(h) || 0;
-            const shipping = extractShippingFromPage(h) || 0;
-            const oos   = isAmazonOOS(h.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '');
-            // Fold shipping into the cost so markup applies to price + shipping.
-            const _total = price + (shipping || 0);
+            const _total = mini.price + (mini.shippingCost || 0);
             asinPrice[asin]   = _total;
-            asinInStock[asin] = !oos && price > 0;
+            asinInStock[asin] = mini.inStock;
             // Cache the result for 7 days (only if we got real data).
-            // Skip caching for prices that match known parser-default values
-            // ($9.99 is the broken mobile-page extraction default — never cache
-            // those, force a re-fetch next cycle in case it was wrong).
-            if (price > 0 && price !== 9.99) {
-              _asinCacheSet(asin, { price: _total, shipping, inStock: !oos && price > 0 });
-            } else if (price === 9.99) {
+            // Skip caching $9.99 — historically a broken-parser default value.
+            if (mini.price > 0 && mini.price !== 9.99) {
+              _asinCacheSet(asin, { price: _total, shipping: mini.shippingCost, inStock: mini.inStock });
+            } else if (mini.price === 9.99) {
               console.warn(`[smartSync] ${asin} got $9.99 — suspect parser default, NOT caching`);
             }
-            if (shipping > 0) console.log(`[smartSync] ${asin} → $${price} +$${shipping} ship = $${_total.toFixed(2)} inStock=${!oos}`);
-            else               console.log(`[smartSync] ${asin} → $${price} inStock=${!oos}`);
             fetchOk++;
           }));
           if (i + BATCH < _asinsToFetch.length) await sleep(1000);
