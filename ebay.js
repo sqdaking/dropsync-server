@@ -7866,6 +7866,7 @@ module.exports = async (req, res) => {
       // Parent page fetch is only used as fallback if comboAsin is missing.
       let allUniqueAsins = [];
       let dta = {};
+      let html = null;
       let _parentHtmlOk = false;
       if (body.comboAsin && typeof body.comboAsin === 'object') {
         allUniqueAsins = [...new Set(Object.values(body.comboAsin))].filter(Boolean);
@@ -7873,7 +7874,7 @@ module.exports = async (req, res) => {
       } else {
         // Fallback: fetch parent page to extract ASIN map. Costs ~1.5MB via proxy.
         console.log(`[smartSync] no comboAsin in body — fetching parent page as fallback`);
-        const html = await fetchPage(sourceUrl, randUA()).catch(() => null);
+        html = await fetchPage(sourceUrl, randUA()).catch(() => null);
         _parentHtmlOk = !!(html && html.length >= 5000);
         if (_parentHtmlOk) {
           const dtaM = html.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/);
