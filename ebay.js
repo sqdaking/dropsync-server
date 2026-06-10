@@ -229,25 +229,45 @@ async function _aliGetAccessToken() {
 }
 
 // Fetch product + freight via the System API (no SDK).
+// freight.query now REQUIRES selectedSkuId, so we fetch product first, grab
+// the first SKU's ID, then call freight with that SKU as the shipping sample.
 async function _aliFetchProductAndFreight(productId, shipTo = 'US', currency = 'USD') {
-  const [apiResp, freightResp] = await Promise.all([
-    _aliCall('aliexpress.ds.product.get', {
-      product_id: productId,
-      ship_to_country: shipTo,
-      target_currency: currency,
-      target_language: 'en',
-    }),
-    _aliCall('aliexpress.ds.freight.query', {
+  // Step 1: get product details
+  const apiResp = await _aliCall('aliexpress.ds.product.get', {
+    product_id: productId,
+    ship_to_country: shipTo,
+    target_currency: currency,
+    target_language: 'en',
+  });
+
+  // Step 2: extract first SKU ID from response to use in freight query
+  let firstSkuId = null;
+  try {
+    const root = apiResp.aliexpress_ds_product_get_response?.result || apiResp.result || apiResp;
+    const skuInfo = root.ae_item_sku_info_dtos || root.ae_item_sku_info || [];
+    const skus = Array.isArray(skuInfo) ? skuInfo
+                : (skuInfo.ae_item_sku_info_d_t_o || skuInfo.ae_item_sku_info_dto || []);
+    if (skus.length > 0) firstSkuId = skus[0].sku_id || skus[0].id;
+  } catch(e) {}
+
+  // Step 3: freight query with selectedSkuId
+  let freightResp = null;
+  if (firstSkuId) {
+    freightResp = await _aliCall('aliexpress.ds.freight.query', {
       queryDeliveryReq: JSON.stringify({
-        quantity:      '1',
-        productId:     productId,
-        shipToCountry: shipTo,
-        productNum:    1,
-        currency:      currency,
-        language:      'en_US',
+        quantity:        '1',
+        productId:       productId,
+        selectedSkuId:   String(firstSkuId),
+        shipToCountry:   shipTo,
+        productNum:      1,
+        currency:        currency,
+        language:        'en_US',
       }),
-    }).catch(e => { console.warn(`[ali] freight query failed: ${e.message}`); return null; }),
-  ]);
+    }).catch(e => { console.warn(`[ali] freight query failed: ${e.message}`); return null; });
+  } else {
+    console.warn(`[ali] no SKU ID found in product ${productId} — skipping freight query`);
+  }
+
   return { apiResp, freightResp };
 }
 
@@ -325,13 +345,6 @@ function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo, fallbackProductI
   const comboShipping = {}; // per-SKU shipping cost (AliExpress shipping is usually per-product, but we track per-SKU)
   const variations = []; // dimension definitions for the UI/eBay aspects
   const dimValues = {};  // dim name -> Set of values
-  // DIAGNOSTIC: log the first SKU's shape so we can see what stock fields exist
-  if (skus.length > 0) {
-    const _s0 = skus[0];
-    const _keys = Object.keys(_s0).filter(k => /stock|inventory|avail|quantity/i.test(k));
-    console.log(`[ali] SKU keys (first variant): ${Object.keys(_s0).slice(0,20).join(',')}`);
-    console.log(`[ali] SKU stock-like fields: ${_keys.length ? _keys.map(k => `${k}=${_s0[k]}`).join(', ') : 'NONE FOUND'}`);
-  }
   for (const sku of skus) {
     const skuId = sku.sku_id || sku.id || '';
     const price = parseFloat(sku.offer_sale_price || sku.sku_price || sku.price || 0);
@@ -4966,7 +4979,16 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     }
   }
 
-  const _isAE = !!(body._source === 'aliexpress' || body.sourceUrl?.includes('aliexpress'));
+  // AliExpress check — source marker lives on product (browser passes it
+  // in the product payload, not at body root). Also fall back to URL check.
+  const _isAE = !!(
+    product._source === 'aliexpress'
+    || product.source === 'aliexpress'
+    || body._source === 'aliexpress'
+    || product.sourceUrl?.includes('aliexpress')
+    || body.sourceUrl?.includes('aliexpress')
+  );
+  if (_isAE) console.log(`[push] AliExpress source detected — using AliExpress policies + China warehouse location`);
   const locationKey = await ensureLocation(auth, _isAE);
   // When revising (existingEbaySku set), MUST reuse the same groupSku
   // eBay maps groupSku → listingId permanently — a new random groupSku = new listing
