@@ -1575,7 +1575,10 @@ function buildProd() {
   return {
     id: uid(),
     sourceUrl: IMP.url || '',
-    source: 'amazon',
+    source: IMP._source || 'amazon',
+    _source: IMP._source || 'amazon',  // CRITICAL: preserves source so push selects the right policies (Amazon vs AliExpress) and so sync uses the right API (Amazon scrape vs AliExpress official API)
+    aliProductId: IMP.aliProductId || '',  // AliExpress product ID for daily sync
+    aeId: IMP.aeId || IMP.aliProductId || '',  // AliExpress ID (legacy field name kept for compat)
     asin: IMP.asin || '',
     parentAsin: IMP.parentAsin || '', // ← persisted so dedup-by-parent works on future imports
     title: IMP.title || '',        // raw Amazon title (kept for reference)
