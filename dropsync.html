@@ -2570,14 +2570,16 @@ async function bulkPushAll() {
     try {
       const token = await ensureToken();
       capCombos(p); // hard cap variants before push
+      const _isAli = p._source === 'aliexpress';
       const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
           access_token: token, product: p,
-          fulfillmentPolicyId: S.fulfillmentPolicyId,
-          paymentPolicyId:     S.paymentPolicyId,
-          returnPolicyId:      S.returnPolicyId,
-          markup: p.markup != null ? p.markup : (S.markup || 23), handlingCost: S.handlingCost || 2,
+          fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
+          paymentPolicyId:     _isAli ? (S.ae_paymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
+          returnPolicyId:      _isAli ? (S.ae_returnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
+          markup: p.markup != null ? p.markup : (_isAli ? (S.ae_markup || 40) : (S.markup || 23)),
+          handlingCost: _isAli ? (S.ae_handlingCost || 2) : (S.handlingCost || 2),
         })
       });
       const d = await safeJson(r);
@@ -4741,17 +4743,18 @@ async function pushExisting(pid, _overrides = {}) {
       } catch(e) { console.warn('[pushExisting] rescue rescrape failed:', e.message); }
     }
 
+    const _isAli = productToPost._source === 'aliexpress' || p._source === 'aliexpress';
     const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token: token,
         product: productToPost,
-        fulfillmentPolicyId: S.fulfillmentPolicyId,
-        paymentPolicyId:     S.paymentPolicyId,
-        returnPolicyId:      S.returnPolicyId,
-        markup: p.markup != null ? p.markup : (S.markup || 23),
-        handlingCost: S.handlingCost || 2,
-        quantity: p.quantity || S.quantity || 1,
+        fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
+        paymentPolicyId:     _isAli ? (S.ae_paymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
+        returnPolicyId:      _isAli ? (S.ae_returnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
+        markup: p.markup != null ? p.markup : (_isAli ? (S.ae_markup || 40) : (S.markup || 23)),
+        handlingCost: _isAli ? (S.ae_handlingCost || 2) : (S.handlingCost || 2),
+        quantity: p.quantity || (_isAli ? (S.ae_quantity || 1) : S.quantity) || 1,
         existingEbaySku: _overrides.existingEbaySku !== undefined ? _overrides.existingEbaySku : (p.ebaySku || null),  // server deletes+recreates on re-push
       }),
     });
