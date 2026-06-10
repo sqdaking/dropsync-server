@@ -325,10 +325,31 @@ function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo, fallbackProductI
   const comboShipping = {}; // per-SKU shipping cost (AliExpress shipping is usually per-product, but we track per-SKU)
   const variations = []; // dimension definitions for the UI/eBay aspects
   const dimValues = {};  // dim name -> Set of values
+  // DIAGNOSTIC: log the first SKU's shape so we can see what stock fields exist
+  if (skus.length > 0) {
+    const _s0 = skus[0];
+    const _keys = Object.keys(_s0).filter(k => /stock|inventory|avail|quantity/i.test(k));
+    console.log(`[ali] SKU keys (first variant): ${Object.keys(_s0).slice(0,20).join(',')}`);
+    console.log(`[ali] SKU stock-like fields: ${_keys.length ? _keys.map(k => `${k}=${_s0[k]}`).join(', ') : 'NONE FOUND'}`);
+  }
   for (const sku of skus) {
     const skuId = sku.sku_id || sku.id || '';
     const price = parseFloat(sku.offer_sale_price || sku.sku_price || sku.price || 0);
-    const stock = parseInt(sku.sku_available_stock || sku.stock || sku.ipm_sku_stock || 0);
+    // Stock: AliExpress sometimes omits stock fields entirely. We try a wider
+    // set of field names. If NO stock field is present at all, we DON'T force
+    // OOS — we trust that the variant is sellable until proven otherwise.
+    // Only an EXPLICIT zero stock value marks the variant OOS.
+    const stockFields = ['sku_available_stock', 'sku_stock', 'stock', 'ipm_sku_stock',
+                         'inventory', 'available_stock', 'quantity', 'sale_count_quantity'];
+    let stock = null;
+    for (const f of stockFields) {
+      if (sku[f] !== undefined && sku[f] !== null && sku[f] !== '') {
+        stock = parseInt(sku[f]);
+        if (!isNaN(stock)) break;
+      }
+    }
+    // If no stock field found at all, assume in-stock (1+). Only explicit 0 = OOS.
+    const inStock = stock === null ? true : (stock > 0);
     const propsArr = sku.ae_sku_property_dtos
                   || sku.ae_sku_property_dtos?.ae_sku_property_d_t_o
                   || sku.sku_attr_value
@@ -347,10 +368,13 @@ function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo, fallbackProductI
     // FOLD SHIPPING INTO PRICE — same model as Amazon. Markup applies to (price + shipping).
     const totalCost = price + shippingCost;
     if (price > 0) comboPrices[comboKey] = totalCost;
-    comboInStock[comboKey] = stock > 0;
+    comboInStock[comboKey] = inStock;
     comboAsin[comboKey] = skuId;
     comboShipping[comboKey] = shippingCost;
   }
+  const _inCount = Object.values(comboInStock).filter(Boolean).length;
+  const _outCount = Object.values(comboInStock).length - _inCount;
+  console.log(`[ali] stock summary: ${_inCount} in-stock / ${_outCount} OOS of ${skus.length} SKUs`);
   for (const [name, vals] of Object.entries(dimValues)) {
     variations.push({ name, values: Array.from(vals) });
   }
@@ -515,58 +539,53 @@ const randUA = () => UA_LIST[Math.floor(Math.random() * UA_LIST.length)];
 let _relayHandle = null; // { isAlive: () => bool, db: { enqueueRelayFetch, awaitRelayResult } }
 function setRelayHandle(h) { _relayHandle = h; }
 
-// ── MINI-ENDPOINT FETCH for price+stock only ──────────────────────────────
-// Pulls just price + stock from Amazon's lightweight AJAX endpoints (~5-30KB
-// vs ~1.5MB for a full product page). Used by smartSync to cut residential
-// proxy bandwidth ~99%. Goes through DataImpulse proxy (residential IP).
-// Returns { price, inStock, shippingCost } or null if blocked/missing.
+// ── FULL PAGE FETCH for per-ASIN price ─────────────────────────────────────
+// Mini-endpoints (/gp/product/ajax, /gp/aod/ajax) used to be ~5-30KB but
+// Amazon retired them in 2025/2026 — both now return 404. So we go back to
+// full desktop pages (~1.5MB). The 7-day Postgres cache amortizes the cost:
+// after the first sync per ASIN, subsequent syncs within 7 days = 0 bandwidth.
+// All fetches route through DataImpulse residential proxy.
 async function fetchAmazonMini(asin) {
   if (!asin) return null;
-  // Try the offer-display endpoint first (~30KB, most reliable)
-  // Falls back to AOD ajax (~5KB) if blocked
-  const endpoints = [
-    `https://www.amazon.com/gp/product/ajax?asin=${asin}&deviceType=desktop&offerListingID=&isSubVariantQuoteCard=false`,
-    `https://www.amazon.com/gp/aod/ajax?asin=${asin}&pc=dp`,
-    `https://www.amazon.com/hz/m/gp/aod/ajax?asin=${asin}`,
-  ];
+  const url = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-    'Accept': 'text/html,*/*;q=0.8',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
     'Accept-Encoding': 'gzip, deflate, br',
-    'X-Requested-With': 'XMLHttpRequest',
-    'Referer': `https://www.amazon.com/dp/${asin}`,
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'none',
+    'Upgrade-Insecure-Requests': '1',
   };
-  for (const ep of endpoints) {
+  // Up to 2 attempts with 1s delay between
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const opts = { headers, redirect: 'follow' };
-      // Apply proxy for mini-endpoints (residential IP needed)
       const finalOpts = _proxyEnabled && _proxyAgent ? { ...opts, agent: _proxyAgent } : opts;
-      const r = await fetch(ep, finalOpts);
+      const r = await fetch(url, finalOpts);
       const html = await r.text();
-      // DIAGNOSTIC: log status + response info
-      const epName = ep.includes('aod') ? 'aod' : 'product/ajax';
-      const sample = html.slice(0, 80).replace(/\s+/g, ' ');
-      console.log(`[mini] ${asin} ${epName}: status=${r.status} len=${html.length} proxy=${!!finalOpts.agent} sample="${sample}"`);
-      if (!html || html.length < 200) continue;
-      // Detect block / captcha
-      if (/api-services-support@amazon\.com|To discuss automated access|enter the characters/i.test(html)) {
-        console.log(`[mini] ${asin}: blocked at ${epName}`);
-        continue;
+      if (!html || html.length < 5000) {
+        if (attempt < 2) { await sleep(1000); continue; }
+        console.log(`[fetch] ${asin}: tiny response (${html.length}B status=${r.status}) — blocked`);
+        return null;
       }
-      // Extract price from mini-HTML
+      // Block detection
+      if (/api-services-support@amazon\.com|To discuss automated access|enter the characters/i.test(html.slice(0, 5000))) {
+        if (attempt < 2) { await sleep(1500); continue; }
+        console.log(`[fetch] ${asin}: blocked (captcha page, ${html.length}B)`);
+        return null;
+      }
       const price = extractPriceFromBuyBox(html) || extractPrice(html) || 0;
-      // Extract stock: look for "In Stock", "Currently unavailable", buy-box presence
-      const inStockText = /In Stock\b|Only \d+ left|\bIn stock soon\b|Add to Cart|aod-pinned-offer/i.test(html);
-      const oosText = /Currently unavailable|Out of stock|Unavailable|We don't know when/i.test(html);
-      const inStock = price > 0 && (inStockText || !oosText);
-      // Shipping cost — sometimes present in mini-endpoints
-      const shipMatch = html.match(/(?:Shipping|Delivery)[^$]{0,80}\$([\d.]+)/i);
-      const shippingCost = shipMatch ? parseFloat(shipMatch[1]) : 0;
-      console.log(`[mini] ${asin}: $${price.toFixed(2)} ${inStock ? 'IN' : 'OOS'} ${shippingCost > 0 ? `+$${shippingCost} ship` : ''} (${html.length}B from ${ep.split('?')[0].split('/').slice(-2).join('/')})`);
+      const shippingCost = extractShippingFromPage(html) || 0;
+      const oos = isAmazonOOS(html.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '');
+      const inStock = !oos && price > 0;
+      console.log(`[fetch] ${asin}: $${price.toFixed(2)} ${inStock ? 'IN' : 'OOS'} ${shippingCost > 0 ? `+$${shippingCost} ship` : ''} (${(html.length/1024).toFixed(0)}KB)`);
       return { price, inStock, shippingCost, htmlSize: html.length };
     } catch(e) {
-      // Try next endpoint
+      if (attempt < 2) { await sleep(1500); continue; }
+      console.log(`[fetch] ${asin}: error ${e.message}`);
+      return null;
     }
   }
   return null;
@@ -8008,7 +8027,7 @@ module.exports = async (req, res) => {
               asinInStock[asin] = false;
               _fetchFailed.add(asin);
               fetchFail++;
-              console.log(`[smartSync] ${asin} → mini-endpoint blocked or empty, qty=0`);
+              console.log(`[smartSync] ${asin} → fetch blocked or empty, qty=0`);
               return;
             }
             const _total = mini.price + (mini.shippingCost || 0);
