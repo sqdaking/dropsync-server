@@ -215,7 +215,7 @@ const DEFAULT_STATE = {
   markup: 35, minMarkup: 5, handlingCost: 2, quantity: 1,
   fulfillmentPolicyId: '', paymentPolicyId: '', returnPolicyId: '',
   // AliExpress-specific settings (completely separate from Amazon)
-  ae_markup: 40, ae_handlingCost: 2, ae_quantity: 1,
+  ae_markup: 60, ae_handlingCost: 2, ae_quantity: 1,
   ae_fulfillmentPolicyId: '', ae_paymentPolicyId: '', ae_returnPolicyId: '',
   ae_maxDeliveryDays: 21, ae_minRating: 4.5, ae_minOrders: 50,
   scraperApiKey: '',
@@ -1273,7 +1273,7 @@ async function doAliImport(rawUrl) {
     // Mark this as an AliExpress product so push uses AliExpress markup/policies.
     product._source = 'aliexpress';
     product.url = rawUrl;
-    product.markup = S.ae_markup ?? 40;
+    product.markup = S.ae_markup ?? 60;
     IMP = product;
     _scraping = false;
     renderImport();
@@ -1351,7 +1351,7 @@ async function doScrape() {
     IMP = d.product;
     IMP.url = url;
     // Use source-specific markup: AliExpress gets ae_markup, Amazon/others get markup.
-    IMP.markup = (IMP._source === 'aliexpress') ? (S.ae_markup ?? 40) : (S.markup ?? 23);
+    IMP.markup = (IMP._source === 'aliexpress') ? (S.ae_markup ?? 60) : (S.markup ?? 23);
 
     // ── Duplicate detection for multi-ASIN listings ──────────────────────
     // Two different variant ASINs from the same parent listing share parentAsin
@@ -1670,7 +1670,7 @@ async function doPush() {
         fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
         paymentPolicyId:     _isAli ? (S.ae_paymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
         returnPolicyId:      _isAli ? (S.ae_returnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
-        markup:        IMP.markup != null ? IMP.markup : (_isAli ? (S.ae_markup ?? 40) : (S.markup || 23)),
+        markup:        IMP.markup != null ? IMP.markup : (_isAli ? (S.ae_markup ?? 60) : (S.markup || 23)),
         handlingCost:  _isAli ? (S.ae_handlingCost ?? 2) : (S.handlingCost || 2),
         quantity:      _isAli ? (S.ae_quantity ?? 1)     : (S.quantity || 1),
         existingEbaySku: IMP.ebaySku || null,
@@ -2578,7 +2578,7 @@ async function bulkPushAll() {
           fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
           paymentPolicyId:     _isAli ? (S.ae_paymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
           returnPolicyId:      _isAli ? (S.ae_returnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
-          markup: p.markup != null ? p.markup : (_isAli ? (S.ae_markup || 40) : (S.markup || 23)),
+          markup: p.markup != null ? p.markup : (_isAli ? (S.ae_markup || 60) : (S.markup || 23)),
           handlingCost: _isAli ? (S.ae_handlingCost || 2) : (S.handlingCost || 2),
         })
       });
@@ -4752,7 +4752,7 @@ async function pushExisting(pid, _overrides = {}) {
         fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
         paymentPolicyId:     _isAli ? (S.ae_paymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
         returnPolicyId:      _isAli ? (S.ae_returnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
-        markup: p.markup != null ? p.markup : (_isAli ? (S.ae_markup || 40) : (S.markup || 23)),
+        markup: p.markup != null ? p.markup : (_isAli ? (S.ae_markup || 60) : (S.markup || 23)),
         handlingCost: _isAli ? (S.ae_handlingCost || 2) : (S.handlingCost || 2),
         quantity: p.quantity || (_isAli ? (S.ae_quantity || 1) : S.quantity) || 1,
         existingEbaySku: _overrides.existingEbaySku !== undefined ? _overrides.existingEbaySku : (p.ebaySku || null),  // server deletes+recreates on re-push
@@ -8452,7 +8452,7 @@ function renderSettings() {
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
               <div>
                 <label>Markup %</label>
-                <input type="number" class="input" id="ae-markup" value="${S.ae_markup ?? 40}" min="10" max="500"
+                <input type="number" class="input" id="ae-markup" value="${S.ae_markup ?? 60}" min="10" max="500"
                   oninput="S.ae_markup=parseFloat(this.value)||40;save()">
               </div>
               <div>
