@@ -7,36 +7,14 @@ const _nfFn = _nodeFetch.default || _nodeFetch;
 // Replace global fetch with node-fetch so existing code paths use it transparently
 global.fetch = _nfFn;
 
-// ── RESIDENTIAL PROXY (DataImpulse) — MINI-ENDPOINT ONLY ──────────────────
-// Used ONLY for smartSync's price+stock mini-endpoint fetches (~5-30KB each
-// vs 1.5MB for full pages). Saves 99%+ vs full-page proxying. Bulk import
-// + push still use browser/codetabs (no proxy bandwidth). AliExpress uses
-// official API (no proxy).
-//
-// Env vars in Railway:
-//   PROXY_HOST = gw.dataimpulse.com
-//   PROXY_PORT = 823
-//   PROXY_USER = <your login>
-//   PROXY_PASS = <your password>
+// ── PROXY DISABLED (per user request) ─────────────────────────────────────
+// DataImpulse env vars stay in Railway (we may re-enable later for specific
+// flows), but the proxy is forcibly disabled. Server never fetches Amazon.
+// Browser tab handles all Amazon work via codetabs/corsproxy (residential IP).
+// AliExpress = official API server-side (no proxy needed).
 let _proxyAgent = null;
 let _proxyEnabled = false;
-const _proxyHost = process.env.PROXY_HOST || '';
-const _proxyPort = process.env.PROXY_PORT || '';
-const _proxyUser = process.env.PROXY_USER || '';
-const _proxyPass = process.env.PROXY_PASS || '';
-if (_proxyHost && _proxyPort && _proxyUser && _proxyPass) {
-  try {
-    const { HttpsProxyAgent } = require('https-proxy-agent');
-    const _auth = `${encodeURIComponent(_proxyUser)}:${encodeURIComponent(_proxyPass)}`;
-    _proxyAgent = new HttpsProxyAgent(`http://${_auth}@${_proxyHost}:${_proxyPort}`);
-    _proxyEnabled = true;
-    console.log(`[proxy] DataImpulse ENABLED for mini-endpoint smartSync only via ${_proxyHost}:${_proxyPort}`);
-  } catch(e) {
-    console.warn(`[proxy] init failed: ${e.message}`);
-  }
-} else {
-  console.log('[proxy] DataImpulse disabled (no PROXY_* env vars set)');
-}
+console.log('[proxy] DISABLED (browser-only Amazon sync; AliExpress uses official API)');
 
 // ── ALIEXPRESS DROPSHIPPING INTEGRATION ───────────────────────────────────
 // Uses the ae_sdk npm package which handles AliExpress IOP signing correctly.
@@ -3315,7 +3293,8 @@ function makeApplyMk(markupPct, handling) {
   };
 }
 
-function buildDescription(title, bullets, para, aspects) {
+function buildDescription(title, bullets, para, aspects, source) {
+  const isAE = source === 'aliexpress';
   const bulletHtml = (bullets || []).length
     ? '<ul>' + bullets.map(b => `<li>${String(b).replace(/</g,'&lt;').replace(/>/g,'&gt;')}</li>`).join('') + '</ul>'
     : '';
@@ -3326,12 +3305,17 @@ function buildDescription(title, bullets, para, aspects) {
   const specsTable = specRows
     ? `<br/><table border="0" cellpadding="4" cellspacing="0" width="100%"><tbody>${specRows}</tbody></table>`
     : '';
+  // AliExpress: ships from overseas, longer delivery. Don't claim US shipping.
+  // Amazon: ships from US warehouse, fast delivery.
+  const footer = isAE
+    ? '<br/><p style="font-size:11px;color:#888">Item is new. Please message us with any questions before purchasing.</p>'
+    : '<br/><p style="font-size:11px;color:#888">Ships from US. Item is new. Please message us with any questions before purchasing.</p>';
   return [
     `<h2>${title}</h2>`,
     bulletHtml,
     para ? `<p>${para}</p>` : '',
     specsTable,
-    '<br/><p style="font-size:11px;color:#888">Ships from US. Item is new. Please message us with any questions before purchasing.</p>',
+    footer,
   ].filter(Boolean).join('\n');
 }
 
@@ -4798,9 +4782,19 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
    const listingTitle = sanitizeTitle(neutralizeTitle(product.ebayTitle || product.title || 'Product', product));
 
 
-  // Description
-  const ebayDescription = buildDescription(listingTitle, product.bullets || [], product.descriptionPara || '', product.aspects || {})
-    || product.description || listingTitle;
+  // Description: for AliExpress, prefer the source description (baseInfo.detail)
+  // since AliExpress titles are detailed and the bullets/aspects are usually
+  // sparse. Falls back to buildDescription for Amazon (which has rich bullets).
+  const _isAESrc = (product._source || product.source) === 'aliexpress';
+  let ebayDescription;
+  if (_isAESrc && product.description && product.description.length > 100) {
+    // Use AliExpress's own description, wrapped with title + AliExpress footer
+    const cleanDesc = String(product.description).replace(/<script[\s\S]*?<\/script>/gi, '').slice(0, 8000);
+    ebayDescription = `<h2>${listingTitle}</h2>\n<div>${cleanDesc}</div>\n<br/><p style="font-size:11px;color:#888">Item is new. Please message us with any questions before purchasing.</p>`;
+  } else {
+    ebayDescription = buildDescription(listingTitle, product.bullets || [], product.descriptionPara || '', product.aspects || {}, product._source || product.source)
+      || product.description || listingTitle;
+  }
 
   // Base aspects (strip Color/Size — variants carry their own)
   const aspects = { ...(product.aspects || {}) };
@@ -6871,42 +6865,59 @@ module.exports = async (req, res) => {
     // changes to eBay via bulkUpdatePriceQuantity. No scraping, no proxy.
     if (action === 'ali_sync') {
       const { access_token, ebaySku, ebayListingId, aliProductId,
-              markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw } = body;
+              markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw,
+              skuToAsin: clientSkuToAsin } = body;
       if (!access_token || !ebaySku || !aliProductId)
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or aliProductId' });
       try {
         // Pull fresh AliExpress data
         const { apiResp, freightResp } = await _aliFetchProductAndFreight(aliProductId, 'US', 'USD');
         const product = _aliToDropSyncProduct(apiResp, '', freightResp, aliProductId);
-        const markupPct  = parseFloat(mkRaw ?? 35);
+        const markupPct  = parseFloat(mkRaw ?? 60);
         const handling   = parseFloat(handRaw ?? 2);
-        const defaultQty = parseInt(qtyRaw) || 5;
-        // Build per-SKU updates: ebaySku→{price, qty}
+        const defaultQty = parseInt(qtyRaw) || 1;
+
+        // ── Match eBay SKUs to AliExpress SKUs ─────────────────────────────
+        // Browser sends skuToAsin: { ebaySku → aliSkuId } captured at push time.
+        // Fresh product.comboAsin: { comboKey → aliSkuId }.
+        // We invert: aliSkuId → comboKey, then walk ebaySku→aliSkuId→comboKey.
+        const EBAY_API = getEbayUrls().EBAY_API;
+        const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+
+        const aliSkuToCombo = {};
+        for (const [combo, aliSku] of Object.entries(product.comboAsin || {})) {
+          if (aliSku) aliSkuToCombo[String(aliSku)] = combo;
+        }
+        const skuToAsin = clientSkuToAsin || {};
+        if (Object.keys(skuToAsin).length === 0) {
+          return res.json({ success: false, error: 'No skuToAsin map provided — need to repush to capture variant mapping' });
+        }
+
+        // ── Build per-variant updates ───────────────────────────────────────
         const updates = [];
-        for (const [comboKey, totalCost] of Object.entries(product.comboPrices || {})) {
-          const inStock = product.comboInStock?.[comboKey] !== false;
-          const aliSkuId = product.comboAsin?.[comboKey];
-          if (!aliSkuId) continue;
-          // ebay SKU for this variant: {ebaySku}-{aliSkuId}
-          const variantEbaySku = `${ebaySku}-${aliSkuId}`;
+        let matched = 0, missingAliSku = 0, missingCombo = 0;
+        for (const [eSku, aliSkuId] of Object.entries(skuToAsin)) {
+          const combo = aliSkuToCombo[String(aliSkuId)];
+          if (!combo) { missingAliSku++; continue; }
+          const totalCost = product.comboPrices?.[combo];
+          if (typeof totalCost !== 'number' || totalCost <= 0) { missingCombo++; continue; }
+          const inStock = product.comboInStock?.[combo] !== false;
           const sellPrice = (totalCost + handling) * (1 + markupPct / 100);
           updates.push({
-            ebaySku: variantEbaySku,
-            aliSkuId,
-            comboKey,
+            ebaySku: eSku,
             cost: totalCost,
             price: Math.round(sellPrice * 100) / 100,
             qty: inStock ? defaultQty : 0,
           });
+          matched++;
         }
-        // Find offer IDs for each ebaySku, then bulkUpdatePriceQuantity
-        const EBAY_API = getEbayUrls().EBAY_API;
-        const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json', 'Content-Language': 'en-US' };
+        console.log(`[ali_sync] ${ebaySku}: matched=${matched}, missingAliSku=${missingAliSku}, missingCombo=${missingCombo}`);
+
+        // ── Look up offer IDs ───────────────────────────────────────────────
         const updateRequests = [];
         for (const u of updates) {
-          // Look up offer ID
           const oR = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(u.ebaySku)}`, { headers: auth });
-          const oD = await oR.json();
+          const oD = await oR.json().catch(() => ({}));
           const off = (oD.offers || [])[0];
           if (!off?.offerId) {
             console.log(`[ali_sync] ${ebaySku}: no offer for ${u.ebaySku} — skipping`);
@@ -7876,18 +7887,19 @@ module.exports = async (req, res) => {
       if (!access_token || !ebaySku || !sourceUrl)
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
 
-      // PROXY-OR-BROWSER POLICY: smartSync for Amazon needs EITHER
-      // (a) the DataImpulse proxy enabled (server hits mini-endpoints), OR
-      // (b) browser-prefetched ASIN data passed in. If neither, skip cleanly.
+      // BROWSER-ONLY POLICY: smartSync for Amazon requires browser-prefetched
+      // ASIN data (clientAsinData). Server NEVER fetches Amazon directly —
+      // proxy is disabled, no Railway-IP fallback. If browser didn't provide
+      // data, skip this sync cycle.
       const _isAmazonSource = /amazon\.(com|co\.uk|de|ca)/.test(sourceUrl);
       const _hasClientAsinData = clientAsinData && typeof clientAsinData === 'object'
         && Object.keys(clientAsinData).length > 0;
-      if (_isAmazonSource && !_hasClientAsinData && !_proxyEnabled) {
-        console.log(`[smartSync] ${ebaySku}: Amazon source, no proxy AND no browser data — skipping`);
+      if (_isAmazonSource && !_hasClientAsinData) {
+        console.log(`[smartSync] ${ebaySku}: Amazon source but no browser data — skipping`);
         return res.json({
           success: false,
           skipped: true,
-          reason: 'Amazon source needs proxy or browser tab. Sync skipped.',
+          reason: 'Amazon source requires browser data. Sync skipped.',
         });
       }
 
@@ -9052,20 +9064,8 @@ module.exports = async (req, res) => {
       const categoryId  = suggestions[0]?.id || '11450';
       const listingTitle = sanitizeTitle(neutralizeTitle(product.ebayTitle || product.title || 'Product', product));
 
-      // ── STEP 3: Build description (same as push/revise) ──────────────────────
-      const buildEbayDesc = (title, bullets, para, asp) => {
-        const bulletHtml = (bullets || []).length
-          ? '<ul>' + bullets.map(b => `<li>${String(b).replace(/</g,'&lt;').replace(/>/g,'&gt;')}</li>`).join('') + '</ul>' : '';
-        const specRows = Object.entries(asp || {})
-          .filter(([k,v]) => !['ASIN','UPC','Color','Size','Brand Name','Brand'].includes(k) && v[0] && String(v[0]).length < 80)
-          .slice(0, 10).map(([k,v]) => `<tr><td><b>${k}</b></td><td>${v[0]}</td></tr>`).join('');
-        const specsTable = specRows
-          ? `<br/><table border="0" cellpadding="4" cellspacing="0" width="100%"><tbody>${specRows}</tbody></table>` : '';
-        return [`<h2>${title}</h2>`, bulletHtml, para ? `<p>${para}</p>` : '', specsTable,
-          '<br/><p style="font-size:11px;color:#888">Ships from US. Item is new. Please message us with any questions before purchasing.</p>',
-        ].filter(Boolean).join('\n');
-      };
-      const ebayDescription = buildEbayDesc(listingTitle, product.bullets || [], product.descriptionPara || '', product.aspects || '')
+      // ── STEP 3: Build description (uses global buildDescription, source-aware) ──
+      const ebayDescription = buildDescription(listingTitle, product.bullets || [], product.descriptionPara || '', product.aspects || {}, product._source || product.source)
                            || product.description || listingTitle;
 
       const aspects = { ...(product.aspects || {}) };
