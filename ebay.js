@@ -250,7 +250,7 @@ async function _aliFetchProductAndFreight(productId, shipTo = 'US', currency = '
     if (skus.length > 0) firstSkuId = skus[0].sku_id || skus[0].id;
   } catch(e) {}
 
-  // Step 3: freight query with selectedSkuId
+  // Step 3: freight query with selectedSkuId + locale at top level
   let freightResp = null;
   if (firstSkuId) {
     freightResp = await _aliCall('aliexpress.ds.freight.query', {
@@ -263,6 +263,7 @@ async function _aliFetchProductAndFreight(productId, shipTo = 'US', currency = '
         currency:        currency,
         language:        'en_US',
       }),
+      locale: 'en_US',  // some AliExpress regions require this at the top level
     }).catch(e => { console.warn(`[ali] freight query failed: ${e.message}`); return null; });
   } else {
     console.warn(`[ali] no SKU ID found in product ${productId} — skipping freight query`);
@@ -368,7 +369,10 @@ function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo, fallbackProductI
                   || sku.sku_attr_value
                   || [];
     const props = Array.isArray(propsArr) ? propsArr : (propsArr.ae_sku_property_d_t_o || []);
-    // Build a combo key from props (e.g. "Red|Large")
+    // Build a combo key from props. Format MUST be "primary|secondary" — the
+    // server's _resolveComboKey expects this pattern (matches Amazon scraper).
+    // For 1-dim products we still want a trailing pipe: "Red|" not "Red".
+    // For 0-dim (no variants), key = skuId.
     const keyParts = [];
     for (const p of props) {
       const dimName = p.sku_property_name || p.attr_name || 'Variant';
@@ -377,7 +381,9 @@ function _aliToDropSyncProduct(apiResp, sourceUrl, freightInfo, fallbackProductI
       if (valName) dimValues[dimName].add(valName);
       keyParts.push(valName || '');
     }
-    const comboKey = keyParts.join('|') || skuId;
+    // Pad to at least 2 slots so single-dim variants get "Red|" format
+    while (keyParts.length > 0 && keyParts.length < 2) keyParts.push('');
+    const comboKey = keyParts.length ? keyParts.join('|') : skuId;
     // FOLD SHIPPING INTO PRICE — same model as Amazon. Markup applies to (price + shipping).
     const totalCost = price + shippingCost;
     if (price > 0) comboPrices[comboKey] = totalCost;
