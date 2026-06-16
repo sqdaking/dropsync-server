@@ -1099,12 +1099,11 @@ function _browserExtractAsinData(html) {
       }
     }
   }
-  // OOS: check buy-box signals
-  const inStock = !html.includes('outOfStockBuyBox')
-    && !/currently unavailable/i.test(html)
-    && !/out of stock/i.test(html.slice(0, 50000))
-    && !html.includes('Join the waitlist');
-  return { price, shipping, inStock: price > 0 ? inStock : false };
+  // Stock rule: price IS the in-stock signal. Amazon hides the buy-box price
+  // whenever a product is "Currently unavailable", "See available options",
+  // OOS, waitlist, etc. If we extracted a real price → buyable. No price → OOS.
+  // No string scanning needed — too many false positives across Amazon pages.
+  return { price, shipping, inStock: price > 0 };
 }
 
 // ── Prefetch per-ASIN price+stock from browser — sends exact data to server ──────
