@@ -9830,6 +9830,103 @@ module.exports = async (req, res) => {
     // ── END LISTING ───────────────────────────────────────────────────────────
     // ── DEALS SCRAPE v2: get ASINs from Amazon Today's Deals page ────────────────
     if (action === 'bulkScrapeAsins') action = 'dealsScrape'; // backward compat alias
+    // ── BROWSER-DRIVEN DEALS SCRAPE: returns URL list only ──────────────────
+    // The browser/extension fetches the URLs (residential IP), then sends
+    // the parsed ASINs back via dealsScrapeAsinDetails. Avoids server-side
+    // Amazon block.
+    if (action === 'dealsScrapeUrls') {
+      const { dept = null, customUrls = null } = body;
+      // Identical map to dealsScrape (kept synced manually)
+      const AMAZON_PAGES_BY_DEPT = {
+        deals: [
+          'https://www.amazon.com/deals?ref_=nav_cs_gb',
+          'https://www.amazon.com',
+        ],
+        electronics: [
+          'https://www.amazon.com/b?node=172282',
+          'https://www.amazon.com/gp/bestsellers/electronics',
+          'https://www.amazon.com/s?k=phone+cases&i=electronics',
+          'https://www.amazon.com/s?k=wireless+earbuds&i=electronics',
+          'https://www.amazon.com/s?k=portable+charger&i=electronics',
+          'https://www.amazon.com/s?k=smart+watch&i=electronics',
+          'https://www.amazon.com/s?k=ring+light+tripod&i=electronics',
+          'https://www.amazon.com/s?k=usb+accessories&i=electronics',
+        ],
+        fashion_women: [
+          'https://www.amazon.com/s?k=women+dresses&i=fashion-womens',
+          'https://www.amazon.com/s?k=women+tops+blouses&i=fashion-womens',
+          'https://www.amazon.com/s?k=women+leggings&i=fashion-womens',
+          'https://www.amazon.com/s?k=women+swimwear&i=fashion-womens',
+          'https://www.amazon.com/s?k=women+pajamas&i=fashion-womens',
+        ],
+        fashion_men: [
+          'https://www.amazon.com/s?k=men+shirts&i=fashion-mens',
+          'https://www.amazon.com/s?k=men+shorts&i=fashion-mens',
+          'https://www.amazon.com/s?k=men+hoodies&i=fashion-mens',
+          'https://www.amazon.com/s?k=men+joggers&i=fashion-mens',
+        ],
+        fashion_kids: [
+          'https://www.amazon.com/s?k=girls+clothing&i=fashion-girls',
+          'https://www.amazon.com/s?k=boys+clothing&i=fashion-boys',
+          'https://www.amazon.com/s?k=school+uniforms+kids',
+        ],
+        baby_clothing: [
+          'https://www.amazon.com/s?k=baby+onesies&i=fashion-baby',
+          'https://www.amazon.com/s?k=baby+pajamas&i=fashion-baby',
+          'https://www.amazon.com/s?k=baby+dresses&i=fashion-baby',
+        ],
+        accessories: [
+          'https://www.amazon.com/s?k=handbags&i=fashion-womens',
+          'https://www.amazon.com/s?k=jewelry+women&i=fashion-womens',
+          'https://www.amazon.com/s?k=watches+women&i=fashion-womens',
+          'https://www.amazon.com/s?k=sunglasses&i=fashion-womens',
+        ],
+        home_kitchen: [
+          'https://www.amazon.com/gp/bestsellers/kitchen',
+          'https://www.amazon.com/s?k=kitchen+gadgets&i=garden',
+          'https://www.amazon.com/s?k=home+decor&i=garden',
+          'https://www.amazon.com/s?k=bedding+sheets&i=garden',
+          'https://www.amazon.com/s?k=organizers+storage&i=garden',
+        ],
+        toys: [
+          'https://www.amazon.com/gp/bestsellers/toys-and-games',
+          'https://www.amazon.com/s?k=educational+toys+kids&i=toys-and-games',
+          'https://www.amazon.com/s?k=remote+control+toys&i=toys-and-games',
+        ],
+        sports_fitness: [
+          'https://www.amazon.com/gp/bestsellers/sporting-goods',
+          'https://www.amazon.com/s?k=yoga+mat&i=sporting',
+          'https://www.amazon.com/s?k=resistance+bands&i=sporting',
+          'https://www.amazon.com/s?k=water+bottles&i=sporting',
+        ],
+        pets: [
+          'https://www.amazon.com/gp/bestsellers/pet-supplies',
+          'https://www.amazon.com/s?k=dog+toys&i=pet-supplies',
+          'https://www.amazon.com/s?k=cat+toys&i=pet-supplies',
+          'https://www.amazon.com/s?k=pet+beds&i=pet-supplies',
+        ],
+        beauty: [
+          'https://www.amazon.com/gp/bestsellers/beauty',
+          'https://www.amazon.com/s?k=skincare&i=beauty',
+          'https://www.amazon.com/s?k=hair+care&i=beauty',
+          'https://www.amazon.com/s?k=makeup&i=beauty',
+        ],
+      };
+      let urls;
+      if (Array.isArray(customUrls) && customUrls.length) {
+        urls = customUrls.map(u => ({ url: u, dept: dept || 'custom' }));
+      } else if (dept && dept !== 'all' && AMAZON_PAGES_BY_DEPT[dept]) {
+        urls = AMAZON_PAGES_BY_DEPT[dept].map(u => ({ url: u, dept }));
+      } else {
+        // All depts → flat list with dept tags
+        urls = [];
+        for (const [d, list] of Object.entries(AMAZON_PAGES_BY_DEPT)) {
+          for (const u of list) urls.push({ url: u, dept: d });
+        }
+      }
+      return res.json({ success: true, urls });
+    }
+
     if (action === 'dealsScrape') {
       const { exclude = [], count = 25, dept = null, customUrls = null } = body;
       const excludeSet = new Set(exclude);
