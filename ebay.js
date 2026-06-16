@@ -8190,6 +8190,23 @@ module.exports = async (req, res) => {
           if (p > 0) _used++;
         }
         console.log(`[smartSync] using browser clientAsinData: ${_used} ASINs priced (skipping server-side fetch)`);
+        // Even though we have client data, fill gaps from the 7-day cache for
+        // any ASIN NOT covered by the browser. This way variant-rich listings
+        // (where browser only sent the parent) can still publish with accurate
+        // prices using cached data from prior syncs.
+        const _uncoveredAsins = uniqueAsins.filter(a => !(a in asinPrice));
+        if (_uncoveredAsins.length > 0) {
+          let _filled = 0;
+          await Promise.all(_uncoveredAsins.map(async asin => {
+            const cached = await _asinCacheGet(asin);
+            if (cached && typeof cached.price === 'number' && cached.price > 0) {
+              asinPrice[asin]   = cached.price;
+              asinInStock[asin] = cached.inStock !== false;
+              _filled++;
+            }
+          }));
+          if (_filled > 0) console.log(`[smartSync] cache-filled ${_filled}/${_uncoveredAsins.length} uncovered ASINs from 7-day cache`);
+        }
       }
 
       if (uniqueAsins.length > 0 && !_hasClientData) {
