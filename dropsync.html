@@ -496,11 +496,42 @@ async function loadProductsFromRailway() {
       localStorage.setItem(KEY, JSON.stringify(settingsOnly));
     } catch(e) { console.warn('[Railway] settings save failed:', e.message); }
     console.log('[Railway] Loaded', d.products.length, 'products from Railway' + (localOnly.length ? ` + ${localOnly.length} local-only` : ''));
+    // Auto-register Amazon listings with relay queue (extension uses this to know what to sync)
+    _registerListingsForRelay().catch(() => {});
     return true;
   } catch(e) {
     console.warn('[Railway] loadProductsFromRailway failed — using local cache:', e.message);
     return false;
   }
+}
+
+// Push our Amazon listings to Railway's relay_state table so the Chrome
+// extension can pick them up and sync in background. Throttled to once per
+// 10 min — the extension keeps last_synced timestamps internally.
+let _lastRelayRegister = 0;
+async function _registerListingsForRelay() {
+  if (!S.serverUrl || !S.token) return;
+  if (Date.now() - _lastRelayRegister < 10 * 60 * 1000) return;
+  const items = (S.products || [])
+    .filter(p => p.status === 'listed' && p.ebaySku && p.sourceUrl && /amazon\./i.test(p.sourceUrl))
+    .map(p => ({
+      ebaySku:   normaliseGroupSku(p.ebaySku),
+      sourceUrl: p.sourceUrl,
+      comboAsin: p.comboAsin || {},
+      skuToAsin: p.skuToAsin || {},
+    }));
+  if (!items.length) return;
+  // Push in chunks of 500
+  for (let i = 0; i < items.length; i += 500) {
+    try {
+      await fetch(`${S.serverUrl}/api/ebay?action=relay_register`, {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ listings: items.slice(i, i+500) }),
+      });
+    } catch(e) { /* silent */ }
+  }
+  _lastRelayRegister = Date.now();
+  console.log(`[relay] registered ${items.length} Amazon listings for background extension sync`);
 }
 
 // ── loadLogsFromRailway: fetch logs from Railway DB ──
@@ -639,6 +670,10 @@ async function ensureToken() {
     } else {
       throw new Error('eBay token expired and no refresh token. Go to Settings → Force Reconnect.');
     }
+  }
+  // Push token to the Chrome extension if installed — lets it do background syncs.
+  if (window.dsExt && typeof window.dsExt.setToken === 'function') {
+    window.dsExt.setToken(S.token).catch(() => {});
   }
   return S.token;
 }
@@ -888,55 +923,66 @@ let _extId = localStorage.getItem('ds_ext_id') || null;
 
 // ── DropSync Amazon Fetcher Extension integration ─────────────────────────────
 // Detects if the Chrome extension is installed (sets window.__dropsyncExtensionReady).
-// Sends Amazon fetch requests via window.postMessage; content script relays to
-// the extension's background worker, which fetches Amazon with the user's
+// Sends Amazon fetch requests via window.dsExt (injected by the Chrome
+// extension's content script). Extension fetches Amazon with the user's
 // residential IP and returns HTML.
-let _extReadyCached = null;
-let _extReqCounter = 0;
-const _extPendingResolvers = new Map();
 
-// One global listener for extension responses
-window.addEventListener('message', (event) => {
-  if (event.source !== window) return;
-  const msg = event.data;
-  if (!msg || msg.__dropsync !== 'fetchAmazonResponse' && msg.__dropsync !== 'pingResponse') return;
-  const resolver = _extPendingResolvers.get(msg.reqId);
-  if (resolver) {
-    _extPendingResolvers.delete(msg.reqId);
-    resolver(msg.response);
-  }
+// Cached "ready" state. Updated when the extension dispatches 'dsExtReady'
+// or when we successfully ping it on first check.
+let _extReadyCached = null;
+let _extPingPromise = null;
+
+window.addEventListener('dsExtReady', () => {
+  _extReadyCached = true;
+  console.log('[extension] DropSync Amazon Bridge detected via dsExtReady event');
 });
 
 async function _extensionAvailable() {
-  // Detect extension via DOM marker (CSP-safe — content script sets data attr
-  // on <html> regardless of page CSP, unlike window flags which require script
-  // injection that gets blocked by strict CSPs).
-  const v = document.documentElement.dataset.dropsyncExtension;
-  if (v) {
-    if (_extReadyCached !== true) console.log('[extension] detected v' + v);
-    _extReadyCached = true;
-    return true;
+  // Already confirmed ready
+  if (_extReadyCached === true) return true;
+  // window.dsExt is injected by the extension's content script
+  if (typeof window.dsExt !== 'object' || !window.dsExt) {
+    _extReadyCached = false;
+    return false;
   }
-  _extReadyCached = false;
-  return false;
+  // Ping to confirm the service worker is alive (it can die between fetches)
+  if (!_extPingPromise) {
+    _extPingPromise = (async () => {
+      try {
+        const r = await Promise.race([
+          window.dsExt.ping(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 1500)),
+        ]);
+        if (r && r.ok) {
+          _extReadyCached = true;
+          if (r.version) console.log('[extension] ping ok v' + r.version);
+          return true;
+        }
+        _extReadyCached = false;
+        return false;
+      } catch(e) {
+        _extReadyCached = false;
+        return false;
+      } finally {
+        // Re-check after 30s in case extension reloads
+        setTimeout(() => { _extPingPromise = null; }, 30000);
+      }
+    })();
+  }
+  return _extPingPromise;
 }
 
 async function _fetchAmazonViaExtension(url) {
-  if (!document.documentElement.dataset.dropsyncExtension) throw new Error('Extension not installed');
-  const reqId = 'ext_' + (++_extReqCounter) + '_' + Date.now();
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      _extPendingResolvers.delete(reqId);
-      reject(new Error('extension fetch timeout after 30s'));
-    }, 30000);
-    _extPendingResolvers.set(reqId, (response) => {
-      clearTimeout(timeout);
-      if (!response) { reject(new Error('no response from extension')); return; }
-      if (!response.ok) { reject(new Error(response.error || `blocked or empty (status ${response.status})`)); return; }
-      resolve(response.html);
-    });
-    window.postMessage({ __dropsync: 'fetchAmazon', reqId, url }, '*');
-  });
+  if (!window.dsExt || typeof window.dsExt.fetchAmazon !== 'function') {
+    throw new Error('Extension not installed');
+  }
+  const r = await Promise.race([
+    window.dsExt.fetchAmazon(url),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('extension fetch timeout 30s')), 30000)),
+  ]);
+  if (!r) throw new Error('no response from extension');
+  if (!r.ok) throw new Error(r.reason || `blocked (status ${r.status||'?'}, size ${r.htmlSize||0}B)`);
+  return r.html;
 }
 
 async function fetchAmazonInBrowser(url) {
