@@ -7880,6 +7880,166 @@ module.exports = async (req, res) => {
       });
     }
 
+    // ── EXTENSION RELAY ENDPOINTS ─────────────────────────────────────────
+    // The Chrome extension runs in the user's browser (residential IP), fetches
+    // Amazon directly, and POSTs results back here. These endpoints let the
+    // extension run autonomously without the DropSync tab being open.
+    //
+    // Flow:
+    //   1. Extension polls /api/ebay?action=relay_next_batch every N min
+    //   2. Server returns N listings due for sync (oldest synced first)
+    //   3. Extension fetches each one from Amazon (user's IP), parses prices
+    //   4. Extension POSTs results via /api/ebay?action=relay_result
+    //   5. Server runs smartSync logic, updates eBay
+    //
+    // If Amazon blocks any fetch, extension POSTs /api/ebay?action=relay_blocked
+    // so we can throttle the next batch.
+    if (action === 'relay_next_batch') {
+      const { access_token, limit = 15 } = body;
+      if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+      if (!_cachePool) return res.status(500).json({ error: 'DB not ready' });
+      try {
+        // Ensure relay state table exists
+        await _cachePool.query(`
+          CREATE TABLE IF NOT EXISTS relay_state (
+            ebay_sku TEXT PRIMARY KEY,
+            source_url TEXT NOT NULL,
+            last_synced TIMESTAMPTZ,
+            last_blocked TIMESTAMPTZ,
+            block_count INTEGER DEFAULT 0,
+            cooldown_until TIMESTAMPTZ,
+            comboAsin JSONB,
+            skuToAsin JSONB,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          );
+        `).catch(() => {});
+
+        // Return listings sorted by oldest synced, excluding any in cooldown.
+        // Caller (extension) provides the full list via separate sync_register
+        // calls, so we filter from there. The DropSync UI registers listings
+        // when they're pushed.
+        const cap = Math.max(1, Math.min(100, parseInt(limit) || 15));
+        const r = await _cachePool.query(`
+          SELECT ebay_sku, source_url, last_synced, comboAsin, skuToAsin
+          FROM relay_state
+          WHERE (cooldown_until IS NULL OR cooldown_until < NOW())
+            AND source_url LIKE '%amazon%'
+          ORDER BY COALESCE(last_synced, '1970-01-01'::timestamptz) ASC
+          LIMIT $1
+        `, [cap]);
+        return res.json({
+          success: true,
+          batch: r.rows.map(row => ({
+            ebaySku:    row.ebay_sku,
+            sourceUrl:  row.source_url,
+            lastSynced: row.last_synced,
+            comboAsin:  row.comboasin || {},
+            skuToAsin:  row.skutoasin || {},
+          })),
+        });
+      } catch(e) {
+        console.error('[relay_next_batch] error:', e.message);
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
+    // Extension reports a successful fetch + parsed data — we run smartSync
+    // logic with the provided clientAsinData (so no server-side Amazon fetch).
+    if (action === 'relay_result') {
+      const { access_token, ebaySku, sourceUrl, clientAsinData,
+              markup, handlingCost, quantity, comboAsin, skuToAsin } = body;
+      if (!access_token || !ebaySku || !sourceUrl) {
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
+      try {
+        // Forward to smartSync handler (same code, same logic) by recursion
+        const mockReq = {
+          query: { action: 'smartSync' },
+          body: { access_token, ebaySku, sourceUrl,
+                  markup, handlingCost, quantity,
+                  clientAsinData, comboAsin, skuToAsin },
+          headers: req.headers || {},
+        };
+        let _result = null;
+        const mockRes = {
+          json: (j) => { _result = j; return mockRes; },
+          status: (c) => { mockRes._status = c; return mockRes; },
+        };
+        // Re-invoke this same handler with smartSync action
+        await module.exports(mockReq, mockRes);
+        // Update relay_state with last_synced timestamp + the maps we just used
+        if (_cachePool) {
+          await _cachePool.query(`
+            INSERT INTO relay_state (ebay_sku, source_url, last_synced, comboAsin, skuToAsin, block_count, updated_at)
+            VALUES ($1, $2, NOW(), $3::jsonb, $4::jsonb, 0, NOW())
+            ON CONFLICT (ebay_sku) DO UPDATE
+              SET last_synced = NOW(),
+                  source_url  = EXCLUDED.source_url,
+                  comboAsin   = COALESCE(EXCLUDED.comboAsin, relay_state.comboAsin),
+                  skuToAsin   = COALESCE(EXCLUDED.skuToAsin, relay_state.skuToAsin),
+                  block_count = 0,
+                  cooldown_until = NULL,
+                  updated_at  = NOW()
+          `, [ebaySku, sourceUrl, JSON.stringify(comboAsin || {}), JSON.stringify(skuToAsin || {})]).catch(e => {
+            console.warn('[relay_result] db update failed:', e.message);
+          });
+        }
+        return res.json({ success: true, smartSyncResult: _result });
+      } catch(e) {
+        console.error('[relay_result] error:', e.message);
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
+    // Extension reports a block from Amazon — put this ASIN in cooldown.
+    if (action === 'relay_blocked') {
+      const { ebaySku, reason = 'amazon_block', cooldownMinutes = 30 } = body;
+      if (!ebaySku) return res.status(400).json({ error: 'Missing ebaySku' });
+      try {
+        if (_cachePool) {
+          await _cachePool.query(`
+            INSERT INTO relay_state (ebay_sku, source_url, last_blocked, block_count, cooldown_until, updated_at)
+            VALUES ($1, '', NOW(), 1, NOW() + INTERVAL '${parseInt(cooldownMinutes)||30} minutes', NOW())
+            ON CONFLICT (ebay_sku) DO UPDATE
+              SET last_blocked = NOW(),
+                  block_count = relay_state.block_count + 1,
+                  cooldown_until = NOW() + INTERVAL '${parseInt(cooldownMinutes)||30} minutes',
+                  updated_at = NOW()
+          `, [ebaySku]).catch(() => {});
+        }
+        console.log(`[relay_blocked] ${ebaySku}: ${reason} — cooldown ${cooldownMinutes}min`);
+        return res.json({ success: true });
+      } catch(e) {
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
+    // Register listings into relay_state so the extension can pick them up
+    // (called by the DropSync UI when it has the full listing list).
+    if (action === 'relay_register') {
+      const { listings } = body; // [{ ebaySku, sourceUrl, comboAsin, skuToAsin }, ...]
+      if (!Array.isArray(listings)) return res.status(400).json({ error: 'listings must be array' });
+      if (!_cachePool) return res.status(500).json({ error: 'DB not ready' });
+      try {
+        let registered = 0;
+        for (const l of listings) {
+          if (!l.ebaySku || !l.sourceUrl) continue;
+          if (!/amazon\.(com|co\.uk|de|ca)/.test(l.sourceUrl)) continue; // only Amazon for now
+          await _cachePool.query(`
+            INSERT INTO relay_state (ebay_sku, source_url, comboAsin, skuToAsin, updated_at)
+            VALUES ($1, $2, $3::jsonb, $4::jsonb, NOW())
+            ON CONFLICT (ebay_sku) DO UPDATE
+              SET source_url = EXCLUDED.source_url,
+                  comboAsin  = COALESCE(EXCLUDED.comboAsin, relay_state.comboAsin),
+                  skuToAsin  = COALESCE(EXCLUDED.skuToAsin, relay_state.skuToAsin),
+                  updated_at = NOW()
+          `, [l.ebaySku, l.sourceUrl, JSON.stringify(l.comboAsin || {}), JSON.stringify(l.skuToAsin || {})]).catch(() => {});
+          registered++;
+        }
+        return res.json({ success: true, registered });
+      } catch(e) { return res.status(500).json({ error: e.message }); }
+    }
+
     if (action === 'smartSync') {
       const { access_token, ebaySku, ebayListingId, sourceUrl,
               markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw,
