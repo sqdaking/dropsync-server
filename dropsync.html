@@ -2298,14 +2298,12 @@ function stripVeROBrands(title) {
 }
 
 async function fetchDealsAsins(dept) {
-  // Use backend dealsScrape action — it has proper fetch/proxy infrastructure
   bulkLog(`Scanning Amazon${dept && dept!=='all' ? ' — '+dept.replace(/_/g,' ') : ' Today\'s Deals'}…`);
 
-  // Build comprehensive exclude set: ASINs + parentASINs to prevent cross-variant dupes
+  // Build exclude set
   const usedAsins = new Set([...BULK.usedAsins, ...(S.products||[]).map(p=>p.asin).filter(Boolean)]);
   const usedParents = new Set((S.products||[]).map(p=>p.parentAsin).filter(Boolean));
   const usedTitlesNorm = new Set((S.products||[]).map(p=>(p.title||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,40)).filter(t=>t.length>15));
-  const usedSet = usedAsins;
 
   // Resolve custom dept to URLs
   let _deptParam = dept === 'all' ? null : dept;
@@ -2320,38 +2318,100 @@ async function fetchDealsAsins(dept) {
     }
   }
 
-  const r = await fetch(`${S.serverUrl}/api/ebay?action=dealsScrape`, {
+  // Step 1: get URL list from server (no Amazon calls, just config lookup)
+  const urlsResp = await fetch(`${S.serverUrl}/api/ebay?action=dealsScrapeUrls`, {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ exclude: [...usedSet], count: 50, dept: _deptParam, customUrls: _customUrls, primeOnly: S.primeOnly || false })
+    body: JSON.stringify({ dept: _deptParam, customUrls: _customUrls }),
   });
-  const d = await safeJson(r);
-  if (!d.success) throw new Error(d.error || 'Deals scrape failed');
+  const urlsData = await safeJson(urlsResp);
+  if (!urlsData.success || !urlsData.urls?.length) {
+    throw new Error('Could not get URL list from server');
+  }
+  bulkLog(`Got ${urlsData.urls.length} URLs to scan — fetching via Chrome extension…`);
 
+  // Step 2: check extension is available — REQUIRED for bulk import now.
+  const hasExt = await _extensionAvailable();
+  if (!hasExt) {
+    throw new Error('Chrome extension required for bulk import. Install DropSync Amazon Bridge.');
+  }
+
+  // Step 3: fetch each URL via extension, extract ASINs
+  const productMap = {};
+  let pagesLoaded = 0;
+  const VERO = ['samsung','apple','nike','adidas','sony','microsoft','lg','bose','beats','dyson','lego','gucci','louis vuitton','chanel','rolex','prada','versace','burberry','yeezy','jordan','off-white','supreme','north face','ugg','timberland','new balance','under armour','reebok','puma','vans','converse','crocs','birkenstock','kindle','echo','ring','roomba','nintendo','playstation','xbox','fitbit','garmin','gopro','pokemon','disney','marvel'];
+  const isVeroT = (t) => { const x = (t||'').toLowerCase(); return VERO.some(b => x.includes(b)); };
+
+  // Sequential to avoid hammering Amazon. Extension has its own rate limits anyway.
+  for (let i = 0; i < urlsData.urls.length; i++) {
+    const { url, dept: d } = urlsData.urls[i];
+    try {
+      const r = await window.dsExt.fetchAmazon(url);
+      if (!r.ok) {
+        bulkLog(`⚠ Page ${i+1}/${urlsData.urls.length} blocked (${r.reason}) — continuing`, 'warn');
+        continue;
+      }
+      const html = r.html;
+      // Extract ASINs from data-asin attributes (most reliable)
+      const asinMatches = [...html.matchAll(/data-asin="(B0[A-Z0-9]{8})"/g)];
+      let added = 0;
+      for (const m of asinMatches) {
+        const asin = m[1];
+        if (productMap[asin]) continue;
+        if (usedAsins.has(asin)) continue;
+        // Try to find a nearby title (h2/h5 within ~2000 chars of the asin tag)
+        const idx = m.index;
+        const slice = html.slice(idx, idx + 3000);
+        const titleM = slice.match(/<span[^>]*class="[^"]*a-text-normal[^"]*"[^>]*>([^<]{20,200})</)
+                    || slice.match(/<h2[^>]*>\s*<a[^>]*>\s*<span[^>]*>([^<]{20,200})</)
+                    || slice.match(/aria-label="([^"]{20,200})"/);
+        const title = titleM ? titleM[1].replace(/&amp;/g,'&').replace(/&quot;/g,'"').trim() : '';
+        if (title && isVeroT(title)) continue;
+        productMap[asin] = { asin, title, dept: d };
+        added++;
+      }
+      pagesLoaded++;
+      console.log(`[bulk] page ${i+1}/${urlsData.urls.length} ${d}: +${added} pool=${Object.keys(productMap).length}`);
+      bulkLog(`Page ${i+1}/${urlsData.urls.length}: +${added} (pool: ${Object.keys(productMap).length})`);
+      // Stop early if we have plenty
+      if (Object.keys(productMap).length >= 100) break;
+      // Brief pause between pages
+      await new Promise(r => setTimeout(r, 800 + Math.random()*600));
+    } catch(e) {
+      console.warn(`[bulk] page ${i+1} error:`, e.message);
+    }
+  }
+
+  if (Object.keys(productMap).length === 0) {
+    throw new Error('No products found. Extension may be blocked by Amazon — wait a few minutes.');
+  }
+
+  // Filter + dedupe + dept balance
   const _norm = s => (s||'').toLowerCase().replace(/[^a-z0-9]/g,'').slice(0,40);
-  const products = (d.products || []).filter(p => {
-    if (!p.asin || usedAsins.has(p.asin)) return false;
-    if (isVeRO(p.title)) return false;
-    // Block same-parent variants
-    if (p.parentAsin && usedParents.has(p.parentAsin)) return false;
-    // Block near-identical titles
+  const allProducts = Object.values(productMap).filter(p => {
+    if (!p.asin) return false;
+    if (usedAsins.has(p.asin)) return false;
+    if (p.title && isVeroT(p.title)) return false;
     const nt = _norm(p.title);
     if (nt.length > 15 && usedTitlesNorm.has(nt)) return false;
     return true;
   });
-  bulkLog(`Found ${d.totalFound || '?'} products across all depts · ${products.length} new (no dupes)`);
 
-  // Remove internal dupes from this batch (same parent/title)
-  const seenThisBatch = new Set();
-  const seenParents = new Set();
-  const deduped = products.filter(p => {
-    if (seenThisBatch.has(p.asin)) return false;
-    if (p.parentAsin && seenParents.has(p.parentAsin)) return false;
-    seenThisBatch.add(p.asin);
-    if (p.parentAsin) seenParents.add(p.parentAsin);
-    return true;
-  });
-
-  return deduped.slice(0, 25);
+  // Round-robin across depts
+  const byDept = {};
+  for (const p of allProducts) { (byDept[p.dept||'unknown'] = byDept[p.dept||'unknown'] || []).push(p); }
+  for (const arr of Object.values(byDept)) {
+    for (let i = arr.length-1; i>0; i--) { const j = Math.floor(Math.random()*(i+1)); [arr[i],arr[j]]=[arr[j],arr[i]]; }
+  }
+  const deptQueues = Object.values(byDept);
+  const selected = [];
+  let _di = 0;
+  while (selected.length < 25 && deptQueues.some(q=>q.length>0)) {
+    const q = deptQueues[_di % deptQueues.length];
+    if (q.length > 0) selected.push(q.shift());
+    _di++;
+  }
+  bulkLog(`Found ${Object.keys(productMap).length} products · ${selected.length} selected (no dupes)`);
+  return selected;
 }
 
 async function bulkFetchDeals(dept) {
