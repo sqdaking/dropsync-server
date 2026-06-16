@@ -2466,6 +2466,16 @@ async function bulkFetchDeals(dept) {
           const _bRes = await fetchAmazonInBrowser(_bUrl).catch(() => null);
           if (typeof _bRes === 'string' && _bRes.length > 5000) {
             _pageHtml = _bRes;
+            // ALSO prefetch all variant ASIN prices via the extension so the
+            // server doesn't try to fetch them itself (it can't — proxy disabled).
+            // prefetchAsinPrices uses window.dsExt.fetchAmazon under the hood.
+            try {
+              _clientAsinData = await prefetchAsinPrices(_pageHtml);
+              const _n = _clientAsinData ? Object.keys(_clientAsinData).length : 0;
+              if (_n > 0) bulkLog(`${asin}: prefetched ${_n} variant prices via extension`);
+            } catch(_pe) {
+              console.warn(`[bulk] ${asin}: variant prefetch failed:`, _pe.message);
+            }
           }
         } catch(_be) { /* fall through to server-only path */ }
 
