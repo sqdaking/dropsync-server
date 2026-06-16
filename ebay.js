@@ -7959,11 +7959,19 @@ module.exports = async (req, res) => {
                   markup, handlingCost, quantity,
                   clientAsinData, comboAsin, skuToAsin },
           headers: req.headers || {},
+          method: 'POST',
         };
         let _result = null;
         const mockRes = {
-          json: (j) => { _result = j; return mockRes; },
-          status: (c) => { mockRes._status = c; return mockRes; },
+          _status: 200,
+          _headers: {},
+          json: function(j) { this._result = j; _result = j; return this; },
+          status: function(c) { this._status = c; return this; },
+          setHeader: function(k, v) { this._headers[k] = v; return this; },
+          getHeader: function(k) { return this._headers[k]; },
+          removeHeader: function(k) { delete this._headers[k]; return this; },
+          send: function(b) { if (typeof b === 'object') _result = b; return this; },
+          end: function() { return this; },
         };
         // Re-invoke this same handler with smartSync action
         await module.exports(mockReq, mockRes);
