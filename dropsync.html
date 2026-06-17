@@ -1099,11 +1099,27 @@ function _browserExtractAsinData(html) {
       }
     }
   }
-  // Stock rule: price IS the in-stock signal. Amazon hides the buy-box price
-  // whenever a product is "Currently unavailable", "See available options",
-  // OOS, waitlist, etc. If we extracted a real price → buyable. No price → OOS.
-  // No string scanning needed — too many false positives across Amazon pages.
-  return { price, shipping, inStock: price > 0 };
+  // OOS: check the buy-box / availability area specifically (not whole page).
+  // Real OOS signals only appear in:
+  //   - id="availability" widget (Amazon's official availability block)
+  //   - id="outOfStock" container
+  //   - id="buybox" / "desktop_buybox" / "rightCol" (buy area)
+  // We do NOT scan the whole HTML — "out of stock" appears in related items,
+  // recently-viewed, etc. on every product page.
+  const availSection = html.match(/id="availability"[\s\S]{0,3000}/)?.[0]
+                    || html.match(/id="outOfStock"[\s\S]{0,2000}/)?.[0]
+                    || '';
+  const buyBoxSection = html.match(/id="(?:buybox|desktop_buybox|rightCol)"[\s\S]{0,8000}/)?.[0] || '';
+  const _searchArea = availSection + buyBoxSection;
+  const inStock = !!_searchArea
+    && !/Currently unavailable/i.test(_searchArea)
+    && !/Out of stock/i.test(_searchArea)
+    && !/We don('|'|&#39;)t know when/i.test(_searchArea)
+    && !/See available options/i.test(_searchArea)
+    && !html.includes('Join the waitlist')
+    && !html.includes('outOfStockBuyBox');
+  // Price gate still applies — no price = OOS regardless of strings.
+  return { price, shipping, inStock: price > 0 ? inStock : false };
 }
 
 // ── Prefetch per-ASIN price+stock from browser — sends exact data to server ──────
