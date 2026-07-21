@@ -500,6 +500,72 @@ async function _asinCachePurge() {
 setTimeout(_asinCachePurge, 30000); // 30s after boot
 setInterval(_asinCachePurge, 6 * 3600 * 1000); // every 6h
 
+// ── MULTI-ACCOUNT: resolve eBay account identity from an access token ─────────
+// Uses Trading API GetUser (works with existing OAuth user tokens, no new
+// scope needed). Result cached in memory for 1h keyed by token tail so we
+// don't burn an eBay call per request. Falls back to the caller-provided
+// hint, then 'default'. NEVER trust the hint alone when a token is present —
+// the token is the authoritative source of identity.
+const _acctCache = new Map();
+async function _resolveEbayAccountId(accessToken, hintedId) {
+  const hint = (typeof hintedId === 'string' && /^[\w.\-]{1,64}$/.test(hintedId)) ? hintedId : null;
+  if (!accessToken) return hint || 'default';
+  const key = String(accessToken).slice(-40);
+  const hit = _acctCache.get(key);
+  if (hit && Date.now() - hit.ts < 3600 * 1000) return hit.id;
+  try {
+    const r = await fetch(getEbayUrls().EBAY_TRADING, {
+      method: 'POST',
+      headers: {
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '1193',
+        'X-EBAY-API-CALL-NAME': 'GetUser',
+        'X-EBAY-API-SITEID': '0',
+        'X-EBAY-API-IAF-TOKEN': accessToken,
+        'Content-Type': 'text/xml',
+      },
+      body: '<?xml version="1.0" encoding="utf-8"?><GetUserRequest xmlns="urn:ebay:apis:eBLBaseComponents"><DetailLevel>ReturnSummary</DetailLevel></GetUserRequest>',
+    });
+    const xml = await r.text();
+    const m = xml.match(/<UserID>([^<]{1,64})<\/UserID>/);
+    if (m && m[1]) {
+      const id = m[1].trim();
+      _acctCache.set(key, { id, ts: Date.now() });
+      if (_acctCache.size > 300) _acctCache.delete(_acctCache.keys().next().value);
+      return id;
+    }
+  } catch(e) { /* fall through */ }
+  return hint || 'default';
+}
+// (exposed on module.exports at bottom of file)
+
+// ── relay_state schema — created/migrated once per boot ───────────────────────
+let _relaySchemaReady = false;
+async function _ensureRelayStateSchema() {
+  if (_relaySchemaReady || !_cachePool) return;
+  await _cachePool.query(`
+    CREATE TABLE IF NOT EXISTS relay_state (
+      ebay_sku TEXT PRIMARY KEY,
+      source_url TEXT NOT NULL,
+      last_synced TIMESTAMPTZ,
+      last_blocked TIMESTAMPTZ,
+      block_count INTEGER DEFAULT 0,
+      cooldown_until TIMESTAMPTZ,
+      comboAsin JSONB,
+      skuToAsin JSONB,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS account_id      TEXT NOT NULL DEFAULT 'default';
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS offer_ids       JSONB;
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS asin_offset     INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS markup          NUMERIC(6,2);
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS handling_cost   NUMERIC(6,2);
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS quantity        INTEGER;
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS last_dispatched TIMESTAMPTZ;
+    CREATE INDEX IF NOT EXISTS relay_state_acct_idx ON relay_state(account_id, last_synced);
+  `).catch(e => console.warn('[relay] schema migrate:', e.message));
+  _relaySchemaReady = true;
+}
+
 // DropSync AI Agent — Amazon → eBay Dropshipping Backend
 // Clean architecture: per-ASIN prices+images, AI category detection, auto policies
 
@@ -544,6 +610,14 @@ function setRelayHandle(h) { _relayHandle = h; }
 // All fetches route through DataImpulse residential proxy.
 async function fetchAmazonMini(asin) {
   if (!asin) return null;
+  // BROWSER-ONLY POLICY (July 2026): the server never fetches Amazon. Without
+  // a proxy agent this function would hit Amazon from Railway's IP — instantly
+  // blocked AND a policy violation. Hard-refuse unless a proxy is explicitly
+  // enabled (it isn't — _proxyEnabled is hardcoded false).
+  if (!_proxyEnabled || !_proxyAgent) {
+    console.log(`[fetch] ${asin}: server-side Amazon fetch disabled (browser-only) — returning null`);
+    return null;
+  }
   const url = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
@@ -7040,11 +7114,16 @@ module.exports = async (req, res) => {
           </p></body></html>`
         );
       }
+      // MULTI-ACCOUNT: resolve the eBay username for this token so the
+      // frontend can scope everything (products, settings, relay) to it.
+      let _acctId = null;
+      try { _acctId = await _resolveEbayAccountId(d.access_token); } catch(e) {}
       const payload = {
         type: 'ebay_auth',
         token: d.access_token,
         refresh: d.refresh_token,
-        expiry: Date.now() + ((d.expires_in||7200)-120)*1000
+        expiry: Date.now() + ((d.expires_in||7200)-120)*1000,
+        accountId: _acctId && _acctId !== 'default' ? _acctId : undefined,
       };
       return res.setHeader('Content-Type','text/html').send(
         `<!DOCTYPE html><html><body>
@@ -7899,42 +7978,61 @@ module.exports = async (req, res) => {
       if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
       if (!_cachePool) return res.status(500).json({ error: 'DB not ready' });
       try {
-        // Ensure relay state table exists
-        await _cachePool.query(`
-          CREATE TABLE IF NOT EXISTS relay_state (
-            ebay_sku TEXT PRIMARY KEY,
-            source_url TEXT NOT NULL,
-            last_synced TIMESTAMPTZ,
-            last_blocked TIMESTAMPTZ,
-            block_count INTEGER DEFAULT 0,
-            cooldown_until TIMESTAMPTZ,
-            comboAsin JSONB,
-            skuToAsin JSONB,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-          );
-        `).catch(() => {});
+        await _ensureRelayStateSchema();
+        // MULTI-ACCOUNT: resolve which eBay account this token belongs to and
+        // only hand out THAT account's listings. Without this, one extension
+        // instance would sync another account's listings with the wrong token.
+        const accountId = await _resolveEbayAccountId(access_token, body.accountId);
 
-        // Return listings sorted by oldest synced, excluding any in cooldown.
-        // Caller (extension) provides the full list via separate sync_register
-        // calls, so we filter from there. The DropSync UI registers listings
-        // when they're pushed.
+        // Return listings sorted by oldest synced, excluding any in cooldown
+        // AND any dispatched to a worker in the last 5 minutes (claim-lock —
+        // prevents overlapping ticks from double-fetching the same listing).
         const cap = Math.max(1, Math.min(100, parseInt(limit) || 15));
         const r = await _cachePool.query(`
-          SELECT ebay_sku, source_url, last_synced, comboAsin, skuToAsin
-          FROM relay_state
-          WHERE (cooldown_until IS NULL OR cooldown_until < NOW())
-            AND source_url LIKE '%amazon%'
-          ORDER BY COALESCE(last_synced, '1970-01-01'::timestamptz) ASC
-          LIMIT $1
-        `, [cap]);
+          UPDATE relay_state SET last_dispatched = NOW()
+          WHERE ebay_sku IN (
+            SELECT ebay_sku FROM relay_state
+            WHERE account_id = $2
+              AND (cooldown_until IS NULL OR cooldown_until < NOW())
+              AND (last_dispatched IS NULL OR last_dispatched < NOW() - INTERVAL '5 minutes')
+              AND source_url LIKE '%amazon%'
+            ORDER BY COALESCE(last_synced, '1970-01-01'::timestamptz) ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+          )
+          RETURNING ebay_sku, source_url, last_synced, comboAsin, skuToAsin,
+                    offer_ids, asin_offset, markup, handling_cost, quantity
+        `, [cap, accountId]);
+
+        // Tell the extension which ASINs already have fresh cache (<20h old)
+        // so it can SKIP fetching them entirely — biggest block-avoidance win.
+        const _allAsins = [...new Set(r.rows.flatMap(row =>
+          Object.values(row.comboasin || {}).filter(a => /^[A-Z0-9]{10}$/.test(String(a)))
+        ))];
+        let freshAsins = [];
+        if (_allAsins.length) {
+          const fr = await _cachePool.query(
+            `SELECT asin FROM asin_cache WHERE fetched_at > NOW() - INTERVAL '20 hours' AND asin = ANY($1)`,
+            [_allAsins]
+          ).catch(() => ({ rows: [] }));
+          freshAsins = fr.rows.map(x => x.asin);
+        }
+
         return res.json({
           success: true,
+          accountId,
+          freshAsins,
           batch: r.rows.map(row => ({
-            ebaySku:    row.ebay_sku,
-            sourceUrl:  row.source_url,
-            lastSynced: row.last_synced,
-            comboAsin:  row.comboasin || {},
-            skuToAsin:  row.skutoasin || {},
+            ebaySku:      row.ebay_sku,
+            sourceUrl:    row.source_url,
+            lastSynced:   row.last_synced,
+            comboAsin:    row.comboasin || {},
+            skuToAsin:    row.skutoasin || {},
+            offerIds:     row.offer_ids || {},
+            asinOffset:   parseInt(row.asin_offset) || 0,
+            markup:       row.markup       != null ? parseFloat(row.markup)        : null,
+            handlingCost: row.handling_cost != null ? parseFloat(row.handling_cost) : null,
+            quantity:     row.quantity     != null ? parseInt(row.quantity)        : null,
           })),
         });
       } catch(e) {
@@ -7947,17 +8045,47 @@ module.exports = async (req, res) => {
     // logic with the provided clientAsinData (so no server-side Amazon fetch).
     if (action === 'relay_result') {
       const { access_token, ebaySku, sourceUrl, clientAsinData,
-              markup, handlingCost, quantity, comboAsin, skuToAsin } = body;
+              markup, handlingCost, quantity, comboAsin, skuToAsin,
+              asinOffset } = body;
       if (!access_token || !ebaySku || !sourceUrl) {
         return res.status(400).json({ error: 'Missing required fields' });
       }
       try {
+        await _ensureRelayStateSchema();
+        const accountId = await _resolveEbayAccountId(access_token, body.accountId);
+
+        // Load the stored row: per-listing settings (markup/handling/qty saved
+        // at registration time from the DropSync UI), cached offer IDs (skips
+        // the whole eBay offer-discovery chain), and the rotation offset.
+        // Extension-provided values win when present; stored values are the
+        // fallback so background syncs NEVER fall back to hardcoded defaults.
+        let _row = null;
+        if (_cachePool) {
+          const rr = await _cachePool.query(
+            `SELECT offer_ids, asin_offset, markup, handling_cost, quantity, account_id
+               FROM relay_state WHERE ebay_sku = $1`, [ebaySku]).catch(() => null);
+          _row = rr?.rows?.[0] || null;
+        }
+        // Account guard: refuse to sync a listing registered to a DIFFERENT account
+        if (_row && _row.account_id && _row.account_id !== 'default' && _row.account_id !== accountId) {
+          console.warn(`[relay_result] ${ebaySku}: registered to ${_row.account_id}, token is ${accountId} — refusing`);
+          return res.status(403).json({ error: `Listing belongs to eBay account ${_row.account_id}, token is for ${accountId}` });
+        }
+        const _mk   = markup       != null ? markup       : (_row?.markup        != null ? parseFloat(_row.markup)        : undefined);
+        const _hand = handlingCost != null ? handlingCost : (_row?.handling_cost != null ? parseFloat(_row.handling_cost) : undefined);
+        const _qty  = quantity     != null ? quantity     : (_row?.quantity      != null ? parseInt(_row.quantity)        : undefined);
+        const _cachedOfferIds = _row?.offer_ids || null;
+        const _asinOff = asinOffset != null ? parseInt(asinOffset) : (parseInt(_row?.asin_offset) || 0);
+
         // Forward to smartSync handler (same code, same logic) by recursion
         const mockReq = {
           query: { action: 'smartSync' },
           body: { access_token, ebaySku, sourceUrl,
-                  markup, handlingCost, quantity,
-                  clientAsinData, comboAsin, skuToAsin },
+                  markup: _mk, handlingCost: _hand, quantity: _qty,
+                  clientAsinData, comboAsin, skuToAsin,
+                  cachedOfferIds: _cachedOfferIds,
+                  asinOffset: _asinOff,
+                  accountId },
           headers: req.headers || {},
           method: 'POST',
         };
@@ -7975,20 +8103,33 @@ module.exports = async (req, res) => {
         };
         // Re-invoke this same handler with smartSync action
         await module.exports(mockReq, mockRes);
-        // Update relay_state with last_synced timestamp + the maps we just used
+
+        // Persist sync outcome: timestamp, maps, FRESH OFFER IDS (so the next
+        // cycle skips discovery entirely) and the advanced rotation offset (so
+        // listings with more variants than one cycle covers eventually get
+        // every variant refreshed).
         if (_cachePool) {
+          const _stale = _result && _result.offersCacheStale === true;
           await _cachePool.query(`
-            INSERT INTO relay_state (ebay_sku, source_url, last_synced, comboAsin, skuToAsin, block_count, updated_at)
-            VALUES ($1, $2, NOW(), $3::jsonb, $4::jsonb, 0, NOW())
+            INSERT INTO relay_state (ebay_sku, source_url, account_id, last_synced, comboAsin, skuToAsin, offer_ids, asin_offset, block_count, updated_at)
+            VALUES ($1, $2, $3, NOW(), $4::jsonb, $5::jsonb, $6::jsonb, $7, 0, NOW())
             ON CONFLICT (ebay_sku) DO UPDATE
               SET last_synced = NOW(),
                   source_url  = EXCLUDED.source_url,
+                  account_id  = EXCLUDED.account_id,
                   comboAsin   = COALESCE(EXCLUDED.comboAsin, relay_state.comboAsin),
                   skuToAsin   = COALESCE(EXCLUDED.skuToAsin, relay_state.skuToAsin),
+                  offer_ids   = ${_stale ? 'NULL' : 'COALESCE(EXCLUDED.offer_ids, relay_state.offer_ids)'},
+                  asin_offset = EXCLUDED.asin_offset,
                   block_count = 0,
                   cooldown_until = NULL,
                   updated_at  = NOW()
-          `, [ebaySku, sourceUrl, JSON.stringify(comboAsin || {}), JSON.stringify(skuToAsin || {})]).catch(e => {
+          `, [ebaySku, sourceUrl, accountId,
+              JSON.stringify(comboAsin || {}),
+              JSON.stringify(Object.keys(_result?.skuToAsin || {}).length ? _result.skuToAsin : (skuToAsin || {})),
+              _result?.offerIdsBySku ? JSON.stringify(_result.offerIdsBySku) : null,
+              parseInt(_result?.nextAsinOffset) || 0,
+          ]).catch(e => {
             console.warn('[relay_result] db update failed:', e.message);
           });
         }
@@ -8004,16 +8145,20 @@ module.exports = async (req, res) => {
       const { ebaySku, reason = 'amazon_block', cooldownMinutes = 30 } = body;
       if (!ebaySku) return res.status(400).json({ error: 'Missing ebaySku' });
       try {
+        await _ensureRelayStateSchema();
         if (_cachePool) {
+          // UPDATE-only: never insert rows with empty source_url (they'd be
+          // invisible to relay_next_batch's LIKE '%amazon%' filter forever
+          // and just pollute the table).
+          const _cd = Math.max(1, Math.min(1440, parseInt(cooldownMinutes) || 30));
           await _cachePool.query(`
-            INSERT INTO relay_state (ebay_sku, source_url, last_blocked, block_count, cooldown_until, updated_at)
-            VALUES ($1, '', NOW(), 1, NOW() + INTERVAL '${parseInt(cooldownMinutes)||30} minutes', NOW())
-            ON CONFLICT (ebay_sku) DO UPDATE
-              SET last_blocked = NOW(),
-                  block_count = relay_state.block_count + 1,
-                  cooldown_until = NOW() + INTERVAL '${parseInt(cooldownMinutes)||30} minutes',
-                  updated_at = NOW()
-          `, [ebaySku]).catch(() => {});
+            UPDATE relay_state
+               SET last_blocked = NOW(),
+                   block_count = block_count + 1,
+                   cooldown_until = NOW() + ($2 || ' minutes')::interval,
+                   updated_at = NOW()
+             WHERE ebay_sku = $1
+          `, [ebaySku, String(_cd)]).catch(() => {});
         }
         console.log(`[relay_blocked] ${ebaySku}: ${reason} — cooldown ${cooldownMinutes}min`);
         return res.json({ success: true });
@@ -8024,27 +8169,44 @@ module.exports = async (req, res) => {
 
     // Register listings into relay_state so the extension can pick them up
     // (called by the DropSync UI when it has the full listing list).
+    // MULTI-ACCOUNT: registration carries the caller's token so every listing
+    // is tagged with the eBay account it belongs to. Also stores per-listing
+    // markup / handling / quantity + cached offer IDs so background syncs use
+    // YOUR settings and skip offer discovery.
     if (action === 'relay_register') {
-      const { listings } = body; // [{ ebaySku, sourceUrl, comboAsin, skuToAsin }, ...]
+      const { listings, access_token } = body;
       if (!Array.isArray(listings)) return res.status(400).json({ error: 'listings must be array' });
       if (!_cachePool) return res.status(500).json({ error: 'DB not ready' });
       try {
+        await _ensureRelayStateSchema();
+        const accountId = await _resolveEbayAccountId(access_token, body.accountId);
         let registered = 0;
         for (const l of listings) {
           if (!l.ebaySku || !l.sourceUrl) continue;
           if (!/amazon\.(com|co\.uk|de|ca)/.test(l.sourceUrl)) continue; // only Amazon for now
           await _cachePool.query(`
-            INSERT INTO relay_state (ebay_sku, source_url, comboAsin, skuToAsin, updated_at)
-            VALUES ($1, $2, $3::jsonb, $4::jsonb, NOW())
+            INSERT INTO relay_state (ebay_sku, source_url, account_id, comboAsin, skuToAsin, offer_ids, markup, handling_cost, quantity, updated_at)
+            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, NOW())
             ON CONFLICT (ebay_sku) DO UPDATE
               SET source_url = EXCLUDED.source_url,
+                  account_id = EXCLUDED.account_id,
                   comboAsin  = COALESCE(EXCLUDED.comboAsin, relay_state.comboAsin),
                   skuToAsin  = COALESCE(EXCLUDED.skuToAsin, relay_state.skuToAsin),
+                  offer_ids  = COALESCE(EXCLUDED.offer_ids, relay_state.offer_ids),
+                  markup        = COALESCE(EXCLUDED.markup,        relay_state.markup),
+                  handling_cost = COALESCE(EXCLUDED.handling_cost, relay_state.handling_cost),
+                  quantity      = COALESCE(EXCLUDED.quantity,      relay_state.quantity),
                   updated_at = NOW()
-          `, [l.ebaySku, l.sourceUrl, JSON.stringify(l.comboAsin || {}), JSON.stringify(l.skuToAsin || {})]).catch(() => {});
+          `, [l.ebaySku, l.sourceUrl, accountId,
+              JSON.stringify(l.comboAsin || {}), JSON.stringify(l.skuToAsin || {}),
+              l.offerIds && Object.keys(l.offerIds).length ? JSON.stringify(l.offerIds) : null,
+              l.markup       != null ? parseFloat(l.markup)       : null,
+              l.handlingCost != null ? parseFloat(l.handlingCost) : null,
+              l.quantity     != null ? parseInt(l.quantity)       : null,
+          ]).catch(() => {});
           registered++;
         }
-        return res.json({ success: true, registered });
+        return res.json({ success: true, registered, accountId });
       } catch(e) { return res.status(500).json({ error: e.message }); }
     }
 
@@ -8128,33 +8290,28 @@ module.exports = async (req, res) => {
         });
       }
 
-      // ── Progressive slicing — 50 ASINs per cycle ─────────────────────────────
-      // Capped at 50 per user rule (was 100). Smaller batches = lower per-cycle
-      // load on Amazon (less rate-limit triggering) and faster cycle turnaround,
-      // at the cost of more cycles for very large listings (1000+ variations).
-      // Frontend stores asinOffset, sends it each cycle, resets when all done.
-      // ── VARIANT CAP per cycle ─────────────────────────────────────────────
-      // Big listings (50-500 variants) burn massive proxy bandwidth if every
-      // variant gets fetched every cycle. Hard cap to MAX_VARIANTS_PER_SYNC
-      // most-likely-to-sell variants (or all of them if listing is small).
-      // The cache handles longer-term coverage — variants not fetched this
-      // cycle keep their last cached price (up to 7 days old).
+      // ── VARIANT ROTATION (fixed July 2026) ────────────────────────────────
+      // OLD BUG: MAX_VARIANTS_PER_SYNC truncated allUniqueAsins to the first
+      // 15 BEFORE the offset slice, so variants 16+ could NEVER be reached —
+      // the rotation offset always reset to 0 against a 15-item list. Large
+      // listings had 80% of variants permanently stale.
+      //
+      // NEW MODEL: the server considers ALL ASINs every cycle. Fresh data
+      // comes from clientAsinData (whatever the browser fetched this cycle)
+      // plus the 7-day Postgres cache. MAX_VARIANTS_PER_SYNC is now only a
+      // ROTATION HINT for the fetcher: nextAsinOffset tells the browser/
+      // extension which slice of variants to fresh-fetch next cycle, so over
+      // N cycles every variant gets refreshed.
       const MAX_VARIANTS_PER_SYNC = parseInt(process.env.MAX_VARIANTS_PER_SYNC) || 15;
-      if (allUniqueAsins.length > MAX_VARIANTS_PER_SYNC) {
-        const _before = allUniqueAsins.length;
-        // Keep the first N — these correspond to twister's natural variant order,
-        // which roughly matches Amazon's "most-popular variants first".
-        allUniqueAsins = allUniqueAsins.slice(0, MAX_VARIANTS_PER_SYNC);
-        console.log(`[smartSync] variant cap: ${_before} ASINs → ${allUniqueAsins.length} (set MAX_VARIANTS_PER_SYNC env var to change)`);
-      }
+      const asinOffset = Math.max(0, parseInt(body.asinOffset || 0)) % Math.max(1, allUniqueAsins.length);
+      const nextAsinOffset = (asinOffset + MAX_VARIANTS_PER_SYNC >= allUniqueAsins.length)
+        ? 0
+        : asinOffset + MAX_VARIANTS_PER_SYNC;
+      // uniqueAsins = full list — coverage now comes from client data + cache,
+      // not from which slice the server would have proxy-fetched (proxy is dead).
+      const uniqueAsins = allUniqueAsins;
 
-      const ASIN_BATCH_SIZE = 50;
-      const asinOffset = parseInt(body.asinOffset || 0);
-      const _slice = allUniqueAsins.slice(asinOffset, asinOffset + ASIN_BATCH_SIZE);
-      const uniqueAsins = _slice.length ? _slice : allUniqueAsins; // fallback to all if offset wrong
-      const nextAsinOffset = asinOffset + uniqueAsins.length >= allUniqueAsins.length ? 0 : asinOffset + ASIN_BATCH_SIZE;
-
-      console.log(`[smartSync] ${allUniqueAsins.length} ASINs total — fetching ${uniqueAsins.length} (offset ${asinOffset})${nextAsinOffset ? ` → next: ${nextAsinOffset}` : ' → complete'}`);
+      console.log(`[smartSync] ${allUniqueAsins.length} ASINs total — rotation offset ${asinOffset}${nextAsinOffset ? ` → next: ${nextAsinOffset}` : ' (full coverage this cycle)'}`);
 
       // ── STEP 2: Fetch each ASIN page → price (fail fast, 2 attempts max) ───────
       // Failed fetches used to leave asinPrice[asin] undefined which caused the
@@ -8188,8 +8345,17 @@ module.exports = async (req, res) => {
           asinPrice[asin]   = p > 0 ? p : 0;
           asinInStock[asin] = data.inStock !== false && p > 0;
           if (p > 0) _used++;
+          // CRITICAL FIX (July 2026): write fresh browser data into the 7-day
+          // cache. Previously this path NEVER cached, so in browser-only mode
+          // the cache was permanently empty and cache-fill below had nothing
+          // to fill with → variants outside the fetched slice stayed stale
+          // forever. $9.99 stays excluded (suspect parser default).
+          if (p > 0 && p !== 9.99) {
+            const _ship = parseFloat(data.shipping) || 0;
+            _asinCacheSet(asin, { price: p, shipping: _ship, inStock: data.inStock !== false });
+          }
         }
-        console.log(`[smartSync] using browser clientAsinData: ${_used} ASINs priced (skipping server-side fetch)`);
+        console.log(`[smartSync] using browser clientAsinData: ${_used} ASINs priced (cached for 7d, skipping server-side fetch)`);
         // Even though we have client data, fill gaps from the 7-day cache for
         // any ASIN NOT covered by the browser. This way variant-rich listings
         // (where browser only sent the parent) can still publish with accurate
@@ -8233,9 +8399,9 @@ module.exports = async (req, res) => {
         const _asinsToFetch = toFetch.length > 0 ? toFetch : [];
 
         if (_asinsToFetch.length === 0) {
-          console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1}: all ${uniqueAsins.length} ASINs from cache, skipping proxy ──`);
+          console.log(`[smartSync] ── Batch: all ${uniqueAsins.length} ASINs from cache, skipping proxy ──`);
         } else {
-          console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1}: fetching ${_asinsToFetch.length} ASINs via proxy (${cacheHits} from cache) ──`);
+          console.log(`[smartSync] ── Batch: fetching ${_asinsToFetch.length} ASINs via proxy (${cacheHits} from cache) ──`);
         }
         const BATCH = 8;
         let fetchOk = 0, fetchFail = 0;
@@ -8270,7 +8436,7 @@ module.exports = async (req, res) => {
           if (i + BATCH < _asinsToFetch.length) await sleep(1000);
         }
         if (_asinsToFetch.length > 0) {
-          console.log(`[smartSync] ── Batch ${Math.floor(asinOffset/ASIN_BATCH_SIZE)+1} done: ${fetchOk} ok, ${fetchFail} blocked, cache ${cacheHits} hits ──`);
+          console.log(`[smartSync] ── Batch done: ${fetchOk} ok, ${fetchFail} blocked, cache ${cacheHits} hits ──`);
         }
       }
 
@@ -8817,13 +8983,75 @@ module.exports = async (req, res) => {
       // If eBay rejects with 25019 4× message, we react then; no preemptive clamping.)
 
       // ── STEP 5: Update all variants ──────────────────────────────────────────
+      // REWRITTEN (July 2026): bulkUpdatePriceQuantity FIRST — 25 variant SKUs
+      // per call, price + offer qty + ship-to-location qty in ONE request, and
+      // far fewer revisions against eBay's 250/day per-listing cap. The old
+      // per-offer GET→mutate→PUT chain (2 calls/variant) + inventory-item
+      // GET→PUT (2 more calls/variant) + publish-every-cycle burned dozens of
+      // calls and multiple revisions per listing per cycle. The legacy loop
+      // below is kept ONLY as a fallback for entries the bulk call rejects.
       console.log(`[smartSync] updating ${updates.length} variants…`);
       let okCount = 0, failCount = 0;
-      // Track failure reasons so we know whether failures are rate limits, stale
-      // offers, auth issues, or malformed bodies. Without this, failures are
-      // invisible and we can't tell why eBay didn't apply qty updates.
       const _failReasons = { get429: 0, get4xx: 0, get5xx: 0, getNet: 0,
                              put429: 0, put4xx: 0, put5xx: 0, putNet: 0 };
+
+      const _bulkFailed = []; // entries that need the legacy per-offer path
+      {
+        const _bulkOk = new Set();
+        for (let bi = 0; bi < updates.length; bi += 25) {
+          const chunk = updates.slice(bi, bi + 25);
+          const payload = {
+            requests: chunk.map(u => ({
+              sku: u.sku,
+              shipToLocationAvailability: { quantity: u.availableQuantity },
+              offers: [{
+                offerId: u.offerId,
+                availableQuantity: u.availableQuantity,
+                price: u.price,
+              }],
+            })),
+          };
+          let br = null;
+          try {
+            br = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_update_price_quantity`, {
+              method: 'POST', headers: auth, body: JSON.stringify(payload),
+            });
+            if (br.status === 429) { await sleep(1500);
+              br = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_update_price_quantity`, {
+                method: 'POST', headers: auth, body: JSON.stringify(payload) });
+            }
+          } catch(e) { br = null; }
+          if (!br) { _bulkFailed.push(...chunk); continue; }
+          let bd = {};
+          try { bd = JSON.parse(await br.text()); } catch(e) {}
+          const _resps = bd.responses || [];
+          if (!br.ok && _resps.length === 0) {
+            // Whole call rejected (auth, malformed, 5xx) — send chunk to legacy path
+            console.warn(`[smartSync] bulk update HTTP ${br.status} — ${chunk.length} entries → legacy fallback`);
+            _bulkFailed.push(...chunk);
+            continue;
+          }
+          for (const resp of _resps) {
+            const _u = chunk.find(u => u.sku === resp.sku || u.offerId === resp.offerId);
+            const _sc = parseInt(resp.statusCode) || 0;
+            if (_sc >= 200 && _sc < 300) {
+              okCount++;
+              if (_u) _bulkOk.add(_u.sku);
+            } else {
+              const _emsg = (resp.errors || []).map(e => `${e.errorId}:${(e.message||'').slice(0,80)}`).join('; ');
+              console.warn(`[smartSync] bulk ✗ ${(resp.sku||'').slice(-20)} ${_sc}: ${_emsg}`);
+              if (_u) _bulkFailed.push(_u);
+            }
+          }
+          // Any chunk entries eBay didn't echo back at all → legacy fallback
+          for (const u of chunk) {
+            if (!_bulkOk.has(u.sku) && !_bulkFailed.includes(u)) _bulkFailed.push(u);
+          }
+          if (bi + 25 < updates.length) await sleep(300);
+        }
+        console.log(`[smartSync] bulk update: ${okCount}/${updates.length} ok${_bulkFailed.length ? `, ${_bulkFailed.length} → legacy per-offer fallback` : ''}`);
+      }
+      const _legacyUpdates = _bulkFailed;
 
       // Helper: fetch with one retry on 429 (eBay rate-limit), backing off ~1.5s.
       // Most "silent" failures we've been seeing are 429s during the 10-parallel
@@ -8839,11 +9067,11 @@ module.exports = async (req, res) => {
         return r;
       }
 
-      // PUT /offer/{id} per variant — updates price + qty directly on the offer
-      // No inventory item bulk update — it overwrites product data and breaks group association (25604)
-      // Must use individual PUT (not bulk_update) — bulk fails on ENDED offers
-      for (let i = 0; i < updates.length; i += 10) {
-        await Promise.all(updates.slice(i, i + 10).map(async ({ offerId, sku, availableQuantity, price }) => {
+      // LEGACY FALLBACK: PUT /offer/{id} per variant — only for entries the
+      // bulk call rejected (e.g. ENDED offers, group quirks). Was previously
+      // the primary path for ALL variants.
+      for (let i = 0; i < _legacyUpdates.length; i += 10) {
+        await Promise.all(_legacyUpdates.slice(i, i + 10).map(async ({ offerId, sku, availableQuantity, price }) => {
           try {
             const gr = await _fetchRetry(`${EBAY_API}/sell/inventory/v1/offer/${encodeURIComponent(offerId)}`, { headers: auth });
             if (!gr.ok) {
@@ -8915,7 +9143,7 @@ module.exports = async (req, res) => {
             console.warn(`[smartSync] update threw for ${(sku||offerId).slice(-18)}: ${e.message}`);
           }
         }));
-        if (i + 10 < updates.length) await sleep(250); // was 150ms — bumped to ease eBay rate limit
+        if (i + 10 < _legacyUpdates.length) await sleep(250); // was 150ms — bumped to ease eBay rate limit
       }
 
       // Log failure breakdown so we can see what's actually going wrong
@@ -8927,7 +9155,9 @@ module.exports = async (req, res) => {
       // Sync inventory item quantity to match offer — prevents OOS showing on eBay
       // even when offer qty=1, because eBay uses inventory item qty as the source of truth
       if (okCount > 0) {
-        const _itemUpdates = updates.filter(u => u.availableQuantity > 0); // only need to fix in-stock
+        // Only legacy-path items need the inventory-item qty PUT — the bulk call
+        // already set shipToLocationAvailability for everything it accepted.
+        const _itemUpdates = _legacyUpdates.filter(u => u.availableQuantity > 0);
         for (let _qi = 0; _qi < _itemUpdates.length; _qi += 5) {
           await Promise.all(_itemUpdates.slice(_qi, _qi + 5).map(async ({ sku, availableQuantity }) => {
             try {
@@ -8985,7 +9215,10 @@ module.exports = async (req, res) => {
         });
       }
 
-      // Publish — offer PUTs are already live even if publish fails
+      // Publish — ONLY when the legacy fallback path ran (bulk updates apply
+      // live without a publish; publishing every cycle wasted a revision
+      // against the 250/day cap on every single sync).
+      if (_legacyUpdates.length > 0 || okCount === 0) {
       try {
         const pubR = await fetch(`${EBAY_API}/sell/inventory/v1/offer/publish_by_inventory_item_group`,
           { method: 'POST', headers: auth,
@@ -9017,6 +9250,7 @@ module.exports = async (req, res) => {
           }
         } else console.warn(`[smartSync] publish ${pubR.status}: ${pubTxt.slice(0,800)}`);
       } catch(e) { console.warn('[smartSync] publish error:', e.message); }
+      } // end conditional publish
 
       // ── CLEANUP STALE VARIANTS FROM GROUP ─────────────────────────────────────
       // Remove from the group any SKU that is:
@@ -9026,16 +9260,27 @@ module.exports = async (req, res) => {
       try {
         const _allGroupSkus = Object.keys(offerMap);
         const _orphanSet = new Set(_orphanedSkus);
+        // SKUs successfully repriced THIS cycle with a real price + stock.
+        // These must NEVER be deleted — the old code compared against the
+        // PRE-update offer price, so a variant we had just fixed from $9.99
+        // to $47.99 still matched "<= $15" and got deleted right after being
+        // repaired. Classic self-inflicted mistake, now guarded.
+        const _justFixed = new Set(
+          updates.filter(u => !u._orphan && u.availableQuantity > 0 && parseFloat(u.price?.value) > 15)
+                 .map(u => u.sku)
+        );
+        // Cheap-placeholder threshold — env-tunable (CLEANUP_CHEAP_PRICE),
+        // set to 0 to disable cheap-deletes entirely.
+        const _cheapMax = process.env.CLEANUP_CHEAP_PRICE != null
+          ? parseFloat(process.env.CLEANUP_CHEAP_PRICE) : 15;
         const _toDelete = _allGroupSkus.filter(s => {
+          if (_justFixed.has(s)) return false;
           if (_orphanSet.has(s)) return true;
           if (!offerMap[s]?.offerId) return true;
-          // AGGRESSIVE: delete ANY variant priced at or below $15. Real Amazon
-          // dropship products are almost never genuinely <$15 after markup. Any
-          // variant in this range is leftover placeholder data ($9.99, $10, $12,
-          // etc) from historical bad pushes. Better aggressive cleanup than
-          // leaving a single $9.99 trap on the listing.
+          // Delete variants stuck at placeholder prices ($9.99/$10/$12 leftovers
+          // from historical bad pushes) — but only if not repriced this cycle.
           const _curPrice = parseFloat(offerMap[s].currentPrice) || 0;
-          if (_curPrice > 0 && _curPrice <= 15) return true;
+          if (_cheapMax > 0 && _curPrice > 0 && _curPrice <= _cheapMax) return true;
           return false;
         });
         if (_toDelete.length === 0) {
@@ -9087,6 +9332,12 @@ module.exports = async (req, res) => {
         nextAsinOffset,
         totalAsins: allUniqueAsins.length,
         skuToAsin: Object.keys(skuToAsin).length > 0 ? skuToAsin : undefined,
+        // Fresh offer IDs — client/relay persists these so the NEXT sync skips
+        // the entire offer-discovery chain (dozens of eBay calls saved).
+        offerIdsBySku: Object.fromEntries(Object.entries(offerMap).map(([s, o]) => [s, o.offerId])),
+        // ASINs with no fresh or cached data — the fetcher should prioritize
+        // these next cycle.
+        staleAsins: allUniqueAsins.filter(a => asinPrice[a] === undefined).slice(0, 60),
         prices: Object.fromEntries(uniqueAsins.map(a => [a, {
           cost: asinPrice[a]||0,
           inStock: asinInStock[a]!==false,
@@ -11033,6 +11284,7 @@ module.exports.callAction = async function callEbayAction(body) {
 
 // Also expose scrapeAmazonProduct directly so the sync action can call it in-process
 module.exports.scrapeAmazonProduct = scrapeAmazonProduct;
+module.exports.resolveAccountId = _resolveEbayAccountId;
 
 // ══════════════════════════════════════════════════════════════════════
 // ALIEXPRESS SCRAPER — Completely separate from Amazon scraper

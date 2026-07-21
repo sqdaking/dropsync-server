@@ -509,6 +509,23 @@ async function loadProductsFromRailway() {
 // extension can pick them up and sync in background. Throttled to once per
 // 10 min — the extension keeps last_synced timestamps internally.
 let _lastRelayRegister = 0;
+// MULTI-ACCOUNT MIGRATION: adopt all pre-multi-account server rows
+// (account_id='default') into THIS eBay account. Run ONCE, from the browser
+// of the account that owned the server before the update.
+async function claimLegacyData() {
+  if (!S.serverUrl || !S.accountId) { toast('Connect eBay first', 'error'); return; }
+  if (!confirm(`Assign ALL legacy server data (products, settings, logs, sync state currently unassigned) to eBay account "${S.accountId}"?\n\nOnly do this from the browser of your ORIGINAL account.`)) return;
+  try {
+    const r = await fetch(`${S.serverUrl}/api/claim-default-account`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: S.accountId, access_token: S.token }),
+    });
+    const d = await r.json();
+    if (d.success) toast(`✅ Claimed legacy data: ${JSON.stringify(d.claimed)}`, 'success', 6000);
+    else toast('Claim failed: ' + (d.error || '?'), 'error');
+  } catch(e) { toast('Claim failed: ' + e.message, 'error'); }
+}
+
 async function _registerListingsForRelay() {
   if (!S.serverUrl || !S.token) return;
   if (Date.now() - _lastRelayRegister < 10 * 60 * 1000) return;
@@ -519,19 +536,33 @@ async function _registerListingsForRelay() {
       sourceUrl: p.sourceUrl,
       comboAsin: p.comboAsin || {},
       skuToAsin: p.skuToAsin || {},
+      // Per-listing settings — background syncs use YOUR markup/handling/qty,
+      // not hardcoded server defaults (23%/$2/1 was silently mispricing
+      // everything the extension synced).
+      markup:       p.markup != null ? p.markup : (S.markup ?? 23),
+      handlingCost: S.handlingCost ?? 2,
+      quantity:     p.quantity || S.quantity || 1,
+      // Cached offer IDs — lets the server skip the entire eBay offer
+      // discovery chain on background syncs.
+      offerIds:     p.offerIdCache || null,
     }));
   if (!items.length) return;
-  // Push in chunks of 500
+  // Push in chunks of 500 — token included so the server tags every listing
+  // with THIS browser's eBay account (multi-account isolation).
   for (let i = 0; i < items.length; i += 500) {
     try {
       await fetch(`${S.serverUrl}/api/ebay?action=relay_register`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ listings: items.slice(i, i+500) }),
+        body: JSON.stringify({
+          access_token: S.token,
+          accountId:    S.accountId || undefined,
+          listings:     items.slice(i, i+500),
+        }),
       });
     } catch(e) { /* silent */ }
   }
   _lastRelayRegister = Date.now();
-  console.log(`[relay] registered ${items.length} Amazon listings for background extension sync`);
+  console.log(`[relay] registered ${items.length} Amazon listings for background extension sync${S.accountId ? ' (account ' + S.accountId + ')' : ''}`);
 }
 
 // ── loadLogsFromRailway: fetch logs from Railway DB ──
@@ -626,6 +657,25 @@ function calcPrice(cost, markup) {
 }
 
 // ── Utilities ─────────────────────────────────────────
+// MULTI-ACCOUNT: transparently append ?account=<eBay username> to every
+// same-server /api/products, /api/logs, /api/settings call. One wrapper
+// instead of 20 patched call sites — nothing on the server is shared between
+// eBay accounts anymore.
+(function _installAccountScope() {
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function(input, init) {
+    try {
+      const acct = (typeof S === 'object' && S && S.accountId) ? S.accountId : null;
+      if (acct && typeof input === 'string' && S.serverUrl && input.startsWith(S.serverUrl)) {
+        const path = input.slice(S.serverUrl.length);
+        if (/^\/api\/(products|logs|settings)(\/|\?|$)/.test(path) && !/[?&]account=/.test(input)) {
+          input += (input.includes('?') ? '&' : '?') + 'account=' + encodeURIComponent(acct);
+        }
+      }
+    } catch(e) {}
+    return _origFetch(input, init);
+  };
+})();
 const uid = () => `p${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
 const toast = (msg, type='info', dur=3500) => {
   const el = document.createElement('div');
@@ -673,7 +723,7 @@ async function ensureToken() {
   }
   // Push token to the Chrome extension if installed — lets it do background syncs.
   if (window.dsExt && typeof window.dsExt.setToken === 'function') {
-    window.dsExt.setToken(S.token).catch(() => {});
+    window.dsExt.setToken(S.token, S.accountId || null).catch(() => {});
   }
   return S.token;
 }
@@ -1007,44 +1057,14 @@ async function fetchAmazonInBrowser(url) {
     }
   }
 
-  // Direct fetch attempt — browser sends real cookies + residential IP
-  const cleanUrl = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
-  // Only match REAL captcha/block pages, not legit product pages that happen to
-  // contain "robot" in Amazon's perf telemetry JS (e.g. isRobot:false, robotdetection).
-  // Real block pages are tiny and contain specific text like "/errors/validateCaptcha"
-  // or "Enter the characters you see below".
-  const isBlocked = html => !html || html.length < 5000 ||
-    html.includes('/errors/validateCaptcha') ||
-    html.includes('Enter the characters you see below') ||
-    html.includes('Type the characters you see in this image') ||
-    html.includes('To discuss automated access to Amazon data');
-  const wt = (p, ms) => Promise.race([p, new Promise((_,r) => setTimeout(() => r(new Error('timeout')), ms))]);
-
-  // Attempt 1: SKIPPED — direct fetch(amazon.com) ALWAYS fails with CORS from
-  // our origin (dropsync-server.up.railway.app). It just wasted 10s timeout per
-  // call and filled the console with red errors. Skip straight to proxy 1.
-
-  // CORS proxies — codetabs first (empirically the most reliable for Amazon),
-  // others as fallback in case codetabs has a bad window.
-  // Small random delay to spread requests and avoid rate limiting.
-  await new Promise(r => setTimeout(r, 200 + Math.random() * 500));
-  const proxies = [
-    // Codetabs proxy first — confirmed working most consistently.
-    () => fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
-    // Server-proxy as second choice — your own Railway endpoint.
-    () => S.serverUrl ? fetch(`${S.serverUrl}/api/amazon?url=${encodeURIComponent(cleanUrl)}`).then(r => { if(!r.ok) throw new Error('status '+r.status); return r.text(); }) : Promise.reject(new Error('no serverUrl')),
-    () => fetch(`https://corsproxy.io/?${encodeURIComponent(cleanUrl)}`,{headers:{'Accept':'text/html'}}).then(r=>r.text()),
-    () => fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(cleanUrl)}`).then(r=>r.text()),
-  ];
-
-  for (let i = 0; i < proxies.length; i++) {
-    try {
-      const html = await wt(proxies[i](), 9000);
-      if (!isBlocked(html)) { console.log(`[browserFetch] proxy ${i+1} ok len=${html.length}`); return html; }
-    } catch(e) { console.warn(`[browserFetch] proxy ${i+1} failed: ${e.message}`); }
-  }
-
-  console.warn('[browserFetch] all methods failed — server will handle');
+  // EXTENSION-ONLY (July 2026). The CORS-proxy chain (codetabs / corsproxy /
+  // allorigins) is REMOVED: shared datacenter IPs are 100% blocked by Amazon
+  // now, each attempt wasted up to 9s, and product URLs leaked to third
+  // parties. The Railway /api/amazon proxy is also removed — server-side
+  // Amazon fetching violates the browser-only policy and burns Railway's IP.
+  // If the extension isn't available or its fetch failed, skip this cycle
+  // cleanly; the listing retries on the next rotation.
+  console.warn('[browserFetch] extension unavailable/blocked — skipping (install/reload the DropSync Amazon Bridge extension)');
   return null;
 }
 
@@ -1125,16 +1145,15 @@ function _browserExtractAsinData(html) {
 // ── Prefetch per-ASIN price+stock from browser — sends exact data to server ──────
 // Fetches main page + every ASIN page from browser (your IP, not the server's).
 // Returns { [asin]: { price, inStock } } — server uses this, skips its own Amazon fetches.
-async function prefetchAsinPrices(mainHtml) {
-  // RE-ENABLED — browser is now the ONLY way to get Amazon data to the
-  // server. DataImpulse proxy is removed. Server refuses to fetch Amazon
-  // directly. This function bulk-extracts variant prices from the parent
-  // HTML, then individually fetches missing ASINs via CORS proxies (codetabs
-  // etc.) using your residential IP.
-  return await _legacyPrefetchAsinPrices(mainHtml);
+async function prefetchAsinPrices(mainHtml, opts) {
+  // Browser is the ONLY way to get Amazon data to the server. Extracts variant
+  // prices in bulk from the parent HTML, then individually fetches missing
+  // ASINs via the extension (residential IP). opts: { maxFetch, offset } for
+  // rotation-capped sync cycles.
+  return await _legacyPrefetchAsinPrices(mainHtml, opts);
 }
 
-async function _legacyPrefetchAsinPrices(mainHtml) {
+async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   if (!mainHtml) return {};
 
   // Extension returned full data — use it directly, no per-ASIN fetches needed
@@ -1204,55 +1223,51 @@ async function _legacyPrefetchAsinPrices(mainHtml) {
   console.log(`[prefetchAsin] bulk extracted ${bulkHits}/${uniqueAsins.length} prices from parent page HTML`);
 
   // ── FALLBACK: only fetch ASINs not covered by bulk extraction ──────────────
-  const toFetch = uniqueAsins.filter(a => !result[a]);
+  // EXTENSION-ONLY (July 2026): CORS proxies removed (blocked + leaky).
+  // Rotation-capped: sync passes { maxFetch, offset } so big listings spread
+  // their variant fetches across cycles instead of hammering Amazon with 50
+  // fetches in one shot (the #1 cause of blocks).
+  let toFetch = uniqueAsins.filter(a => !result[a]);
+  const _opts = (typeof _rotOpts === 'object' && _rotOpts) || {};
+  if (_opts.maxFetch > 0 && toFetch.length > _opts.maxFetch) {
+    const off = Math.max(0, parseInt(_opts.offset) || 0) % toFetch.length;
+    toFetch = toFetch.slice(off, off + _opts.maxFetch)
+      .concat(toFetch.slice(0, Math.max(0, _opts.maxFetch - (toFetch.length - off))));
+    console.log(`[prefetchAsin] rotation: fetching ${toFetch.length} of ${uniqueAsins.length - Object.keys(result).length} uncovered ASINs (offset ${off})`);
+  }
   if (toFetch.length > 0) {
     console.log(`[prefetchAsin] ${toFetch.length} ASINs need individual fetch`);
     const isBlocked = html => !html || html.length < 5000 || /validateCaptcha|robot check/i.test(html);
     const hasExt = await _extensionAvailable();
-    // EXTENSION-FIRST: when the Chrome extension is installed, fetch ASINs
-    // through it (residential IP). Keep concurrency LOW — each fetch returns
-    // 2-3MB of HTML which Chrome buffers in memory. With high concurrency
-    // (we tried 6) you exhaust Chrome's network sockets (ERR_INSUFFICIENT_RESOURCES)
-    // which silently breaks heartbeats AND fetches AND smartSync. 2 concurrent
-    // with 500ms between batches gives Chrome time to release sockets.
-    const _conc = hasExt ? 2 : 3;
+    if (!hasExt) {
+      console.warn('[prefetchAsin] extension not available — skipping individual ASIN fetches (parent-page prices only)');
+    } else {
+    // EXTENSION-FIRST: fetch ASINs through it (residential IP). Keep
+    // concurrency LOW — each fetch returns 2-3MB of HTML which Chrome buffers
+    // in memory. 2 concurrent with pacing between batches gives Chrome time
+    // to release sockets and keeps the request rate human-shaped.
+    const _conc = 2;
     for (let i = 0; i < toFetch.length; i += _conc) {
       const batch = toFetch.slice(i, i + _conc);
       await Promise.all(batch.map(async asin => {
         try {
           const url = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
           let html = null;
-          // Try extension first
-          if (hasExt) {
-            try {
-              const extHtml = await _fetchAmazonViaExtension(url);
-              if (extHtml && !isBlocked(extHtml)) html = extHtml;
-            } catch(e) {}
-          }
-          // Fallback to proxies
-          if (!html) {
-            for (const proxy of [
-              `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-              `https://corsproxy.io/?${encodeURIComponent(url)}`,
-              `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-            ]) {
-              try {
-                const r = await fetch(proxy, { headers: { Accept: 'text/html' } });
-                const h = await r.text();
-                if (!isBlocked(h)) { html = h; break; }
-              } catch(e) {}
-            }
-          }
+          try {
+            const extHtml = await _fetchAmazonViaExtension(url);
+            if (extHtml && !isBlocked(extHtml)) html = extHtml;
+          } catch(e) {}
           if (html) {
             const data = _browserExtractAsinData(html);
             if (data) result[asin] = data;
           }
         } catch(e) {}
       }));
-      // 500ms between batches to let Chrome release sockets/memory.
+      // Human-shaped pacing between batches (jittered).
       if (i + _conc < toFetch.length) {
-        await new Promise(r => setTimeout(r, hasExt ? 500 : 1500 + Math.random() * 1000));
+        await new Promise(r => setTimeout(r, 800 + Math.random() * 900));
       }
+    }
     }
   }
 
@@ -5299,7 +5314,7 @@ function _stopPushLockHeartbeat() {
 window.addEventListener('beforeunload', () => {
   if (_pushLockHeartbeat) {
     _stopPushLockHeartbeat();
-    navigator.sendBeacon?.(`${S.serverUrl}/api/settings/bulk`, new Blob(
+    navigator.sendBeacon?.(`${S.serverUrl}/api/settings/bulk${S.accountId ? '?account=' + encodeURIComponent(S.accountId) : ''}`, new Blob(
       [JSON.stringify({ push_lock: 'false', push_lock_at: '0' })],
       { type: 'application/json' }
     ));
@@ -7658,7 +7673,7 @@ async function smartSyncProduct(p) {
     try {
       const parentHtml = await fetchAmazonInBrowser(p.sourceUrl).catch(() => null);
       if (parentHtml && parentHtml.length > 5000) {
-        _clientAsinData = await prefetchAsinPrices(parentHtml);
+        _clientAsinData = await prefetchAsinPrices(parentHtml, { maxFetch: 15, offset: p._asinOffset || 0 });
         const _n = Object.keys(_clientAsinData || {}).length;
         if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
         else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices extracted`);
@@ -7677,6 +7692,7 @@ async function smartSyncProduct(p) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         access_token:    token,
+        accountId:       S.accountId || undefined,
         ebaySku:         normaliseGroupSku(p.ebaySku),
         ebayListingId:   p.ebayListingId || '',
         sourceUrl:       p.sourceUrl,
@@ -7723,6 +7739,10 @@ async function smartSyncProduct(p) {
     p.lastSynced = new Date().toISOString();
     // Save rebuilt skuToAsin so future syncs match instantly
     if (d.skuToAsin && Object.keys(d.skuToAsin).length > 0) p.skuToAsin = d.skuToAsin;
+    // Save fresh offer IDs — next sync skips the whole discovery chain
+    if (d.offerIdsBySku && Object.keys(d.offerIdsBySku).length > 0) {
+      p.offerIdCache = d.offerIdsBySku; p.offerIdCacheAt = Date.now();
+    }
     // Save next ASIN offset for progressive slicing (large products)
     p._asinOffset = d.nextAsinOffset || 0;
     if (d.nextAsinOffset > 0) console.log(`[smartSync] ${p.ebaySku?.slice(-10)} → next cycle: ASINs from offset ${d.nextAsinOffset}/${d.totalAsins}`);
@@ -8379,7 +8399,8 @@ function renderSettings() {
           </div>
           <div id="ebay-conn-status" style="margin-bottom:16px">
             ${S.token
-              ? `<div class="status-bar success">✅ Connected to eBay · token expires ${new Date(S.tokenExpiry).toLocaleTimeString()}</div>`
+              ? `<div class="status-bar success">✅ Connected to eBay${S.accountId ? ' as <b>' + S.accountId + '</b>' : ''} · token expires ${new Date(S.tokenExpiry).toLocaleTimeString()}</div>
+                 ${S.accountId ? `<div style="font-size:11px;margin-top:4px;opacity:.75">All server data (products, settings, sync state) is scoped to <b>${S.accountId}</b>. First time after the multi-account update? <a href="#" onclick="claimLegacyData();return false">Claim this server's legacy data for this account</a></div>` : ''}`
               : `<div class="status-bar info">Not connected. Click below to authorize eBay.</div>`}
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
@@ -8975,12 +8996,21 @@ async function connectEbay() {
       if (resolved) return;
       resolved = true;
       S.token = data.token; S.refreshToken = data.refresh; S.tokenExpiry = data.expiry;
+      // MULTI-ACCOUNT: server resolves the eBay username during the OAuth
+      // callback and includes it as accountId. Everything this browser syncs
+      // (products, settings, logs, relay registrations) is scoped to it.
+      if (data.accountId) {
+        if (S.accountId && S.accountId !== data.accountId) {
+          toast(`⚠️ Connected as ${data.accountId} but this browser was previously ${S.accountId} — data is scoped per account`, 'error', 8000);
+        }
+        S.accountId = data.accountId;
+      }
       save(); updateStatus(); renderSettings(); setupAutoSync();
-      toast('✅ Connected to eBay!', 'success');
+      toast(`✅ Connected to eBay${S.accountId ? ' as ' + S.accountId : ''}!`, 'success');
       try { loadPolicies(); } catch(e) {}
       // Push token to Railway so worker can refresh independently
       if (S.serverUrl && data.refresh) {
-        fetch(S.serverUrl + '/api/settings/bulk', {
+        fetch(S.serverUrl + '/api/settings/bulk' + (S.accountId ? ('?account=' + encodeURIComponent(S.accountId)) : ''), {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             access_token:  data.token,

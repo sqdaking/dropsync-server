@@ -64,7 +64,28 @@ async function initDB() {
       );
       CREATE INDEX IF NOT EXISTS relay_queue_status_idx ON relay_queue(status, requested_at);
       CREATE INDEX IF NOT EXISTS relay_queue_url_idx ON relay_queue(url);
+      -- MULTI-ACCOUNT (July 2026): every per-account table gets account_id.
+      -- Existing rows fall under 'default' until claimed via
+      -- POST /api/claim-default-account from the original account's browser.
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'default';
+      CREATE INDEX IF NOT EXISTS products_acct_idx ON products(account_id, status);
+      ALTER TABLE logs ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'default';
+      CREATE INDEX IF NOT EXISTS logs_acct_idx ON logs(account_id, created_at DESC);
+      ALTER TABLE settings ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'default';
     `);
+    // settings PK must become (account_id, key) — done separately since
+    // constraint changes can't run inside the IF NOT EXISTS batch above.
+    try {
+      const pk = await client.query(`SELECT conname FROM pg_constraint WHERE conrelid='settings'::regclass AND contype='p'`);
+      const isComposite = await client.query(
+        `SELECT COUNT(*) AS n FROM information_schema.key_column_usage
+          WHERE table_name='settings' AND constraint_name=$1`, [pk.rows[0]?.conname || '']);
+      if (pk.rows[0] && parseInt(isComposite.rows[0].n) < 2) {
+        await client.query(`ALTER TABLE settings DROP CONSTRAINT ${pk.rows[0].conname}`);
+        await client.query(`ALTER TABLE settings ADD PRIMARY KEY (account_id, key)`);
+        console.log('[DB] settings PK migrated to (account_id, key)');
+      }
+    } catch(e) { console.warn('[DB] settings PK migration:', e.message); }
     console.log('[DB] Schema ready');
   } finally {
     client.release();
@@ -72,23 +93,23 @@ async function initDB() {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
-async function getSetting(key) {
-  const r = await pool.query('SELECT value FROM settings WHERE key=$1', [key]);
+async function getSetting(key, account = 'default') {
+  const r = await pool.query('SELECT value FROM settings WHERE key=$1 AND account_id=$2', [key, account]);
   if (!r.rows[0]) return null;
   try { return JSON.parse(r.rows[0].value); } catch { return r.rows[0].value; }
 }
 
-async function setSetting(key, value) {
+async function setSetting(key, value, account = 'default') {
   const v = typeof value === 'string' ? value : JSON.stringify(value);
   await pool.query(
-    `INSERT INTO settings(key,value,updated_at) VALUES($1,$2,NOW())
-     ON CONFLICT(key) DO UPDATE SET value=$2, updated_at=NOW()`,
-    [key, v]
+    `INSERT INTO settings(account_id,key,value,updated_at) VALUES($3,$1,$2,NOW())
+     ON CONFLICT(account_id,key) DO UPDATE SET value=$2, updated_at=NOW()`,
+    [key, v, account]
   );
 }
 
-async function getAllSettings() {
-  const r = await pool.query('SELECT key, value FROM settings');
+async function getAllSettings(account = 'default') {
+  const r = await pool.query('SELECT key, value FROM settings WHERE account_id=$1', [account]);
   const out = {};
   for (const row of r.rows) {
     try { out[row.key] = JSON.parse(row.value); } catch { out[row.key] = row.value; }
@@ -97,15 +118,16 @@ async function getAllSettings() {
 }
 
 // ── Products ──────────────────────────────────────────────────────────────────
-async function upsertProduct(p) {
+async function upsertProduct(p, account = 'default') {
   const fullData = JSON.stringify(p);
   await pool.query(
     `INSERT INTO products(
        id, asin, ebay_sku, ebay_item_id, title, source_url, my_price, amazon_price,
        cost, status, quantity, has_variations, variations, image_url, category,
-       condition_id, last_synced, updated_at, data
-     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),$18)
+       condition_id, last_synced, updated_at, data, account_id
+     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),$18,$19)
      ON CONFLICT(id) DO UPDATE SET
+       account_id=EXCLUDED.account_id,
        asin=EXCLUDED.asin, ebay_sku=EXCLUDED.ebay_sku, ebay_item_id=EXCLUDED.ebay_item_id,
        title=EXCLUDED.title, source_url=EXCLUDED.source_url, my_price=EXCLUDED.my_price,
        amazon_price=EXCLUDED.amazon_price, cost=EXCLUDED.cost, status=EXCLUDED.status,
@@ -131,22 +153,23 @@ async function upsertProduct(p) {
       p.conditionId || p.condition_id || 'NEW',
       p.lastSynced || p.last_synced || null,
       fullData,
+      account,
     ]
   );
 }
 
-async function getProducts({ status, limit = 500, offset = 0 } = {}) {
-  let q = 'SELECT * FROM products';
-  const params = [];
-  if (status) { q += ' WHERE status=$1'; params.push(status); }
+async function getProducts({ status, limit = 500, offset = 0, account = 'default' } = {}) {
+  let q = 'SELECT * FROM products WHERE account_id=$1';
+  const params = [account];
+  if (status) { q += ' AND status=$2'; params.push(status); }
   q += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
   params.push(limit, offset);
   const r = await pool.query(q, params);
   return r.rows.map(dbToProduct);
 }
 
-async function getProduct(id) {
-  const r = await pool.query('SELECT * FROM products WHERE id=$1', [id]);
+async function getProduct(id, account = 'default') {
+  const r = await pool.query('SELECT * FROM products WHERE id=$1 AND account_id=$2', [id, account]);
   return r.rows[0] ? dbToProduct(r.rows[0]) : null;
 }
 
@@ -189,35 +212,48 @@ async function getProductsForSync(batchSize = 30) {
   return r.rows.map(dbToProduct);
 }
 
-async function countProducts(status) {
+async function countProducts(status, account = 'default') {
   const q = status
-    ? 'SELECT COUNT(*) FROM products WHERE status=$1'
-    : 'SELECT COUNT(*) FROM products';
-  const r = await pool.query(q, status ? [status] : []);
+    ? 'SELECT COUNT(*) FROM products WHERE status=$1 AND account_id=$2'
+    : 'SELECT COUNT(*) FROM products WHERE account_id=$1';
+  const r = await pool.query(q, status ? [status, account] : [account]);
   return parseInt(r.rows[0].count);
 }
 
 // ── Logs ──────────────────────────────────────────────────────────────────────
-async function addLog(type, title, detail, meta = {}) {
+async function addLog(type, title, detail, meta = {}, account = 'default') {
   await pool.query(
-    'INSERT INTO logs(type,title,detail,product_id,meta) VALUES($1,$2,$3,$4,$5)',
-    [type, title, detail || '', meta.productId || null, JSON.stringify(meta)]
+    'INSERT INTO logs(type,title,detail,product_id,meta,account_id) VALUES($1,$2,$3,$4,$5,$6)',
+    [type, title, detail || '', meta.productId || null, JSON.stringify(meta), account]
   );
 }
 
-async function getLogs({ limit = 200, offset = 0, type } = {}) {
-  let q = 'SELECT * FROM logs';
-  const params = [];
-  if (type) { q += ' WHERE type=$1'; params.push(type); }
+async function getLogs({ limit = 200, offset = 0, type, account = 'default' } = {}) {
+  let q = 'SELECT * FROM logs WHERE account_id=$1';
+  const params = [account];
+  if (type) { q += ' AND type=$2'; params.push(type); }
   q += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
   params.push(limit, offset);
   const r = await pool.query(q, params);
   return r.rows;
 }
 
-async function countLogs() {
-  const r = await pool.query('SELECT COUNT(*) FROM logs');
+async function countLogs(account = 'default') {
+  const r = await pool.query('SELECT COUNT(*) FROM logs WHERE account_id=$1', [account]);
   return parseInt(r.rows[0].count);
+}
+
+// MULTI-ACCOUNT MIGRATION: adopt all 'default' rows into a real account.
+async function claimDefaultAccount(account) {
+  if (!account || account === 'default') throw new Error('invalid account');
+  const out = {};
+  for (const t of ['products', 'logs', 'settings', 'relay_state']) {
+    try {
+      const r = await pool.query(`UPDATE ${t} SET account_id=$1 WHERE account_id='default'`, [account]);
+      out[t] = r.rowCount;
+    } catch(e) { out[t] = 'err:' + e.message.slice(0, 60); }
+  }
+  return out;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -348,4 +384,5 @@ module.exports = {
   upsertProduct, getProducts, getProduct, updateProductSync,
   getProductsForSync, countProducts,
   addLog, getLogs, countLogs,
+  claimDefaultAccount,
 };

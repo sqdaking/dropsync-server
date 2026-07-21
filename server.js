@@ -82,7 +82,7 @@ app.get('/api/token', async (req, res) => {
 // ── Settings ──────────────────────────────────────────────────────────────────
 app.get('/api/settings', async (req, res) => {
   try {
-    const s = await db.getAllSettings();
+    const s = await db.getAllSettings(acctOf(req));
     // Don't expose raw tokens
     const { access_token, refresh_token, ...safe } = s;
     safe.has_token = !!access_token;
@@ -96,7 +96,7 @@ app.post('/api/settings', async (req, res) => {
   try {
     const { key, value } = req.body;
     if (!key) return res.status(400).json({ error: 'key required' });
-    await db.setSetting(key, value);
+    await db.setSetting(key, value, acctOf(req));
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -104,10 +104,41 @@ app.post('/api/settings', async (req, res) => {
 app.post('/api/settings/bulk', async (req, res) => {
   try {
     const settings = req.body; // { key: value, ... }
+    const account = acctOf(req);
     for (const [k, v] of Object.entries(settings)) {
-      await db.setSetting(k, v);
+      await db.setSetting(k, v, account);
     }
     res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── MULTI-ACCOUNT ────────────────────────────────────────────────────────────
+// Every products/settings/logs request carries ?account=<eBay username>
+// (the frontend appends it automatically once connected). Unknown/missing →
+// 'default' (pre-multi-account data). Sanitized to a safe identifier.
+function acctOf(req) {
+  const a = String(req.query.account || req.headers['x-ds-account'] || '').trim();
+  return /^[\w.\-]{1,64}$/.test(a) ? a : 'default';
+}
+
+// One-time migration: adopt all 'default'-account rows into a real account.
+// Called from the ORIGINAL account's browser via the Settings link.
+app.post('/api/claim-default-account', async (req, res) => {
+  try {
+    const { accountId, access_token } = req.body || {};
+    if (!accountId || !/^[\w.\-]{1,64}$/.test(accountId) || accountId === 'default')
+      return res.status(400).json({ error: 'valid accountId required' });
+    // Verify the token actually belongs to the claimed account — prevents
+    // account B from hijacking account A's legacy data.
+    const ebayMod = require('./ebay');
+    if (typeof ebayMod.resolveAccountId === 'function' && access_token) {
+      const real = await ebayMod.resolveAccountId(access_token);
+      if (real && real !== 'default' && real !== accountId)
+        return res.status(403).json({ error: `token belongs to ${real}, not ${accountId}` });
+    }
+    const claimed = await db.claimDefaultAccount(accountId);
+    console.log('[multi-account] claimed default rows →', accountId, claimed);
+    res.json({ success: true, claimed });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -115,8 +146,9 @@ app.post('/api/settings/bulk', async (req, res) => {
 app.get('/api/products', async (req, res) => {
   try {
     const { status, limit = 500, offset = 0 } = req.query;
-    const products = await db.getProducts({ status, limit: parseInt(limit), offset: parseInt(offset) });
-    const total = await db.countProducts(status);
+    const account = acctOf(req);
+    const products = await db.getProducts({ status, limit: parseInt(limit), offset: parseInt(offset), account });
+    const total = await db.countProducts(status, account);
     res.json({ products, total, limit: parseInt(limit), offset: parseInt(offset) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -125,7 +157,7 @@ app.post('/api/products', async (req, res) => {
   try {
     const product = req.body;
     if (!product.id) return res.status(400).json({ error: 'product.id required' });
-    await db.upsertProduct(product);
+    await db.upsertProduct(product, acctOf(req));
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -135,8 +167,9 @@ app.post('/api/products/bulk', async (req, res) => {
     const { products } = req.body;
     if (!Array.isArray(products)) return res.status(400).json({ error: 'products array required' });
     let saved = 0;
+    const account = acctOf(req);
     for (const p of products) {
-      if (p.id) { await db.upsertProduct(p); saved++; }
+      if (p.id) { await db.upsertProduct(p, account); saved++; }
     }
     res.json({ success: true, saved });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -144,7 +177,7 @@ app.post('/api/products/bulk', async (req, res) => {
 
 app.put('/api/products/:id', async (req, res) => {
   try {
-    await db.upsertProduct({ ...req.body, id: req.params.id });
+    await db.upsertProduct({ ...req.body, id: req.params.id }, acctOf(req));
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -206,7 +239,7 @@ app.post('/api/products/:id/sync', async (req, res) => {
 
 app.delete('/api/products/:id', async (req, res) => {
   try {
-    await db.pool.query('DELETE FROM products WHERE id=$1', [req.params.id]);
+    await db.pool.query('DELETE FROM products WHERE id=$1 AND account_id=$2', [req.params.id, acctOf(req)]);
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -214,7 +247,7 @@ app.delete('/api/products/:id', async (req, res) => {
 app.get('/api/products/count', async (req, res) => {
   try {
     const { status } = req.query;
-    const count = await db.countProducts(status);
+    const count = await db.countProducts(status, acctOf(req));
     res.json({ count });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -223,8 +256,9 @@ app.get('/api/products/count', async (req, res) => {
 app.get('/api/logs', async (req, res) => {
   try {
     const { limit = 200, offset = 0, type } = req.query;
-    const logs = await db.getLogs({ limit: parseInt(limit), offset: parseInt(offset), type });
-    const total = await db.countLogs();
+    const account = acctOf(req);
+    const logs = await db.getLogs({ limit: parseInt(limit), offset: parseInt(offset), type, account });
+    const total = await db.countLogs(account);
     res.json({ logs, total });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -232,7 +266,7 @@ app.get('/api/logs', async (req, res) => {
 app.post('/api/logs', async (req, res) => {
   try {
     const { type, title, detail, meta } = req.body;
-    await db.addLog(type, title, detail, meta || {});
+    await db.addLog(type, title, detail, meta || {}, acctOf(req));
     res.json({ success: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -241,8 +275,9 @@ app.post('/api/logs/bulk', async (req, res) => {
   try {
     const { logs } = req.body;
     if (!Array.isArray(logs)) return res.status(400).json({ error: 'logs array required' });
+    const account = acctOf(req);
     for (const l of logs) {
-      await db.addLog(l.type, l.title, l.detail, l.meta || {});
+      await db.addLog(l.type, l.title, l.detail, l.meta || {}, account);
     }
     res.json({ success: true, saved: logs.length });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -381,61 +416,19 @@ app.post('/api/backfill-listing-ids', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Amazon proxy — lets the browser fetch Amazon HTML through Railway ──────
-// Railway IPs are not blocked by Amazon like datacenter CDN IPs, so Amazon
-// scraping succeeds. Browser calls this to bypass CORS.
-app.get('/api/amazon', async (req, res) => {
-  const url = (req.query.url || '').trim();
-  if (!url || !url.includes('amazon.')) {
-    return res.status(400).json({ error: 'Invalid Amazon URL' });
-  }
-  // Allow any origin so the dropsync frontend can read the response
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-
-  const fetch = require('node-fetch');
-  try {
-    const r = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Cache-Control': 'max-age=0',
-      },
-      compress: true,
-      timeout: 18000,
-      redirect: 'follow',
-    });
-
-    if (!r.ok) {
-      return res.status(r.status).json({ error: `Amazon returned HTTP ${r.status}` });
-    }
-
-    const html = await r.text();
-
-    // Detect bot challenge pages
-    if (
-      html.includes('Type the characters you see in this image') ||
-      html.includes('robot check') ||
-      html.includes('Enter the characters you see below') ||
-      html.length < 5000
-    ) {
-      return res.status(429).json({ error: 'Amazon bot detection triggered — try again in a moment' });
-    }
-
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(html);
-  } catch(e) {
-    console.error('[amazon-proxy] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+// ── Amazon proxy — DISABLED (July 2026) ─────────────────────────────────────
+// BROWSER-ONLY POLICY: the server never fetches Amazon. This endpoint used
+// Railway's datacenter IP (blocked by Amazon, and every hit degraded the IP's
+// reputation further). All Amazon fetching goes through the Chrome extension
+// on the user's residential IP.
+app.get('/api/amazon', (req, res) => {
+  res.status(410).json({
+    error: 'Server-side Amazon fetching is permanently disabled (browser-only policy). Install the DropSync Amazon Bridge extension.',
+  });
 });
+
+// (original proxy implementation removed)
+
 
 // ── eBay API handler — all actions run in-process on Railway ────────────────
 const handleEbay = require('./ebay');
