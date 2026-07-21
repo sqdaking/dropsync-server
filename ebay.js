@@ -8640,13 +8640,15 @@ module.exports = async (req, res) => {
         // NOT Object.keys(vv2). See the big comment above — getting this wrong silently
         // swaps color/size on every variant.
         const _dimKeys = _authDimKeys;
-        // Build slug → ASIN from dta. For each dimensionToAsinMap entry, take the
-        // combination of dim values it points to and slugify them.
-        const slugToAsin = {};
-        // Also build reversed-order slugs — eBay SKUs may store dims in a different
-        // order than Amazon (e.g. Amazon "color_name, size_name" vs eBay SKU
-        // "SIZE_COLOR" or "COLOR_SIZE"). We accept both directions.
-        const slugToAsinReversed = {};
+        // Build slug → ASIN from dta. KIND-TAGGED (fixed July 2026): compound
+        // vs single is decided by HOW MANY dim values built the slug — NOT by
+        // whether the slug contains an underscore. Multi-word single values
+        // ("1 Little Kid" → 1_LITTLE_KID, "3X-Large Plus" → 3X_LARGE_PLUS)
+        // contain underscores and were misclassified as compound, letting a
+        // size-only slug .includes()-match every color's SKU → one ASIN (and
+        // one price) smeared across all colors of a size.
+        const _compoundMap = {};   // slugs built from ALL dims — exact variant
+        const _singleMap   = {};   // slugs built from ONE dim value — ambiguous on multi-dim
         // Path 1: parent dta iteration
         if (_canReconFromDta) {
         for (const [idx, asin] of Object.entries(dta)) {
@@ -8658,21 +8660,19 @@ module.exports = async (req, res) => {
           if (vals.length) {
             // Full slug (all dims joined in Amazon's order) — most specific
             const slug = vals.map(_slug).join('_');
-            if (slug) slugToAsin[slug] = asin;
+            const _kindMap = vals.length > 1 ? _compoundMap : _singleMap;
+            if (slug && !_kindMap[slug]) _kindMap[slug] = asin;
             // Reversed-order slug — for eBay SKUs that flipped dim order at push time
             if (vals.length > 1) {
               const revSlug = vals.slice().reverse().map(_slug).join('_');
-              if (revSlug && !slugToAsinReversed[revSlug]) slugToAsinReversed[revSlug] = asin;
+              if (revSlug && !_compoundMap[revSlug]) _compoundMap[revSlug] = asin;
             }
-            // Primary-dim-only slug — fallback for SKUs that hashed/truncated the secondary dim
+            // Single-dim slugs — last-resort only, and only on single-dim listings
             if (vals.length > 1) {
               const primary = _slug(vals[0]);
-              if (primary && !slugToAsin[primary]) slugToAsin[primary] = asin;
-              // Also secondary-only, but only as a last-resort (lowest priority)
+              if (primary && !_singleMap[primary]) _singleMap[primary] = asin;
               const secondary = _slug(vals[1]);
-              if (secondary && !slugToAsin[secondary] && !slugToAsinReversed[secondary]) {
-                slugToAsinReversed[secondary] = asin;
-              }
+              if (secondary && !_singleMap[secondary]) _singleMap[secondary] = asin;
             }
           }
         }
@@ -8687,37 +8687,26 @@ module.exports = async (req, res) => {
             // comboKey format from scraper: "PrimVal|SecVal" or "PrimVal|SecVal / Size"
             const rawParts = String(comboKey).split(/\s*\|\s*|\s*\/\s*/).map(s => s.trim()).filter(Boolean);
             if (rawParts.length === 0) continue;
-            // Full compound slug
+            // Full compound slug — kind depends on how many parts the key had
             const fullSlug = rawParts.map(_slug).join('_');
-            if (fullSlug && !slugToAsin[fullSlug]) slugToAsin[fullSlug] = asin;
+            const _kindMap2 = rawParts.length > 1 ? _compoundMap : _singleMap;
+            if (fullSlug && !_kindMap2[fullSlug]) _kindMap2[fullSlug] = asin;
             // Reversed slug
             if (rawParts.length > 1) {
               const revSlug = rawParts.slice().reverse().map(_slug).join('_');
-              if (revSlug && !slugToAsinReversed[revSlug]) slugToAsinReversed[revSlug] = asin;
+              if (revSlug && !_compoundMap[revSlug]) _compoundMap[revSlug] = asin;
             }
-            // Primary-dim-only (last resort)
+            // Single-dim (last resort)
             if (rawParts.length > 1) {
               const primary = _slug(rawParts[0]);
-              if (primary && !slugToAsin[primary]) slugToAsin[primary] = asin;
+              if (primary && !_singleMap[primary]) _singleMap[primary] = asin;
             }
           }
         }
 
-        // CRITICAL: sort slugs by length DESCENDING so the most specific slug matches first.
-        // Without this, "BUTTERFLY" can match a variant whose actual color is "LAVENDER BUTTERFLY"
-        // because both .includes() the substring — whichever is iterated first wins.
-        // Primary (Amazon-order) slugs take precedence over reversed-order slugs.
-        // Separate compound (multi-dim) slugs from primary-only slugs — try compound
-        // first; only fall back to primary-only if compound matching fails entirely.
-        // This prevents 5 SKUs from all matching the same ASIN via primary dim alone.
-        const _compoundSlugs = [
-          ...Object.entries(slugToAsin).filter(([s]) => s.includes('_')),
-          ...Object.entries(slugToAsinReversed).filter(([s]) => s.includes('_')),
-        ].sort((a, b) => b[0].length - a[0].length);
-        const _primaryOnlySlugs = [
-          ...Object.entries(slugToAsin).filter(([s]) => !s.includes('_')),
-          ...Object.entries(slugToAsinReversed).filter(([s]) => !s.includes('_')),
-        ].sort((a, b) => b[0].length - a[0].length);
+        // Sort by length DESCENDING so the most specific slug matches first.
+        const _compoundSlugs = Object.entries(_compoundMap).sort((a, b) => b[0].length - a[0].length);
+        const _primaryOnlySlugs = Object.entries(_singleMap).sort((a, b) => b[0].length - a[0].length);
         const _pfxUpper = normSku.toUpperCase() + '-';
         let _reconHits = 0, _reconAmbiguous = 0;
         for (const sku of _needsRecon) {
@@ -8726,7 +8715,7 @@ module.exports = async (req, res) => {
             ? sku.slice(normSku.length + 1)
             : sku).toUpperCase();
           let matched = false;
-          // Try compound (multi-dim) slugs FIRST
+          // Try compound (multi-dim) slugs FIRST — forward containment
           for (const [slug, asin] of _compoundSlugs) {
             if (sfx.startsWith(slug) || sfx.includes(slug)) {
               skuToAsin[sku] = asin;
@@ -8735,19 +8724,34 @@ module.exports = async (req, res) => {
               break;
             }
           }
+          // TRUNCATED-TAIL match (July 2026): eBay SKUs are capped at 50 chars
+          // so the suffix often loses the front of the color name
+          // ("Y_BLUE_3X_LARGE_PLUS" from "NAVY_BLUE_3X_LARGE_PLUS"). The full
+          // compound slug is then LONGER than the sfx and forward containment
+          // can't match. Test the reverse direction — but ONLY accept when
+          // exactly one ASIN's slug contains this tail (unique = unambiguous).
+          if (!matched && sfx.length >= 8) {
+            const _tailAsins = [...new Set(
+              _compoundSlugs.filter(([slug]) => slug.endsWith(sfx) || slug.includes(sfx)).map(([, a]) => a)
+            )];
+            if (_tailAsins.length === 1) {
+              skuToAsin[sku] = _tailAsins[0];
+              _reconHits++;
+              matched = true;
+            } else if (_tailAsins.length > 1) {
+              _reconAmbiguous++;
+              continue;
+            }
+          }
           if (matched) continue;
           // MULTI-DIM GUARD: never assign an ASIN by a single dim value on a
           // multi-dim listing — that gave every size the same ASIN + price.
           if (_isMultiDim) { _reconAmbiguous++; continue; }
-          // Only fall back to primary-only if no compound matched. But check
-          // how many ASINs share this primary value — if multiple, the match
-          // is ambiguous (same primary, different secondaries) so DON'T guess.
+          // Single-dim listings only: single-value slugs, ambiguity-checked.
           for (const [slug, asin] of _primaryOnlySlugs) {
             if (sfx.startsWith(slug) || sfx.includes(slug)) {
-              // Count how many ASINs in dimensionToAsinMap share this primary value
               const _dupCount = _primaryOnlySlugs.filter(([s]) => s === slug).length;
               if (_dupCount >= 2) {
-                // Ambiguous — multiple ASINs share this primary. Skip the match.
                 _reconAmbiguous++;
                 break;
               }
@@ -8758,9 +8762,11 @@ module.exports = async (req, res) => {
           }
         }
         console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs${_reconAmbiguous > 0 ? ` (${_reconAmbiguous} ambiguous, skipped to avoid wrong-price assignment)` : ''} (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}]${_canReconFromCombo?' +comboAsin fallback':''})`);
-        // Stash the sorted slug map for aspect-based reconstruction below
-        global.__smartSyncSlugMap = [..._compoundSlugs, ..._primaryOnlySlugs];
-        global.__smartSyncSlug    = _slug;
+        // Stash kind-separated maps for the aspect-based upgrade below
+        global.__smartSyncCompoundMap = _compoundMap;
+        global.__smartSyncSingleMap   = _singleMap;
+        global.__smartSyncIsMultiDim  = _isMultiDim;
+        global.__smartSyncSlug        = _slug;
       }
 
       // GET inventory item aspects — ALWAYS, not just when valToAsin is empty. We
@@ -8789,19 +8795,22 @@ module.exports = async (req, res) => {
         }
       }
 
-      // Aspect-based compound-slug upgrade: for every SKU (including ones already
-      // matched above via primary-only fallback), try to build a compound slug from
-      // its aspects and look it up. If it resolves to a different ASIN than the
-      // primary-only match, prefer the aspect match — it's strictly more specific.
-      if (Object.keys(skuAspects).length > 0 && global.__smartSyncSlugMap) {
+      // Aspect-based compound-slug upgrade (rewritten July 2026): build slugs
+      // from the SKU's eBay aspect values and look them up in the COMPOUND map
+      // only. The old version fell back to a SINGLE aspect value (usually the
+      // Size) whenever the compound lookup missed, then OVERWROTE the correct
+      // reconstruction match — smearing one size-ASIN's price across every
+      // color ("14 corrected" in the logs = 14 smeared).
+      if (Object.keys(skuAspects).length > 0 && global.__smartSyncCompoundMap) {
         const _slug = global.__smartSyncSlug;
-        const _slugMap = Object.fromEntries(global.__smartSyncSlugMap);
+        const _cMap = global.__smartSyncCompoundMap;
+        const _sMap = global.__smartSyncSingleMap || {};
+        const _mDim = global.__smartSyncIsMultiDim === true;
         let _aspectUpgrades = 0;
         let _aspectNewMatches = 0;
         for (const sku of Object.keys(offerMap)) {
           const aspects = skuAspects[sku];
           if (!aspects || Object.keys(aspects).length === 0) continue;
-          // Flatten all aspect values (e.g. Color=['Chocolate'], Size=['10\' x 14\' (Rectangular)'])
           const aspectVals = [];
           for (const vals of Object.values(aspects)) {
             for (const v of (Array.isArray(vals) ? vals : [vals])) {
@@ -8809,40 +8818,44 @@ module.exports = async (req, res) => {
             }
           }
           if (aspectVals.length === 0) continue;
-          // Try every permutation of 2 values (covers color-first + size-first orderings)
-          // For compound keys with 2+ parts, we generate both orderings.
+          // COMPOUND-ONLY lookup: every ordered pair of aspect values (covers
+          // extra aspects like Brand polluting the list, and both dim orders),
+          // plus the full joins. Exact key equality against the compound map.
           let _bestAsin = null;
           if (aspectVals.length >= 2) {
-            // Build both orderings of the first two aspect values
-            const slugs = [
-              aspectVals.map(_slug).join('_'),                       // all aspects in object order
-              aspectVals.slice().reverse().map(_slug).join('_'),     // reversed
-              [aspectVals[0], aspectVals[1]].map(_slug).join('_'),   // first two only
-              [aspectVals[1], aspectVals[0]].map(_slug).join('_'),   // first two reversed
-            ];
-            for (const s of slugs) {
-              if (_slugMap[s]) { _bestAsin = _slugMap[s]; break; }
+            const cands = new Set([
+              aspectVals.map(_slug).join('_'),
+              aspectVals.slice().reverse().map(_slug).join('_'),
+            ]);
+            for (let i = 0; i < aspectVals.length && !_bestAsin; i++) {
+              for (let j = 0; j < aspectVals.length; j++) {
+                if (i === j) continue;
+                cands.add(_slug(aspectVals[i]) + '_' + _slug(aspectVals[j]));
+              }
             }
-          }
-          // Fallback: single aspect value direct lookup
-          if (!_bestAsin) {
-            for (const v of aspectVals) {
-              const s = _slug(v);
-              if (_slugMap[s]) { _bestAsin = _slugMap[s]; break; }
+            for (const s of cands) {
+              if (_cMap[s]) { _bestAsin = _cMap[s]; break; }
             }
           }
           if (_bestAsin) {
-            if (!skuToAsin[sku]) {
-              skuToAsin[sku] = _bestAsin;
-              _aspectNewMatches++;
-            } else if (skuToAsin[sku] !== _bestAsin) {
-              skuToAsin[sku] = _bestAsin;
-              _aspectUpgrades++;
+            // A compound aspect match is exact — may create OR correct a match.
+            if (!skuToAsin[sku]) { skuToAsin[sku] = _bestAsin; _aspectNewMatches++; }
+            else if (skuToAsin[sku] !== _bestAsin) { skuToAsin[sku] = _bestAsin; _aspectUpgrades++; }
+            continue;
+          }
+          // Single-value fallback: ONLY on single-dim listings, and ONLY to
+          // fill a missing match — never to overwrite one.
+          if (!_mDim && !skuToAsin[sku]) {
+            for (const v of aspectVals) {
+              const s = _slug(v);
+              if (_sMap[s]) { skuToAsin[sku] = _sMap[s]; _aspectNewMatches++; break; }
             }
           }
         }
-        console.log(`[smartSync] aspect-slug upgrade: ${_aspectUpgrades} corrected, ${_aspectNewMatches} new matches (from ${Object.keys(skuAspects).length} SKUs with aspects)`);
-        delete global.__smartSyncSlugMap;
+        console.log(`[smartSync] aspect-slug upgrade: ${_aspectUpgrades} corrected, ${_aspectNewMatches} new matches (from ${Object.keys(skuAspects).length} SKUs with aspects, compound-only${_mDim ? ', multi-dim' : ''})`);
+        delete global.__smartSyncCompoundMap;
+        delete global.__smartSyncSingleMap;
+        delete global.__smartSyncIsMultiDim;
         delete global.__smartSyncSlug;
       }
 
