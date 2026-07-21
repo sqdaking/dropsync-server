@@ -1126,18 +1126,37 @@ function _browserExtractAsinData(html) {
   //   - id="buybox" / "desktop_buybox" / "rightCol" (buy area)
   // We do NOT scan the whole HTML — "out of stock" appears in related items,
   // recently-viewed, etc. on every product page.
+  // OOS detection — POSITIVE + NEGATIVE signal model (fixed July 2026).
+  // Old code required _searchArea to be non-empty AND checked two strings
+  // page-wide ('outOfStockBuyBox', 'Join the waitlist') which exist in
+  // Amazon's bundled JS on EVERY page → every variant was marked OOS and
+  // pushed qty=0 even with a valid price.
   const availSection = html.match(/id="availability"[\s\S]{0,3000}/)?.[0]
                     || html.match(/id="outOfStock"[\s\S]{0,2000}/)?.[0]
                     || '';
-  const buyBoxSection = html.match(/id="(?:buybox|desktop_buybox|rightCol)"[\s\S]{0,8000}/)?.[0] || '';
+  const buyBoxSection = html.match(/id="(?:buybox|desktop_buybox|rightCol)"[\s\S]{0,8000}/)?.[0]
+                     || html.match(/id="apex_desktop"[\s\S]{0,8000}/)?.[0] || '';
   const _searchArea = availSection + buyBoxSection;
-  const inStock = !!_searchArea
-    && !/Currently unavailable/i.test(_searchArea)
-    && !/Out of stock/i.test(_searchArea)
-    && !/We don('|'|&#39;)t know when/i.test(_searchArea)
-    && !/See available options/i.test(_searchArea)
-    && !html.includes('Join the waitlist')
-    && !html.includes('outOfStockBuyBox');
+  // NEGATIVE: real OOS phrases, only where they actually mean it (buy area).
+  // "See available options" / "Currently unavailable" / etc = out of stock.
+  const _oosSignal = !!_searchArea && (
+       /Currently unavailable/i.test(_searchArea)
+    || /Out of stock/i.test(_searchArea)
+    || /We don('|\u2019|&#39;)t know when/i.test(_searchArea)
+    || /See available options/i.test(_searchArea)
+    || /Available from these sellers/i.test(_searchArea)
+    || /Join the waitlist/i.test(_searchArea)
+    || /id="outOfStockBuyBox"/.test(_searchArea)
+  );
+  // POSITIVE: a real buy path exists.
+  const _canBuy =
+       /id="add-to-cart-button"/.test(html)
+    || /name="submit\.add-to-cart"/.test(html)
+    || /id="buy-now-button"/.test(html)
+    || /In Stock|Only \d+ left in stock|left in stock/i.test(availSection);
+  // Verdict: explicit OOS wins; explicit buy path wins next; otherwise fall
+  // back to the core rule — a real buy-box price means in stock.
+  const inStock = _oosSignal ? false : (_canBuy ? true : price > 0);
   // Price gate still applies — no price = OOS regardless of strings.
   return { price, shipping, inStock: price > 0 ? inStock : false };
 }

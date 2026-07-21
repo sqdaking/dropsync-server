@@ -9031,21 +9031,27 @@ module.exports = async (req, res) => {
             _bulkFailed.push(...chunk);
             continue;
           }
+          // eBay returns TWO response entries per request entry (one for the
+          // inventory ship-to-location update, one for the offer update), so
+          // account per SKU, not per response — otherwise counts double.
+          const _okBySku = new Set();
+          const _failBySku = new Set();
           for (const resp of _resps) {
-            const _u = chunk.find(u => u.sku === resp.sku || u.offerId === resp.offerId);
+            const _u = chunk.find(u => u.sku === resp.sku || (resp.offerId && u.offerId === resp.offerId));
+            if (!_u) continue;
             const _sc = parseInt(resp.statusCode) || 0;
             if (_sc >= 200 && _sc < 300) {
-              okCount++;
-              if (_u) _bulkOk.add(_u.sku);
+              _okBySku.add(_u.sku);
             } else {
               const _emsg = (resp.errors || []).map(e => `${e.errorId}:${(e.message||'').slice(0,80)}`).join('; ');
-              console.warn(`[smartSync] bulk ✗ ${(resp.sku||'').slice(-20)} ${_sc}: ${_emsg}`);
-              if (_u) _bulkFailed.push(_u);
+              console.warn(`[smartSync] bulk ✗ ${(_u.sku||'').slice(-20)} ${_sc}: ${_emsg}`);
+              _failBySku.add(_u.sku);
             }
           }
-          // Any chunk entries eBay didn't echo back at all → legacy fallback
           for (const u of chunk) {
-            if (!_bulkOk.has(u.sku) && !_bulkFailed.includes(u)) _bulkFailed.push(u);
+            if (_failBySku.has(u.sku)) { _bulkFailed.push(u); continue; }   // any failed leg → retry via legacy
+            if (_okBySku.has(u.sku))   { okCount++; _bulkOk.add(u.sku); continue; }
+            _bulkFailed.push(u);                                            // not echoed at all → legacy
           }
           if (bi + 25 < updates.length) await sleep(300);
         }
