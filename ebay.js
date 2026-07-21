@@ -8083,6 +8083,9 @@ module.exports = async (req, res) => {
           body: { access_token, ebaySku, sourceUrl,
                   markup: _mk, handlingCost: _hand, quantity: _qty,
                   clientAsinData, comboAsin, skuToAsin,
+                  freshDta:             body.freshDta             || undefined,
+                  freshVariationValues: body.freshVariationValues || undefined,
+                  freshDimOrder:        body.freshDimOrder        || undefined,
                   cachedOfferIds: _cachedOfferIds,
                   asinOffset: _asinOff,
                   accountId },
@@ -8261,9 +8264,27 @@ module.exports = async (req, res) => {
       let dta = {};
       let html = null;
       let _parentHtmlOk = false;
-      if (body.comboAsin && typeof body.comboAsin === 'object') {
+      // FRESH MAPS FROM BROWSER (July 2026): the browser extracts the FULL
+      // dimensionToAsinMap + variationValues + dimensions from the parent page
+      // it already fetched. This is strictly better than stored comboAsin
+      // (which is often incomplete — e.g. one ASIN per color on a color+size
+      // listing, which used to make every size inherit one size's price).
+      const _freshDta  = (body.freshDta && typeof body.freshDta === 'object') ? body.freshDta : null;
+      const _freshVV   = (body.freshVariationValues && typeof body.freshVariationValues === 'object') ? body.freshVariationValues : null;
+      const _freshDims = Array.isArray(body.freshDimOrder) ? body.freshDimOrder : null;
+      if (_freshDta && Object.keys(_freshDta).length > 0) {
+        dta = _freshDta;
+        allUniqueAsins = [...new Set(Object.values(dta))].filter(Boolean);
+        console.log(`[smartSync] using FRESH dta from browser (${Object.keys(dta).length} combos → ${allUniqueAsins.length} ASINs, dims=[${(_freshDims||[]).join(',')}])`);
+        // Union with stored comboAsin so nothing previously known gets lost
+        if (body.comboAsin && typeof body.comboAsin === 'object') {
+          for (const a of Object.values(body.comboAsin)) {
+            if (a && !allUniqueAsins.includes(a)) allUniqueAsins.push(a);
+          }
+        }
+      } else if (body.comboAsin && typeof body.comboAsin === 'object') {
         allUniqueAsins = [...new Set(Object.values(body.comboAsin))].filter(Boolean);
-        console.log(`[smartSync] using stored comboAsin (${allUniqueAsins.length} ASINs) — skipping parent page fetch`);
+        console.log(`[smartSync] using stored comboAsin (${allUniqueAsins.length} ASINs) — no fresh dta provided`);
       } else {
         // Fallback: fetch parent page to extract ASIN map. Costs ~1.5MB via proxy.
         console.log(`[smartSync] no comboAsin in body — fetching parent page as fallback`);
@@ -8355,7 +8376,9 @@ module.exports = async (req, res) => {
             _asinCacheSet(asin, { price: p, shipping: _ship, inStock: data.inStock !== false });
           }
         }
-        console.log(`[smartSync] using browser clientAsinData: ${_used} ASINs priced (cached for 7d, skipping server-side fetch)`);
+        const _oosFlagged = Object.values(clientAsinData).filter(d => d && d.inStock === false).length;
+        console.log(`[smartSync] using browser clientAsinData: ${_used} ASINs priced, ${_oosFlagged} flagged OOS by browser (cached for 7d, skipping server-side fetch)`);
+        if (_used > 0 && _oosFlagged >= _used) console.warn(`[smartSync] ⚠ ALL priced ASINs flagged OOS — browser tab/extension likely running the OLD extractor. Hard-refresh the tab (Ctrl+Shift+R) and reload the extension.`);
         // Even though we have client data, fill gaps from the 7-day cache for
         // any ASIN NOT covered by the browser. This way variant-rich listings
         // (where browser only sent the parent) can still publish with accurate
@@ -8534,6 +8557,8 @@ module.exports = async (req, res) => {
         const vvM2 = html.match(/"variationValues"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
         try { vv2 = JSON.parse(vvM2?.[1] || '{}'); } catch(e) {}
       }
+      // Fresh variationValues from the browser beat everything else
+      if (Object.keys(vv2).length === 0 && _freshVV) vv2 = _freshVV;
 
       // CRITICAL: Read the authoritative dimension order from Amazon's "dimensions"
       // array. Object.keys(vv2) cannot be trusted — on many listings (e.g. LIANLAM
@@ -8547,12 +8572,22 @@ module.exports = async (req, res) => {
         const _dimOrderM = html.match(/"dimensions"\s*:\s*(\[[^\]]{0,400}\])/);
         try { _dimOrder = JSON.parse(_dimOrderM?.[1] || '[]'); } catch(e) {}
       }
+      // Fresh authoritative dim order from the browser's parent-page extraction
+      if (!_dimOrder.length && _freshDims && _freshDims.length) _dimOrder = _freshDims;
       // Fallback: use fallbackVariations from body to infer dim names when parent is blocked
       if (!_dimOrder.length && Array.isArray(body.fallbackVariations) && body.fallbackVariations.length > 0) {
         _dimOrder = body.fallbackVariations.map(v => String(v.name||'').toLowerCase().replace(/\s+/g, '_')).filter(Boolean);
       }
       const _authDimKeys = (_dimOrder.length ? _dimOrder : Object.keys(vv2))
         .filter(k => Array.isArray(vv2[k]) && vv2[k].length > 0);
+      // Multi-dimension listing (e.g. color + size)? On these, matching a SKU
+      // by a SINGLE dim value (just the color) is guaranteed wrong for every
+      // size but one — the July 2026 "gold 5 / gold 8 same price" bug. All
+      // single-value fallbacks are disabled for multi-dim listings; unmatched
+      // SKUs go qty=0 (orphan-safe) until fresh dta resolves them exactly.
+      const _isMultiDim = _authDimKeys.length >= 2
+        || (Array.isArray(body.fallbackVariations) && body.fallbackVariations.length >= 2)
+        || (_freshDims && _freshDims.length >= 2);
 
       // Build valToAsin directly from dimensionToAsinMap entries, using the correct
       // dim key order. For each "idx0_idx1" entry, look up vv2[dimKey][idx] for each
@@ -8701,6 +8736,9 @@ module.exports = async (req, res) => {
             }
           }
           if (matched) continue;
+          // MULTI-DIM GUARD: never assign an ASIN by a single dim value on a
+          // multi-dim listing — that gave every size the same ASIN + price.
+          if (_isMultiDim) { _reconAmbiguous++; continue; }
           // Only fall back to primary-only if no compound matched. But check
           // how many ASINs share this primary value — if multiple, the match
           // is ambiguous (same primary, different secondaries) so DON'T guess.
@@ -8848,8 +8886,11 @@ module.exports = async (req, res) => {
           asin = skuToAsin[sku];
         }
 
-        // Method B: valToAsin via aspects
-        if (!asin && _sortedValToAsin.length > 0) {
+        // Method B: valToAsin via aspects — DISABLED for multi-dim listings:
+        // a single value (just "Black") maps every size to one ASIN → one
+        // price for all sizes. Multi-dim SKUs must match via compound slugs
+        // (Method A / reconstruction) or go orphan-safe qty=0.
+        if (!asin && _sortedValToAsin.length > 0 && !_isMultiDim) {
           const aspects = skuAspects[sku] || {};
           for (const vals of Object.values(aspects)) {
             for (const v of (Array.isArray(vals) ? vals : [vals])) {

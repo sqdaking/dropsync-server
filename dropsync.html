@@ -656,6 +656,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
+console.log('[dropsync] build 2026-07-21.3 (fresh-dta + instock fix)');
 // ── Utilities ─────────────────────────────────────────
 // MULTI-ACCOUNT: transparently append ?account=<eBay username> to every
 // same-server /api/products, /api/logs, /api/settings call. One wrapper
@@ -7689,9 +7690,25 @@ async function smartSyncProduct(p) {
     // listing skips THIS sync cycle and retries on the next rotation.
     // Server never fetches Amazon directly (no DataImpulse, no Railway IP).
     let _clientAsinData = null;
+    let _freshDta = null, _freshVV = null, _freshDims = null;
     try {
       const parentHtml = await fetchAmazonInBrowser(p.sourceUrl).catch(() => null);
       if (parentHtml && parentHtml.length > 5000) {
+        // FRESH VARIANT MAPS (July 2026): the parent page carries the FULL
+        // dimensionToAsinMap. Stored comboAsin is often incomplete (e.g. one
+        // ASIN per color for a color+size listing) which made the server's
+        // reconstruction assign ONE ASIN to every size — every size then got
+        // that one ASIN's price. Sending the fresh maps lets the server
+        // resolve each SKU to its OWN ASIN → its OWN price.
+        try {
+          const dtaM = parentHtml.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/);
+          if (dtaM) _freshDta = JSON.parse(dtaM[1]);
+          const vvM = parentHtml.match(/"variationValues"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
+          if (vvM) _freshVV = JSON.parse(vvM[1]);
+          const dimM = parentHtml.match(/"dimensions"\s*:\s*(\[[^\]]{0,400}\])/);
+          if (dimM) _freshDims = JSON.parse(dimM[1]);
+          if (_freshDta) console.log(`[smartSync] fresh dta: ${Object.keys(_freshDta).length} combos, dims=[${(_freshDims||[]).join(',')}]`);
+        } catch(_me) {}
         _clientAsinData = await prefetchAsinPrices(parentHtml, { maxFetch: 15, offset: p._asinOffset || 0 });
         const _n = Object.keys(_clientAsinData || {}).length;
         if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
@@ -7720,6 +7737,10 @@ async function smartSyncProduct(p) {
         quantity:        S.quantity || p.quantity || 1,
         // Browser-prefetched ASIN data — server skips its own fetching when this is provided
         clientAsinData:           _clientAsinData,
+        // Fresh variant maps from the parent page — enables exact per-SKU ASIN matching
+        freshDta:                 _freshDta   || undefined,
+        freshVariationValues:     _freshVV    || undefined,
+        freshDimOrder:            _freshDims  || undefined,
         // Variant SKU→ASIN/offerId maps so backend can find all offer IDs
         skuToAsin:                p.skuToAsin        || null,
         cachedOfferIds:           p.offerIdCache    || null,
