@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const db = require('./db');
+const vero = require('./vero');
+const veroInbox = require('./vero-inbox');
 const { startWorker, runForever, getValidToken } = require('./worker');
 
 const app = express();
@@ -539,6 +541,32 @@ async function start() {
   try {
     await db.initDB();
     console.log('[Server] DB initialized');
+    // VeRO / IP risk screening — audit report + do-not-relist enforcement
+    try { await vero.initVero(db.pool); vero.mountVero(app, db); }
+    catch(e) { console.warn('[vero] init failed:', e.message); }
+    // eBay My Messages scanner — auto-flags listings named in policy/VeRO notices
+    try {
+      await veroInbox.initInbox(db.pool);
+      veroInbox.mountInbox(app, require('./ebay').getEbayUrls);
+      // Poll every 3h using the stored token of each account (best effort —
+      // the button in /vero-report uses your live token and is authoritative).
+      setInterval(async () => {
+        try {
+          const r = await db.pool.query(
+            `SELECT account_id, value FROM settings WHERE key = 'access_token'`);
+          for (const row of r.rows) {
+            let tok = row.value;
+            try { tok = JSON.parse(tok); } catch(e) {}
+            if (!tok || typeof tok !== 'string') continue;
+            await veroInbox.scanMessages({
+              token: tok, accountId: row.account_id,
+              tradingUrl: 'https://api.ebay.com/ws/api.dll',
+              days: 7, autoFlag: true, autoAddBrand: true,
+            }).catch(e => console.warn('[vero-inbox] poll', row.account_id, e.message));
+          }
+        } catch(e) { console.warn('[vero-inbox] poll cycle:', e.message); }
+      }, 3 * 3600 * 1000);
+    } catch(e) { console.warn('[vero-inbox] init failed:', e.message); }
     // ── WORKER DISABLED ──────────────────────────────────────────────────────
     // Hard kill switch — worker does not start. To re-enable, uncomment the
     // startWorker() line below. Manual sync from the modal still works (calls

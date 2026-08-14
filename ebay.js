@@ -7237,6 +7237,31 @@ module.exports = async (req, res) => {
 
     // ── PUSH: create eBay listing ─────────────────────────────────────────────
     if (action === 'push') {
+      // VeRO PRE-SCREEN: block CRITICAL/HIGH-risk products from ever being
+      // listed. Set VERO_SCREEN=warn to log only, or VERO_SCREEN=off to skip.
+      const _screenMode = (process.env.VERO_SCREEN || 'block').toLowerCase();
+      if (_screenMode !== 'off') {
+        try {
+          const _vero = require('./vero');
+          const _p = body.product || body;
+          const _hit = await _vero.screenImport({
+            title: _p.title, brand: _p.brand,
+            description: _p.description,
+            image_url: _p.imageUrl || _p.image_url,
+            images: _p.images,
+          });
+          if (_hit) {
+            console.warn(`[vero] push screen ${_hit.risk.toUpperCase()} (${_hit.score}) "${String(_p.title||'').slice(0,60)}" — ${_hit.brands.join(', ')}`);
+            if (_screenMode === 'block') {
+              return res.status(403).json({
+                error: `VeRO risk: ${_hit.risk} (${_hit.brands.join(', ')}). Listing blocked to protect your account.`,
+                veroRisk: _hit.risk, brands: _hit.brands, reasons: _hit.reasons,
+                hint: 'Set VERO_SCREEN=warn to allow with a log-only warning.',
+              });
+            }
+          }
+        } catch(e) { /* vero module optional */ }
+      }
       return handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLocation, buildOffer, sleep, getEbayUrls });
     }
 
@@ -7993,6 +8018,8 @@ module.exports = async (req, res) => {
           WHERE ebay_sku IN (
             SELECT ebay_sku FROM relay_state
             WHERE account_id = $2
+              AND ebay_sku NOT IN (
+                SELECT ebay_sku FROM products WHERE do_not_relist AND ebay_sku IS NOT NULL)
               AND (cooldown_until IS NULL OR cooldown_until < NOW())
               AND (last_dispatched IS NULL OR last_dispatched < NOW() - INTERVAL '5 minutes')
               AND source_url LIKE '%amazon%'
@@ -8220,6 +8247,18 @@ module.exports = async (req, res) => {
       if (!access_token || !ebaySku || !sourceUrl)
         return res.status(400).json({ error: 'Missing access_token, ebaySku, or sourceUrl' });
 
+      // VeRO GATE (July 2026): a listing flagged do_not_relist must NEVER be
+      // touched again — no repricing, no qty update, and above all no publish.
+      // Relisting an item removed under a VeRO report is what escalates a
+      // temporary restriction into a permanent ban.
+      try {
+        const _vero = require('./vero');
+        if (await _vero.isBlocked(ebaySku)) {
+          console.warn(`[smartSync] ${ebaySku} is flagged do_not_relist (VeRO) — refusing to sync`);
+          return res.json({ success: false, blocked: true, reason: 'do_not_relist (VeRO risk)' });
+        }
+      } catch(e) { /* vero module optional */ }
+
       // BROWSER-ONLY POLICY: smartSync for Amazon requires browser-prefetched
       // ASIN data (clientAsinData). Server NEVER fetches Amazon directly —
       // proxy is disabled, no Railway-IP fallback. If browser didn't provide
@@ -8379,6 +8418,13 @@ module.exports = async (req, res) => {
         const _oosFlagged = Object.values(clientAsinData).filter(d => d && d.inStock === false).length;
         console.log(`[smartSync] using browser clientAsinData: ${_used} ASINs priced, ${_oosFlagged} flagged OOS by browser (cached for 7d, skipping server-side fetch)`);
         if (_used > 0 && _oosFlagged >= _used) console.warn(`[smartSync] ⚠ ALL priced ASINs flagged OOS — browser tab/extension likely running the OLD extractor. Hard-refresh the tab (Ctrl+Shift+R) and reload the extension.`);
+        // Parser-default detector: distinct ASINs should rarely ALL carry the
+        // exact same price. When they do (esp. $9.99), the extractor probably
+        // grabbed one page-level price and reused it for every variant.
+        const _distinctPrices = new Set(Object.values(clientAsinData).map(d => d && d.price).filter(p => p > 0));
+        if (_used >= 4 && _distinctPrices.size === 1) {
+          console.warn(`[smartSync] ⚠ all ${_used} fresh ASINs share ONE price ($${[..._distinctPrices][0]}) — suspect parser default, verify against Amazon before trusting these`);
+        }
         // Even though we have client data, fill gaps from the 7-day cache for
         // any ASIN NOT covered by the browser. This way variant-rich listings
         // (where browser only sent the parent) can still publish with accurate
@@ -8630,6 +8676,13 @@ module.exports = async (req, res) => {
       for (const sku of Object.keys(offerMap)) {
         if (!skuToAsin[sku]) _needsRecon.add(sku);
       }
+      // PER-REQUEST LOCALS (fixed July 2026): these were `global.__smartSync*`,
+      // but smartSync runs CONCURRENTLY (browser relay + extension ticks
+      // overlap — visible as interleaved listings in the logs). Globals meant
+      // listing B's slug map could overwrite listing A's mid-flight and assign
+      // A's SKUs to B's ASINs — random wrong prices with no pattern.
+      let _reqCompoundMap = null, _reqSingleMap = null, _reqSlugFn = null;
+      let _mapComplete = true;
       // Reconstruction path 1: use parent's dta + vv2 (most accurate when available)
       // Reconstruction path 2: use body.comboAsin directly (fallback when parent blocked)
       const _canReconFromDta = Object.keys(dta).length > 0 && _authDimKeys.length > 0;
@@ -8684,8 +8737,14 @@ module.exports = async (req, res) => {
         if (_canReconFromCombo) {
           for (const [comboKey, asin] of Object.entries(body.comboAsin)) {
             if (!asin) continue;
-            // comboKey format from scraper: "PrimVal|SecVal" or "PrimVal|SecVal / Size"
-            const rawParts = String(comboKey).split(/\s*\|\s*|\s*\/\s*/).map(s => s.trim()).filter(Boolean);
+            // comboKey format from scraper: "PrimVal|SecVal", "PrimVal / SecVal",
+            // "PrimVal, SecVal" or "PrimVal - SecVal". Broadened July 2026 —
+            // keys using a separator we didn't split on collapsed into a SINGLE
+            // part, landed in the single-value map, and were then blocked by the
+            // multi-dim guard → the variant became an orphan and got zeroed.
+            const rawParts = String(comboKey)
+              .split(/\s*\|\s*|\s*\/\s*|\s*,\s*|\s+-\s+/)
+              .map(s => s.trim()).filter(Boolean);
             if (rawParts.length === 0) continue;
             // Full compound slug — kind depends on how many parts the key had
             const fullSlug = rawParts.map(_slug).join('_');
@@ -8762,11 +8821,26 @@ module.exports = async (req, res) => {
           }
         }
         console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs${_reconAmbiguous > 0 ? ` (${_reconAmbiguous} ambiguous, skipped to avoid wrong-price assignment)` : ''} (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}]${_canReconFromCombo?' +comboAsin fallback':''})`);
-        // Stash kind-separated maps for the aspect-based upgrade below
-        global.__smartSyncCompoundMap = _compoundMap;
-        global.__smartSyncSingleMap   = _singleMap;
-        global.__smartSyncIsMultiDim  = _isMultiDim;
-        global.__smartSyncSlug        = _slug;
+        // MAP COMPLETENESS (July 2026): if the variant map we assembled covers
+        // fewer combos than the eBay group has SKUs, we CANNOT conclude that an
+        // unmatched variant was removed from Amazon — the map is just partial
+        // this cycle (reduced twister, variant-page fetch, OOS parent, etc).
+        // Zeroing on partial data killed 5 live variants in one sync.
+        _mapComplete = Object.keys(_compoundMap).length >= Object.keys(offerMap).length;
+        // Diagnostics: show why SKUs failed to match so the next log pinpoints it.
+        if (_reconHits < _needsRecon.size) {
+          const _unmatched = [...(_needsRecon)].filter(s => !skuToAsin[s]).slice(0, 5)
+            .map(s => (s.toUpperCase().startsWith(_pfxUpper) ? s.slice(normSku.length + 1) : s));
+          const _sampleCombo = Object.keys(body.comboAsin || {}).slice(0, 3);
+          console.log(`[smartSync] unmatched diag: compoundSlugs=${Object.keys(_compoundMap).length} singleSlugs=${Object.keys(_singleMap).length} groupSkus=${Object.keys(offerMap).length} mapComplete=${_mapComplete}`);
+          console.log(`[smartSync] unmatched SKU suffixes: ${_unmatched.join(' | ') || '(none)'}`);
+          console.log(`[smartSync] sample comboAsin keys: ${_sampleCombo.map(k => JSON.stringify(k)).join(' , ') || '(none)'}`);
+          console.log(`[smartSync] sample compound slugs: ${Object.keys(_compoundMap).slice(0, 5).join(' | ') || '(none)'}`);
+        }
+        // Hand the kind-separated maps to the aspect upgrade below (locals, not globals)
+        _reqCompoundMap = _compoundMap;
+        _reqSingleMap   = _singleMap;
+        _reqSlugFn      = _slug;
       }
 
       // GET inventory item aspects — ALWAYS, not just when valToAsin is empty. We
@@ -8801,11 +8875,11 @@ module.exports = async (req, res) => {
       // Size) whenever the compound lookup missed, then OVERWROTE the correct
       // reconstruction match — smearing one size-ASIN's price across every
       // color ("14 corrected" in the logs = 14 smeared).
-      if (Object.keys(skuAspects).length > 0 && global.__smartSyncCompoundMap) {
-        const _slug = global.__smartSyncSlug;
-        const _cMap = global.__smartSyncCompoundMap;
-        const _sMap = global.__smartSyncSingleMap || {};
-        const _mDim = global.__smartSyncIsMultiDim === true;
+      if (Object.keys(skuAspects).length > 0 && _reqCompoundMap) {
+        const _slug = _reqSlugFn;
+        const _cMap = _reqCompoundMap;
+        const _sMap = _reqSingleMap || {};
+        const _mDim = _isMultiDim === true;
         let _aspectUpgrades = 0;
         let _aspectNewMatches = 0;
         for (const sku of Object.keys(offerMap)) {
@@ -8853,10 +8927,6 @@ module.exports = async (req, res) => {
           }
         }
         console.log(`[smartSync] aspect-slug upgrade: ${_aspectUpgrades} corrected, ${_aspectNewMatches} new matches (from ${Object.keys(skuAspects).length} SKUs with aspects, compound-only${_mDim ? ', multi-dim' : ''})`);
-        delete global.__smartSyncCompoundMap;
-        delete global.__smartSyncSingleMap;
-        delete global.__smartSyncIsMultiDim;
-        delete global.__smartSyncSlug;
       }
 
       // Pre-sort valToAsin entries by key length desc — same reason as the reconstruction
@@ -8891,6 +8961,9 @@ module.exports = async (req, res) => {
       const updates = [];
       const _skippedNoBatch = [];
       const _orphanedSkus = [];
+      // SKUs we couldn't resolve because the variant map was partial this cycle.
+      // Left untouched on eBay (not zeroed) and retried next cycle.
+      const _unresolvedSkus = [];
       for (const [sku, offer] of Object.entries(offerMap)) {
         let asin = null;
 
@@ -8935,6 +9008,15 @@ module.exports = async (req, res) => {
         // keep the existing price (eBay requires > 0). The user can re-push to drop
         // orphans entirely, or the variant will simply stop being offered.
         if (!asin) {
+          // PARTIAL-MAP GUARD (July 2026): only conclude "removed from Amazon"
+          // when the variant map we built actually covers this listing. If the
+          // map was partial this cycle, leave the variant EXACTLY as it is —
+          // don't zero a live, selling variant because of a bad page fetch.
+          // It gets another chance next cycle with a fresh map.
+          if (_mapComplete === false) {
+            _unresolvedSkus.push(sku);
+            continue;
+          }
           _orphanedSkus.push(sku);
           // No sibling price and no current price → we must use SOMETHING or
           // skip (eBay requires price>0). Prefer the existing offer price even
@@ -9383,8 +9465,12 @@ module.exports = async (req, res) => {
         }
       } catch(_ce) { console.warn(`[smartSync] cleanup threw: ${_ce.message}`); }
 
+      if (_unresolvedSkus.length > 0) {
+        console.warn(`[smartSync] ⚠ ${_unresolvedSkus.length} variants UNRESOLVED (variant map partial this cycle) — left untouched, will retry: ${_unresolvedSkus.slice(0,5).map(s => s.slice(-24)).join(', ')}${_unresolvedSkus.length > 5 ? '…' : ''}`);
+      }
       return res.json({
         success: true, synced: okCount, failed: failCount,
+        unresolvedCount: _unresolvedSkus.length,
         orphanedCount: _orphanedSkus.length,
         orphanedSkus:  _orphanedSkus.length > 0 ? _orphanedSkus.slice(0, 20) : undefined,
         fetchFailedCount: _fetchFailed.size,
@@ -11345,6 +11431,7 @@ module.exports.callAction = async function callEbayAction(body) {
 // Also expose scrapeAmazonProduct directly so the sync action can call it in-process
 module.exports.scrapeAmazonProduct = scrapeAmazonProduct;
 module.exports.resolveAccountId = _resolveEbayAccountId;
+module.exports.getEbayUrls = getEbayUrls;
 
 // ══════════════════════════════════════════════════════════════════════
 // ALIEXPRESS SCRAPER — Completely separate from Amazon scraper
