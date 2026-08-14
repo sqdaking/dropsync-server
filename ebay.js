@@ -6825,6 +6825,31 @@ module.exports = async (req, res) => {
       } catch(e) { return res.status(500).json({ error: e.message }); }
     }
     // Clear cache for specific ASINs: POST { asins: ['B0XXX', 'B0YYY'] }
+    // Wipe stored SKU→ASIN maps so the next sync rebuilds them from a fresh
+    // Amazon page. Use when a listing keeps re-pushing the same wrong price:
+    //   {"ebaySku":"DS-...", "clearComboAsin":true}   or   {"all":true}
+    if (action === 'reset_variant_maps') {
+      if (!_cachePool) return res.status(500).json({ error: 'DB not ready' });
+      try {
+        const { ebaySku, all, clearComboAsin } = body;
+        const cols = clearComboAsin
+          ? "skutoasin = NULL, comboasin = NULL, offer_ids = NULL, asin_offset = 0"
+          : "skutoasin = NULL, offer_ids = NULL, asin_offset = 0";
+        let r;
+        if (all === true) {
+          r = await _cachePool.query(`UPDATE relay_state SET ${cols}, updated_at = NOW()`);
+        } else if (ebaySku) {
+          r = await _cachePool.query(
+            `UPDATE relay_state SET ${cols}, updated_at = NOW() WHERE ebay_sku = $1`, [ebaySku]);
+        } else {
+          return res.status(400).json({ error: 'Provide ebaySku or all:true' });
+        }
+        console.log(`[reset_variant_maps] cleared ${r.rowCount} rows${ebaySku ? ' for ' + ebaySku : ''}`);
+        return res.json({ success: true, cleared: r.rowCount,
+          note: 'Also clear p.skuToAsin in the browser (localStorage/products) — the UI sends its own copy.' });
+      } catch(e) { return res.status(500).json({ error: e.message }); }
+    }
+
     if (action === 'cache_clear') {
       if (!_cacheReady) return res.json({ ready: false });
       const asins = body.asins;
@@ -8516,6 +8541,24 @@ module.exports = async (req, res) => {
 
       // ── STEP 3: Get variant SKUs + offer IDs ─────────────────────────────────
       const skuToAsin      = body.skuToAsin     || {};
+      // POISONED-MAP REPAIR (July 2026): stored skuToAsin was previously trusted
+      // without question, and reconstruction only ran for SKUs that had NO entry.
+      // So any wrong mapping written by the old buggy matcher (single-dim
+      // smearing, aspect-upgrade overwrites) was reused forever — the listing
+      // kept re-publishing the exact same wrong price on every sync, no matter
+      // how many matcher bugs got fixed. These flags make the stored map
+      // provisional so the fresh map can overrule it.
+      const _storedSkuToAsin = { ...skuToAsin };
+      // Signature of the old smearing bug on a multi-dim listing: several SKUs
+      // sharing one ASIN. Genuine duplicates exist (a colour with one size),
+      // but 3+ SKUs on one ASIN is the bug, not the catalogue.
+      const _asinUseCount = {};
+      for (const a of Object.values(_storedSkuToAsin)) {
+        if (a) _asinUseCount[a] = (_asinUseCount[a] || 0) + 1;
+      }
+      const _suspectAsins = new Set(
+        Object.entries(_asinUseCount).filter(([, n]) => n >= 3).map(([a]) => a)
+      );
       const cachedOfferIds = body.cachedOfferIds || {};
       const offerMap       = {}; // sku → { offerId, currentPrice }
       let _listingId       = String(body.ebayListingId || '');
@@ -8673,8 +8716,21 @@ module.exports = async (req, res) => {
       // truncated variant. Reconstruction matches dim-value slugs against the variant SKU
       // text, which works regardless of how the SKU was truncated.
       const _needsRecon = new Set();
+      // When we have a FRESH variant map this cycle, re-derive any mapping that
+      // looks poisoned rather than trusting what was stored. Without a fresh
+      // map we leave stored mappings alone (no better information available).
+      const _haveFreshMap = !!(_freshDta && Object.keys(_freshDta).length > 0);
+      let _reReconned = 0;
       for (const sku of Object.keys(offerMap)) {
-        if (!skuToAsin[sku]) _needsRecon.add(sku);
+        if (!skuToAsin[sku]) { _needsRecon.add(sku); continue; }
+        if (_haveFreshMap && _isMultiDim && _suspectAsins.has(skuToAsin[sku])) {
+          delete skuToAsin[sku];      // drop it; the matcher below re-derives it
+          _needsRecon.add(sku);
+          _reReconned++;
+        }
+      }
+      if (_reReconned > 0) {
+        console.log(`[smartSync] re-deriving ${_reReconned} stored SKU→ASIN mappings that share an ASIN across 3+ variants (suspected legacy smearing)`);
       }
       // PER-REQUEST LOCALS (fixed July 2026): these were `global.__smartSync*`,
       // but smartSync runs CONCURRENTLY (browser relay + extension ticks
@@ -8821,6 +8877,16 @@ module.exports = async (req, res) => {
           }
         }
         console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs${_reconAmbiguous > 0 ? ` (${_reconAmbiguous} ambiguous, skipped to avoid wrong-price assignment)` : ''} (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}]${_canReconFromCombo?' +comboAsin fallback':''})`);
+        // Show exactly what the fresh map changed vs what was stored — this is
+        // how you confirm a poisoned listing has actually been repaired.
+        const _corrections = Object.keys(skuToAsin).filter(
+          s => _storedSkuToAsin[s] && skuToAsin[s] && _storedSkuToAsin[s] !== skuToAsin[s]);
+        if (_corrections.length) {
+          console.log(`[smartSync] CORRECTED ${_corrections.length} stored mappings: ` +
+            _corrections.slice(0, 6).map(s =>
+              `${s.slice(-22)} ${_storedSkuToAsin[s]}→${skuToAsin[s]}`).join(', ') +
+            (_corrections.length > 6 ? '…' : ''));
+        }
         // MAP COMPLETENESS (July 2026): if the variant map we assembled covers
         // fewer combos than the eBay group has SKUs, we CANNOT conclude that an
         // unmatched variant was removed from Amazon — the map is just partial

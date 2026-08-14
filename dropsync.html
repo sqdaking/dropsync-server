@@ -656,7 +656,34 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-07-21.3 (fresh-dta + instock fix)');
+console.log('[dropsync] build 2026-07-21.4 (map-repair)');
+
+// Force a listing (or all listings) to rebuild its variant maps from scratch.
+// Use when a listing keeps re-publishing the same wrong price: the stored
+// skuToAsin map from the old buggy matcher is what keeps reproducing it.
+async function resetVariantMaps(ebaySkuOrAll) {
+  const all = ebaySkuOrAll === true || ebaySkuOrAll === 'all';
+  const targets = all ? (S.products || []) :
+    (S.products || []).filter(p => normaliseGroupSku(p.ebaySku) === normaliseGroupSku(ebaySkuOrAll));
+  if (!all && !targets.length) { console.warn('[reset] no product matched', ebaySkuOrAll); return; }
+  // 1. clear the browser's own copies (the UI sends these to the server)
+  for (const p of targets) {
+    delete p.skuToAsin; delete p.offerIdCache; delete p.offerIdCacheAt;
+    p._asinOffset = 0;
+    markDirty(p.id);
+  }
+  save();
+  // 2. clear the server-side relay copies
+  try {
+    const r = await fetch(`${S.serverUrl}/api/ebay?action=reset_variant_maps`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(all ? { all: true } : { ebaySku: normaliseGroupSku(ebaySkuOrAll) }),
+    });
+    console.log('[reset] server:', await r.json());
+  } catch(e) { console.warn('[reset] server clear failed:', e.message); }
+  console.log(`[reset] cleared variant maps for ${targets.length} listing(s) — next sync rebuilds from Amazon`);
+}
+window.resetVariantMaps = resetVariantMaps;
 // ── Utilities ─────────────────────────────────────────
 // MULTI-ACCOUNT: transparently append ?account=<eBay username> to every
 // same-server /api/products, /api/logs, /api/settings call. One wrapper
