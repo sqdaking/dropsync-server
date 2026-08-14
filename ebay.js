@@ -561,6 +561,7 @@ async function _ensureRelayStateSchema() {
     ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS handling_cost   NUMERIC(6,2);
     ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS quantity        INTEGER;
     ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS last_dispatched TIMESTAMPTZ;
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS priority_asins  TEXT[];
     CREATE INDEX IF NOT EXISTS relay_state_acct_idx ON relay_state(account_id, last_synced);
   `).catch(e => console.warn('[relay] schema migrate:', e.message));
   _relaySchemaReady = true;
@@ -7813,6 +7814,7 @@ module.exports = async (req, res) => {
                 offerId: off.offerId,
                 lastModifiedDate: off.lastModifiedDate || off.listingStartDate || '',
                 currentPrice: parseFloat(off.pricingSummary?.price?.value || 0),
+                currentQty: parseInt(off.availableQuantity),
               };
             }
           } catch(e) {}
@@ -8053,7 +8055,7 @@ module.exports = async (req, res) => {
             FOR UPDATE SKIP LOCKED
           )
           RETURNING ebay_sku, source_url, last_synced, comboAsin, skuToAsin,
-                    offer_ids, asin_offset, markup, handling_cost, quantity
+                    offer_ids, asin_offset, markup, handling_cost, quantity, priority_asins
         `, [cap, accountId]);
 
         // Tell the extension which ASINs already have fresh cache (<20h old)
@@ -8082,6 +8084,7 @@ module.exports = async (req, res) => {
             skuToAsin:    row.skutoasin || {},
             offerIds:     row.offer_ids || {},
             asinOffset:   parseInt(row.asin_offset) || 0,
+            priorityAsins: row.priority_asins || [],
             markup:       row.markup       != null ? parseFloat(row.markup)        : null,
             handlingCost: row.handling_cost != null ? parseFloat(row.handling_cost) : null,
             quantity:     row.quantity     != null ? parseInt(row.quantity)        : null,
@@ -8166,8 +8169,8 @@ module.exports = async (req, res) => {
         if (_cachePool) {
           const _stale = _result && _result.offersCacheStale === true;
           await _cachePool.query(`
-            INSERT INTO relay_state (ebay_sku, source_url, account_id, last_synced, comboAsin, skuToAsin, offer_ids, asin_offset, block_count, updated_at)
-            VALUES ($1, $2, $3, NOW(), $4::jsonb, $5::jsonb, $6::jsonb, $7, 0, NOW())
+            INSERT INTO relay_state (ebay_sku, source_url, account_id, last_synced, comboAsin, skuToAsin, offer_ids, asin_offset, priority_asins, block_count, updated_at)
+            VALUES ($1, $2, $3, NOW(), $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, 0, NOW())
             ON CONFLICT (ebay_sku) DO UPDATE
               SET last_synced = NOW(),
                   source_url  = EXCLUDED.source_url,
@@ -8176,6 +8179,7 @@ module.exports = async (req, res) => {
                   skuToAsin   = COALESCE(EXCLUDED.skuToAsin, relay_state.skuToAsin),
                   offer_ids   = ${_stale ? 'NULL' : 'COALESCE(EXCLUDED.offer_ids, relay_state.offer_ids)'},
                   asin_offset = EXCLUDED.asin_offset,
+                  priority_asins = EXCLUDED.priority_asins,
                   block_count = 0,
                   cooldown_until = NULL,
                   updated_at  = NOW()
@@ -8184,6 +8188,7 @@ module.exports = async (req, res) => {
               JSON.stringify(Object.keys(_result?.skuToAsin || {}).length ? _result.skuToAsin : (skuToAsin || {})),
               _result?.offerIdsBySku ? JSON.stringify(_result.offerIdsBySku) : null,
               parseInt(_result?.nextAsinOffset) || 0,
+              (_result?.priorityAsins && _result.priorityAsins.length) ? _result.priorityAsins : null,
           ]).catch(e => {
             console.warn('[relay_result] db update failed:', e.message);
           });
@@ -8559,6 +8564,10 @@ module.exports = async (req, res) => {
       const _suspectAsins = new Set(
         Object.entries(_asinUseCount).filter(([, n]) => n >= 3).map(([a]) => a)
       );
+      // SKUs whose ASIN changed vs what was stored. Their live eBay price was
+      // derived from the WRONG ASIN, so it must not stay buyable until we have
+      // a real price for the corrected ASIN.
+      const _correctedSkus = new Set();
       const cachedOfferIds = body.cachedOfferIds || {};
       const offerMap       = {}; // sku → { offerId, currentPrice }
       let _listingId       = String(body.ebayListingId || '');
@@ -8602,7 +8611,7 @@ module.exports = async (req, res) => {
           if (r?.ok) {
             const d = await r.json().catch(() => ({}));
             const o = (d.offers || [])[0];
-            if (o?.offerId) offerMap[sku] = { offerId: o.offerId, currentPrice: parseFloat(o.pricingSummary?.price?.value || 0) };
+            if (o?.offerId) offerMap[sku] = { offerId: o.offerId, currentPrice: parseFloat(o.pricingSummary?.price?.value || 0), currentQty: parseInt(o.availableQuantity) };
           }
         }));
         if (i + 20 < skuList.length) await sleep(60);
@@ -8881,6 +8890,7 @@ module.exports = async (req, res) => {
         // how you confirm a poisoned listing has actually been repaired.
         const _corrections = Object.keys(skuToAsin).filter(
           s => _storedSkuToAsin[s] && skuToAsin[s] && _storedSkuToAsin[s] !== skuToAsin[s]);
+        for (const s2 of _corrections) _correctedSkus.add(s2);
         if (_corrections.length) {
           console.log(`[smartSync] CORRECTED ${_corrections.length} stored mappings: ` +
             _corrections.slice(0, 6).map(s =>
@@ -9126,6 +9136,23 @@ module.exports = async (req, res) => {
             });
             continue;
           }
+          // A CORRECTED mapping means the live price came from the wrong ASIN.
+          // Preserving it would keep selling at a price that belongs to another
+          // variant — exactly the failure we're fixing. Force qty=0 until the
+          // corrected ASIN has a real price (next cycle prioritises it).
+          if (_correctedSkus.has(sku)) {
+            const _p = _currPrice > 0 ? _currPrice : (_highestSiblingPrice || 0);
+            if (_p > 0) {
+              console.log(`[smartSync] ${sku.slice(-20)} → mapping corrected but no price yet for ${asin} — qty=0 until priced`);
+              updates.push({
+                offerId:           offer.offerId,
+                sku,
+                availableQuantity: 0,
+                price:             { value: _p.toFixed(2), currency: 'USD' },
+              });
+              continue;
+            }
+          }
           _skippedNoBatch.push(sku);
           continue;
         }
@@ -9184,80 +9211,122 @@ module.exports = async (req, res) => {
       // (proactive 4× price clamp removed — many categories don't enforce it.
       // If eBay rejects with 25019 4× message, we react then; no preemptive clamping.)
 
-      // ── STEP 5: Update all variants ──────────────────────────────────────────
-      // REWRITTEN (July 2026): bulkUpdatePriceQuantity FIRST — 25 variant SKUs
-      // per call, price + offer qty + ship-to-location qty in ONE request, and
-      // far fewer revisions against eBay's 250/day per-listing cap. The old
-      // per-offer GET→mutate→PUT chain (2 calls/variant) + inventory-item
-      // GET→PUT (2 more calls/variant) + publish-every-cycle burned dozens of
-      // calls and multiple revisions per listing per cycle. The legacy loop
-      // below is kept ONLY as a fallback for entries the bulk call rejects.
-      console.log(`[smartSync] updating ${updates.length} variants…`);
+      // ── STEP 5: Update all variants — TWO PHASES ─────────────────────────────
+      // PHASE 1: set EVERY variant in the group to qty=0.
+      // PHASE 2: restore qty only for variants confirmed in stock this sync.
+      //
+      // WHY TWO PHASES: a single-pass update only touches variants it has data
+      // for. Anything stale — a variant whose ASIN wasn't in this batch, one
+      // that lost its mapping, one Amazon dropped — kept whatever quantity it
+      // had and stayed BUYABLE at an old price. Zeroing first makes "buyable"
+      // something a variant has to EARN each sync from live data, instead of
+      // something it keeps by default.
+      //
+      // COST: two bulk passes instead of one (~2 extra API calls per 25
+      // variants) and a brief window where the listing is unbuyable. Set
+      // TWO_PHASE_SYNC=off to fall back to single-pass.
+      const _twoPhase = (process.env.TWO_PHASE_SYNC || 'on').toLowerCase() !== 'off';
       let okCount = 0, failCount = 0;
       const _failReasons = { get429: 0, get4xx: 0, get5xx: 0, getNet: 0,
                              put429: 0, put4xx: 0, put5xx: 0, putNet: 0 };
 
-      const _bulkFailed = []; // entries that need the legacy per-offer path
-      {
-        const _bulkOk = new Set();
-        for (let bi = 0; bi < updates.length; bi += 25) {
-          const chunk = updates.slice(bi, bi + 25);
+      // Reusable bulk applier — returns { ok:Set(sku), failed:[entries] }
+      const _bulkApply = async (entries, label) => {
+        const okSet = new Set(); const failed = [];
+        for (let bi = 0; bi < entries.length; bi += 25) {
+          const chunk = entries.slice(bi, bi + 25);
           const payload = {
             requests: chunk.map(u => ({
               sku: u.sku,
               shipToLocationAvailability: { quantity: u.availableQuantity },
-              offers: [{
-                offerId: u.offerId,
-                availableQuantity: u.availableQuantity,
-                price: u.price,
-              }],
+              offers: [{ offerId: u.offerId, availableQuantity: u.availableQuantity, price: u.price }],
             })),
           };
           let br = null;
           try {
             br = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_update_price_quantity`, {
-              method: 'POST', headers: auth, body: JSON.stringify(payload),
-            });
+              method: 'POST', headers: auth, body: JSON.stringify(payload) });
             if (br.status === 429) { await sleep(1500);
               br = await fetch(`${EBAY_API}/sell/inventory/v1/bulk_update_price_quantity`, {
                 method: 'POST', headers: auth, body: JSON.stringify(payload) });
             }
           } catch(e) { br = null; }
-          if (!br) { _bulkFailed.push(...chunk); continue; }
-          let bd = {};
-          try { bd = JSON.parse(await br.text()); } catch(e) {}
+          if (!br) { failed.push(...chunk); continue; }
+          let bd = {}; try { bd = JSON.parse(await br.text()); } catch(e) {}
           const _resps = bd.responses || [];
           if (!br.ok && _resps.length === 0) {
-            // Whole call rejected (auth, malformed, 5xx) — send chunk to legacy path
-            console.warn(`[smartSync] bulk update HTTP ${br.status} — ${chunk.length} entries → legacy fallback`);
-            _bulkFailed.push(...chunk);
-            continue;
+            console.warn(`[smartSync] ${label} bulk HTTP ${br.status} — ${chunk.length} entries → fallback`);
+            failed.push(...chunk); continue;
           }
-          // eBay returns TWO response entries per request entry (one for the
-          // inventory ship-to-location update, one for the offer update), so
-          // account per SKU, not per response — otherwise counts double.
-          const _okBySku = new Set();
-          const _failBySku = new Set();
+          // eBay returns one response per leg (inventory + offer) — track per SKU
+          const okBySku = new Set(), failBySku = new Set();
           for (const resp of _resps) {
             const _u = chunk.find(u => u.sku === resp.sku || (resp.offerId && u.offerId === resp.offerId));
             if (!_u) continue;
             const _sc = parseInt(resp.statusCode) || 0;
-            if (_sc >= 200 && _sc < 300) {
-              _okBySku.add(_u.sku);
-            } else {
+            if (_sc >= 200 && _sc < 300) okBySku.add(_u.sku);
+            else {
               const _emsg = (resp.errors || []).map(e => `${e.errorId}:${(e.message||'').slice(0,80)}`).join('; ');
-              console.warn(`[smartSync] bulk ✗ ${(_u.sku||'').slice(-20)} ${_sc}: ${_emsg}`);
-              _failBySku.add(_u.sku);
+              console.warn(`[smartSync] ${label} ✗ ${(_u.sku||'').slice(-20)} ${_sc}: ${_emsg}`);
+              failBySku.add(_u.sku);
             }
           }
           for (const u of chunk) {
-            if (_failBySku.has(u.sku)) { _bulkFailed.push(u); continue; }   // any failed leg → retry via legacy
-            if (_okBySku.has(u.sku))   { okCount++; _bulkOk.add(u.sku); continue; }
-            _bulkFailed.push(u);                                            // not echoed at all → legacy
+            if (failBySku.has(u.sku)) { failed.push(u); continue; }
+            if (okBySku.has(u.sku)) { okSet.add(u.sku); continue; }
+            failed.push(u);
           }
-          if (bi + 25 < updates.length) await sleep(300);
+          if (bi + 25 < entries.length) await sleep(300);
         }
-        console.log(`[smartSync] bulk update: ${okCount}/${updates.length} ok${_bulkFailed.length ? `, ${_bulkFailed.length} → legacy per-offer fallback` : ''}`);
+        return { ok: okSet, failed };
+      };
+
+      // ── PHASE 1: zero everything ─────────────────────────────────────────────
+      // eBay requires price > 0 on every entry, so we resend each offer's
+      // CURRENT price — phase 1 changes quantity only, never price.
+      let _zeroed = 0;
+      if (_twoPhase) {
+        const _wanted = new Map(updates.map(u => [u.sku, u]));
+        const zeroEntries = [];
+        for (const [sku, offer] of Object.entries(offerMap)) {
+          if (!offer?.offerId) continue;
+          // Skip variants that are already 0 AND staying 0 — nothing to change.
+          const cur = parseInt(offer.currentQty);
+          const want = _wanted.get(sku);
+          // Skip only when we KNOW the variant is already at 0 (quantity is
+          // unknown on the cached-offer-ID path — then we zero to be safe).
+          if (!want && Number.isFinite(cur) && cur === 0) continue;
+          // Skip if phase 2 will set this exact SKU to 0 anyway (avoids a
+          // duplicate write while keeping the same end state).
+          if (want && want.availableQuantity === 0) continue;
+          const price = parseFloat(offer.currentPrice) > 0
+            ? parseFloat(offer.currentPrice)
+            : (want ? parseFloat(want.price.value) : (_highestSiblingPrice || 0));
+          if (!(price > 0)) continue; // eBay rejects price<=0; nothing safe to send
+          zeroEntries.push({
+            offerId: offer.offerId, sku, availableQuantity: 0,
+            price: { value: price.toFixed(2), currency: 'USD' },
+          });
+        }
+        if (zeroEntries.length) {
+          console.log(`[smartSync] PHASE 1 — zeroing ${zeroEntries.length}/${Object.keys(offerMap).length} variants (nothing stays buyable without fresh proof)`);
+          const r1 = await _bulkApply(zeroEntries, 'phase1');
+          _zeroed = r1.ok.size;
+          if (r1.failed.length) console.warn(`[smartSync] PHASE 1: ${r1.failed.length} zeroing calls failed — those variants may still be buyable`);
+        } else {
+          console.log(`[smartSync] PHASE 1 — nothing to zero (all variants already 0 or being set to 0)`);
+        }
+      }
+
+      // ── PHASE 2: restore confirmed variants ──────────────────────────────────
+      const _phase2 = _twoPhase ? updates.filter(u => u.availableQuantity > 0) : updates;
+      console.log(`[smartSync] PHASE 2 — restoring ${_phase2.length} confirmed in-stock variants…`);
+      const _bulkFailed = [];
+      {
+        const r2 = await _bulkApply(_phase2, 'phase2');
+        okCount = r2.ok.size;
+        _bulkFailed.push(...r2.failed);
+        console.log(`[smartSync] bulk update: ${okCount}/${_phase2.length} ok${_twoPhase ? `, ${_zeroed} zeroed in phase 1` : ''}${_bulkFailed.length ? `, ${_bulkFailed.length} → legacy fallback` : ''}`);
       }
       const _legacyUpdates = _bulkFailed;
 
@@ -9536,6 +9605,7 @@ module.exports = async (req, res) => {
       }
       return res.json({
         success: true, synced: okCount, failed: failCount,
+        zeroedFirst: _zeroed,
         unresolvedCount: _unresolvedSkus.length,
         orphanedCount: _orphanedSkus.length,
         orphanedSkus:  _orphanedSkus.length > 0 ? _orphanedSkus.slice(0, 20) : undefined,
@@ -9547,8 +9617,11 @@ module.exports = async (req, res) => {
         // Fresh offer IDs — client/relay persists these so the NEXT sync skips
         // the entire offer-discovery chain (dozens of eBay calls saved).
         offerIdsBySku: Object.fromEntries(Object.entries(offerMap).map(([s, o]) => [s, o.offerId])),
-        // ASINs with no fresh or cached data — the fetcher should prioritize
-        // these next cycle.
+        // ASINs the fetcher should get FIRST next cycle: corrected mappings
+        // waiting on a price (their variants are qty=0 until then), followed by
+        // anything with no fresh or cached data.
+        priorityAsins: [...new Set([...(_correctedSkus)].map(s2 => skuToAsin[s2]).filter(Boolean))].slice(0, 40),
+        correctedCount: _correctedSkus.size,
         staleAsins: allUniqueAsins.filter(a => asinPrice[a] === undefined).slice(0, 60),
         prices: Object.fromEntries(uniqueAsins.map(a => [a, {
           cost: asinPrice[a]||0,
