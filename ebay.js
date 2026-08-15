@@ -8828,17 +8828,82 @@ module.exports = async (req, res) => {
           }
         }
 
+        // ── EXACT HASHED-SKU MATCHING (Aug 2026) ──────────────────────────────
+        // eBay SKUs are capped at 50 chars. When a variant name overflows, the
+        // pusher truncates it and appends an 8-hex hash:
+        //   DS-…-AB_PATTERN_BLACK_P_02D65295
+        // Prefix matching then finds MANY candidates (BLACK_PURPLE_QUEEN,
+        // BLACK_PURPLE_KING, BLACK_PINK_QUEEN …), all get marked ambiguous, and
+        // the variant is never priced. But the hash is deterministic, so we can
+        // regenerate the exact SKU each combo WOULD have produced and match on
+        // that — no guessing, no ambiguity.
+        // Must stay byte-identical to _mkSku() in dropsync.html.
+        const _SKU_MAX = 50;
+        const _pfxStr = normSku + '-';
+        const _mkSku = (parts) => {
+          const raw = parts.map(_slug).filter(Boolean).join('_');
+          const maxSfx = _SKU_MAX - _pfxStr.length;
+          if (raw.length <= maxSfx) return _pfxStr + raw;
+          const hash = raw.split('').reduce((h, c) => ((h << 5) - h + c.charCodeAt(0)) | 0, 0);
+          return _pfxStr + raw.slice(0, maxSfx - 9) + '_' + (hash >>> 0).toString(16).toUpperCase().padStart(8, '0');
+        };
+        // Build expected-SKU → ASIN from every combo we know about, in both
+        // dimension orders (SKUs were pushed in whichever order was current).
+        const _exactSkuMap = {};
+        const _addExact = (parts, asin) => {
+          if (!asin || !parts.length) return;
+          for (const p of [parts, parts.slice().reverse()]) {
+            const s = _mkSku(p);
+            if (s && !_exactSkuMap[s]) _exactSkuMap[s] = asin;
+          }
+        };
+        if (_canReconFromDta) {
+          for (const [idx, asin] of Object.entries(dta)) {
+            const parts2 = String(idx).split('_');
+            const vals = _dimKeys.map((k, ki) => {
+              const arr = vv2[k] || [];
+              return arr[parseInt(parts2[ki] ?? parts2[0]) || 0] || '';
+            }).filter(Boolean);
+            _addExact(vals, asin);
+          }
+        }
+        if (_canReconFromCombo) {
+          for (const [comboKey, asin] of Object.entries(body.comboAsin)) {
+            const rawParts = String(comboKey)
+              .split(/\s*\|\s*|\s*\/\s*|\s*,\s*|\s+-\s+/)
+              .map(x => x.trim()).filter(Boolean);
+            _addExact(rawParts, asin);
+            // comboAsin keys sometimes contain a '/' INSIDE a value
+            // ("Tiger/Leopard|King") — also try splitting on '|' only.
+            const pipeParts = String(comboKey).split('|').map(x => x.trim()).filter(Boolean);
+            if (pipeParts.length !== rawParts.length) _addExact(pipeParts, asin);
+          }
+        }
+        let _exactHits = 0;
+
         // Sort by length DESCENDING so the most specific slug matches first.
         const _compoundSlugs = Object.entries(_compoundMap).sort((a, b) => b[0].length - a[0].length);
         const _primaryOnlySlugs = Object.entries(_singleMap).sort((a, b) => b[0].length - a[0].length);
         const _pfxUpper = normSku.toUpperCase() + '-';
         let _reconHits = 0, _reconAmbiguous = 0;
         for (const sku of _needsRecon) {
+          // 1) EXACT: does this SKU equal the SKU some combo would generate?
+          // Handles hashed/truncated SKUs with zero ambiguity.
+          if (_exactSkuMap[sku]) {
+            skuToAsin[sku] = _exactSkuMap[sku];
+            _reconHits++; _exactHits++;
+            continue;
+          }
           // Strip the group SKU prefix when present, then uppercase for case-insensitive matching
           const sfx = (sku.toUpperCase().startsWith(_pfxUpper)
             ? sku.slice(normSku.length + 1)
             : sku).toUpperCase();
+          // A hashed tail (…_02D65295) means the readable part is truncated —
+          // prefix matching on it produces false multi-matches, so only the
+          // exact map above may resolve these. Anything else is a guess.
+          const _hashed = /_[0-9A-F]{8}$/.test(sfx);
           let matched = false;
+          if (_hashed) { _reconAmbiguous++; continue; }
           // Try compound (multi-dim) slugs FIRST — forward containment
           for (const [slug, asin] of _compoundSlugs) {
             if (sfx.startsWith(slug) || sfx.includes(slug)) {
@@ -8885,6 +8950,7 @@ module.exports = async (req, res) => {
             }
           }
         }
+        if (_exactHits > 0) console.log(`[smartSync] exact hashed-SKU matches: ${_exactHits} (regenerated from combos — no guessing)`);
         console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs${_reconAmbiguous > 0 ? ` (${_reconAmbiguous} ambiguous, skipped to avoid wrong-price assignment)` : ''} (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}]${_canReconFromCombo?' +comboAsin fallback':''})`);
         // Show exactly what the fresh map changed vs what was stored — this is
         // how you confirm a poisoned listing has actually been repaired.
@@ -8908,7 +8974,7 @@ module.exports = async (req, res) => {
           const _unmatched = [...(_needsRecon)].filter(s => !skuToAsin[s]).slice(0, 5)
             .map(s => (s.toUpperCase().startsWith(_pfxUpper) ? s.slice(normSku.length + 1) : s));
           const _sampleCombo = Object.keys(body.comboAsin || {}).slice(0, 3);
-          console.log(`[smartSync] unmatched diag: compoundSlugs=${Object.keys(_compoundMap).length} singleSlugs=${Object.keys(_singleMap).length} groupSkus=${Object.keys(offerMap).length} mapComplete=${_mapComplete}`);
+          console.log(`[smartSync] unmatched diag: compoundSlugs=${Object.keys(_compoundMap).length} singleSlugs=${Object.keys(_singleMap).length} exactSkus=${Object.keys(_exactSkuMap).length} groupSkus=${Object.keys(offerMap).length} mapComplete=${_mapComplete}`);
           console.log(`[smartSync] unmatched SKU suffixes: ${_unmatched.join(' | ') || '(none)'}`);
           console.log(`[smartSync] sample comboAsin keys: ${_sampleCombo.map(k => JSON.stringify(k)).join(' , ') || '(none)'}`);
           console.log(`[smartSync] sample compound slugs: ${Object.keys(_compoundMap).slice(0, 5).join(' | ') || '(none)'}`);
