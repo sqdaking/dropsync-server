@@ -1,588 +1,388 @@
-// Log capture must load FIRST so it captures output from every later require.
-const logtail = require('./logtail');
-logtail.install();
+const { Pool } = require('pg');
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const db = require('./db');
-const vero = require('./vero');
-const veroInbox = require('./vero-inbox');
-const { startWorker, runForever, getValidToken } = require('./worker');
-
-const app = express();
-logtail.mountLogTail(app);
-
-// Explicit CORS — allow all origins for every request including preflight
-const corsOptions = {
-  origin: '*',
-  methods: 'GET,POST,PUT,DELETE,OPTIONS',
-  allowedHeaders: 'Content-Type,Authorization,Accept,Accept-Language',
-  credentials: false,
-};
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // handle preflight for all routes
-
-app.use(express.json({ limit: '10mb' }));
-
-// ── Static file serving for frontend ─────────────────────────────────────────
-app.use(express.static(__dirname)); // Serve static files from server directory
-
-const PORT = process.env.PORT || 3000;
-
-// ── Health check & Frontend ──────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  // Serve the DropSync frontend HTML
-  res.sendFile(__dirname + '/dropsync.html');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes('railway') ? { rejectUnauthorized: false } : false,
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'DropSync v2', time: new Date().toISOString() });
-});
-
-// ── Auth ──────────────────────────────────────────────────────────────────────
-app.get('/api/auth', (req, res) => {
-  const clientId = process.env.EBAY_CLIENT_ID;
-  const ruName   = process.env.EBAY_RU_NAME;
-  const SCOPES   = 'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory https://api.ebay.com/oauth/api_scope/sell.account https://api.ebay.com/oauth/api_scope/sell.fulfillment';
-  const url = `https://auth.ebay.com/oauth2/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(ruName)}&response_type=code&scope=${encodeURIComponent(SCOPES)}&state=production`;
-  res.json({ url });
-});
-
-app.get('/api/callback', async (req, res) => {
-  const { code, error } = req.query;
-  if (error) return res.send(`<script>window.opener?.postMessage({type:'ebay_auth',error:'${error}'},'*');window.close();</script>`);
-
-  const clientId     = process.env.EBAY_CLIENT_ID;
-  const clientSecret = process.env.EBAY_CLIENT_SECRET;
-  const ruName       = process.env.EBAY_RU_NAME;
-  const creds        = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
-
+async function initDB() {
+  const client = await pool.connect();
   try {
-    const fetch = require('node-fetch');
-    const r = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
-      method: 'POST',
-      headers: { 'Authorization': `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `grant_type=authorization_code&code=${encodeURIComponent(code)}&redirect_uri=${encodeURIComponent(ruName)}`,
-    });
-    const d = await r.json();
-    if (d.access_token) {
-      await db.setSetting('access_token', d.access_token);
-      await db.setSetting('refresh_token', d.refresh_token);
-      await db.setSetting('token_expiry', String(Date.now() + (d.expires_in * 1000)));
-      res.send(`<script>window.opener?.postMessage({type:'ebay_auth',success:true,access_token:'${d.access_token}',refresh_token:'${d.refresh_token}',expires_in:${d.expires_in}},'*');window.close();</script>`);
-    } else {
-      res.send(`<script>window.opener?.postMessage({type:'ebay_auth',error:'${d.error_description||'Token exchange failed'}'},'*');window.close();</script>`);
-    }
-  } catch(e) {
-    res.send(`<script>window.opener?.postMessage({type:'ebay_auth',error:'${e.message}'},'*');window.close();</script>`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS products (
+        id TEXT PRIMARY KEY,
+        asin TEXT,
+        ebay_sku TEXT,
+        ebay_item_id TEXT,
+        title TEXT,
+        source_url TEXT,
+        my_price NUMERIC(10,2),
+        amazon_price NUMERIC(10,2),
+        cost NUMERIC(10,2),
+        status TEXT DEFAULT 'pending',
+        quantity INTEGER DEFAULT 1,
+        has_variations BOOLEAN DEFAULT FALSE,
+        variations JSONB,
+        image_url TEXT,
+        category TEXT,
+        condition_id TEXT DEFAULT 'NEW',
+        last_synced TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW(),
+        data JSONB
+      );
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS data JSONB;
+      CREATE INDEX IF NOT EXISTS products_status_idx ON products(status);
+      CREATE INDEX IF NOT EXISTS products_asin_idx ON products(asin);
+      CREATE INDEX IF NOT EXISTS products_last_synced_idx ON products(last_synced);
+      CREATE TABLE IF NOT EXISTS logs (
+        id SERIAL PRIMARY KEY,
+        type TEXT,
+        title TEXT,
+        detail TEXT,
+        product_id TEXT,
+        meta JSONB,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS logs_created_idx ON logs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS logs_type_idx ON logs(type);
+      CREATE TABLE IF NOT EXISTS relay_queue (
+        id SERIAL PRIMARY KEY,
+        url TEXT NOT NULL,
+        asin TEXT,
+        status TEXT NOT NULL DEFAULT 'pending', -- pending | claimed | done | failed
+        html TEXT,
+        error TEXT,
+        requested_at TIMESTAMPTZ DEFAULT NOW(),
+        claimed_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS relay_queue_status_idx ON relay_queue(status, requested_at);
+      CREATE INDEX IF NOT EXISTS relay_queue_url_idx ON relay_queue(url);
+      -- MULTI-ACCOUNT (July 2026): every per-account table gets account_id.
+      -- Existing rows fall under 'default' until claimed via
+      -- POST /api/claim-default-account from the original account's browser.
+      ALTER TABLE products ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'default';
+      CREATE INDEX IF NOT EXISTS products_acct_idx ON products(account_id, status);
+      ALTER TABLE logs ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'default';
+      CREATE INDEX IF NOT EXISTS logs_acct_idx ON logs(account_id, created_at DESC);
+      ALTER TABLE settings ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'default';
+    `);
+    // settings PK must become (account_id, key) — done separately since
+    // constraint changes can't run inside the IF NOT EXISTS batch above.
+    try {
+      const pk = await client.query(`SELECT conname FROM pg_constraint WHERE conrelid='settings'::regclass AND contype='p'`);
+      const isComposite = await client.query(
+        `SELECT COUNT(*) AS n FROM information_schema.key_column_usage
+          WHERE table_name='settings' AND constraint_name=$1`, [pk.rows[0]?.conname || '']);
+      if (pk.rows[0] && parseInt(isComposite.rows[0].n) < 2) {
+        await client.query(`ALTER TABLE settings DROP CONSTRAINT ${pk.rows[0].conname}`);
+        await client.query(`ALTER TABLE settings ADD PRIMARY KEY (account_id, key)`);
+        console.log('[DB] settings PK migrated to (account_id, key)');
+      }
+    } catch(e) { console.warn('[DB] settings PK migration:', e.message); }
+    console.log('[DB] Schema ready');
+  } finally {
+    client.release();
   }
-});
-
-app.get('/api/token', async (req, res) => {
-  const token = await getValidToken();
-  if (!token) return res.status(401).json({ error: 'No valid token' });
-  const expiry = await db.getSetting('token_expiry');
-  res.json({ access_token: token, expires_at: expiry });
-});
+}
 
 // ── Settings ──────────────────────────────────────────────────────────────────
-app.get('/api/settings', async (req, res) => {
-  try {
-    const s = await db.getAllSettings(acctOf(req));
-    // Don't expose raw tokens
-    const { access_token, refresh_token, ...safe } = s;
-    safe.has_token = !!access_token;
-    safe.has_refresh = !!refresh_token;
-    safe.token_valid = !!access_token && Date.now() < (safe.token_expiry - 60000);
-    res.json(safe);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/settings', async (req, res) => {
-  try {
-    const { key, value } = req.body;
-    if (!key) return res.status(400).json({ error: 'key required' });
-    await db.setSetting(key, value, acctOf(req));
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/settings/bulk', async (req, res) => {
-  try {
-    const settings = req.body; // { key: value, ... }
-    const account = acctOf(req);
-    for (const [k, v] of Object.entries(settings)) {
-      await db.setSetting(k, v, account);
-    }
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── MULTI-ACCOUNT ────────────────────────────────────────────────────────────
-// Every products/settings/logs request carries ?account=<eBay username>
-// (the frontend appends it automatically once connected). Unknown/missing →
-// 'default' (pre-multi-account data). Sanitized to a safe identifier.
-function acctOf(req) {
-  const a = String(req.query.account || req.headers['x-ds-account'] || '').trim();
-  return /^[\w.\-]{1,64}$/.test(a) ? a : 'default';
+async function getSetting(key, account = 'default') {
+  const r = await pool.query('SELECT value FROM settings WHERE key=$1 AND account_id=$2', [key, account]);
+  if (!r.rows[0]) return null;
+  try { return JSON.parse(r.rows[0].value); } catch { return r.rows[0].value; }
 }
 
-// One-time migration: adopt all 'default'-account rows into a real account.
-// Called from the ORIGINAL account's browser via the Settings link.
-app.post('/api/claim-default-account', async (req, res) => {
-  try {
-    const { accountId, access_token } = req.body || {};
-    if (!accountId || !/^[\w.\-]{1,64}$/.test(accountId) || accountId === 'default')
-      return res.status(400).json({ error: 'valid accountId required' });
-    // Verify the token actually belongs to the claimed account — prevents
-    // account B from hijacking account A's legacy data.
-    const ebayMod = require('./ebay');
-    if (typeof ebayMod.resolveAccountId === 'function' && access_token) {
-      const real = await ebayMod.resolveAccountId(access_token);
-      if (real && real !== 'default' && real !== accountId)
-        return res.status(403).json({ error: `token belongs to ${real}, not ${accountId}` });
-    }
-    const claimed = await db.claimDefaultAccount(accountId);
-    console.log('[multi-account] claimed default rows →', accountId, claimed);
-    res.json({ success: true, claimed });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+async function setSetting(key, value, account = 'default') {
+  const v = typeof value === 'string' ? value : JSON.stringify(value);
+  await pool.query(
+    `INSERT INTO settings(account_id,key,value,updated_at) VALUES($3,$1,$2,NOW())
+     ON CONFLICT(account_id,key) DO UPDATE SET value=$2, updated_at=NOW()`,
+    [key, v, account]
+  );
+}
+
+async function getAllSettings(account = 'default') {
+  const r = await pool.query('SELECT key, value FROM settings WHERE account_id=$1', [account]);
+  const out = {};
+  for (const row of r.rows) {
+    try { out[row.key] = JSON.parse(row.value); } catch { out[row.key] = row.value; }
+  }
+  return out;
+}
 
 // ── Products ──────────────────────────────────────────────────────────────────
-app.get('/api/products', async (req, res) => {
-  try {
-    const { status, limit = 500, offset = 0 } = req.query;
-    const account = acctOf(req);
-    const products = await db.getProducts({ status, limit: parseInt(limit), offset: parseInt(offset), account });
-    const total = await db.countProducts(status, account);
-    res.json({ products, total, limit: parseInt(limit), offset: parseInt(offset) });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+async function upsertProduct(p, account = 'default') {
+  const fullData = JSON.stringify(p);
+  await pool.query(
+    `INSERT INTO products(
+       id, asin, ebay_sku, ebay_item_id, title, source_url, my_price, amazon_price,
+       cost, status, quantity, has_variations, variations, image_url, category,
+       condition_id, last_synced, updated_at, data, account_id
+     ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NOW(),$18,$19)
+     ON CONFLICT(id) DO UPDATE SET
+       account_id=EXCLUDED.account_id,
+       asin=EXCLUDED.asin, ebay_sku=EXCLUDED.ebay_sku, ebay_item_id=EXCLUDED.ebay_item_id,
+       title=EXCLUDED.title, source_url=EXCLUDED.source_url, my_price=EXCLUDED.my_price,
+       amazon_price=EXCLUDED.amazon_price, cost=EXCLUDED.cost, status=EXCLUDED.status,
+       quantity=EXCLUDED.quantity, has_variations=EXCLUDED.has_variations,
+       variations=EXCLUDED.variations, image_url=EXCLUDED.image_url, category=EXCLUDED.category,
+       condition_id=EXCLUDED.condition_id, last_synced=EXCLUDED.last_synced, updated_at=NOW(),
+       data=EXCLUDED.data`,
+    [
+      p.id, p.asin,
+      p.ebaySku || p.ebay_sku,
+      p.ebayListingId || p.ebayItemId || p.ebay_item_id || null,
+      p.title,
+      p.sourceUrl || p.source_url,
+      p.myPrice || p.my_price || null,
+      p.amazonPrice || p.amazon_price || null,
+      p.cost || null,
+      p.status || 'pending',
+      p.quantity || 1,
+      p.hasVariations || p.has_variations || false,
+      p.variations ? JSON.stringify(p.variations) : null,
+      p.imageUrl || p.image_url || (p.images && p.images[0]) || null,
+      p.category || null,
+      p.conditionId || p.condition_id || 'NEW',
+      p.lastSynced || p.last_synced || null,
+      fullData,
+      account,
+    ]
+  );
+}
 
-app.post('/api/products', async (req, res) => {
-  try {
-    const product = req.body;
-    if (!product.id) return res.status(400).json({ error: 'product.id required' });
-    await db.upsertProduct(product, acctOf(req));
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+async function getProducts({ status, limit = 500, offset = 0, account = 'default' } = {}) {
+  let q = 'SELECT * FROM products WHERE account_id=$1';
+  const params = [account];
+  if (status) { q += ' AND status=$2'; params.push(status); }
+  q += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
+  params.push(limit, offset);
+  const r = await pool.query(q, params);
+  return r.rows.map(dbToProduct);
+}
 
-app.post('/api/products/bulk', async (req, res) => {
-  try {
-    const { products } = req.body;
-    if (!Array.isArray(products)) return res.status(400).json({ error: 'products array required' });
-    let saved = 0;
-    const account = acctOf(req);
-    for (const p of products) {
-      if (p.id) { await db.upsertProduct(p, account); saved++; }
-    }
-    res.json({ success: true, saved });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+async function getProduct(id, account = 'default') {
+  const r = await pool.query('SELECT * FROM products WHERE id=$1 AND account_id=$2', [id, account]);
+  return r.rows[0] ? dbToProduct(r.rows[0]) : null;
+}
 
-app.put('/api/products/:id', async (req, res) => {
-  try {
-    await db.upsertProduct({ ...req.body, id: req.params.id }, acctOf(req));
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+// FIX: explicit ::text casts on all params to avoid PostgreSQL type-inference errors
+async function updateProductSync(id, { myPrice, amazonPrice, lastSynced, status, quantity, ebayListingId }) {
+  const listingId = ebayListingId ? String(ebayListingId) : null;
+  await pool.query(
+    `UPDATE products SET
+       my_price    = $2::numeric,
+       amazon_price= $3::numeric,
+       last_synced = $4::timestamptz,
+       status      = $5::text,
+       quantity    = $6::int,
+       updated_at  = NOW(),
+       ebay_item_id = COALESCE($7::text, ebay_item_id),
+       data = CASE WHEN data IS NOT NULL THEN
+         data
+           || jsonb_build_object('myPrice',       $2::numeric)
+           || jsonb_build_object('lastSynced',     $4::text)
+           || jsonb_build_object('status',         $5::text)
+           || jsonb_build_object('quantity',       $6::int)
+           || jsonb_build_object('ebayListingId',  COALESCE($7::text, data->>'ebayListingId'))
+         ELSE data END
+     WHERE id = $1::text`,
+    [id, myPrice || 0, amazonPrice || 0, lastSynced || new Date().toISOString(),
+     status || 'listed', quantity ?? 1, listingId]
+  );
+}
 
-// ── Queue product for immediate worker sync (called by frontend Edit modal) ──
-app.post('/api/products/:id/sync', async (req, res) => {
-  try {
-    const id = req.params.id;
-    const r = await db.pool.query('SELECT data FROM products WHERE id=$1', [id]);
-    if (!r.rows.length) return res.status(404).json({ error: 'Product not found' });
-    const current = typeof r.rows[0].data === 'string' ? JSON.parse(r.rows[0].data) : r.rows[0].data;
+async function getProductsForSync(batchSize = 30) {
+  const r = await pool.query(
+    `SELECT * FROM products
+     WHERE status='listed'
+       AND source_url IS NOT NULL AND source_url != ''
+       AND (ebay_sku NOT LIKE 'DS-RECOVERED%' AND ebay_sku NOT LIKE 'DS-EXISTING%')
+     ORDER BY last_synced ASC NULLS FIRST
+     LIMIT $1`,
+    [batchSize]
+  );
+  return r.rows.map(dbToProduct);
+}
 
-    // Apply any inline edits from the modal (markup, quantity, etc.) BEFORE syncing.
-    // Drop sync_pending — we're handling it inline, not via the worker queue.
-    const merged = { ...current, ...req.body, id };
-    delete merged.sync_pending;
-    await db.upsertProduct(merged);
-
-    // Get a valid eBay token (refreshes if expired)
-    const { reviseProduct, getValidToken } = require('./worker');
-    const token = await getValidToken();
-    if (!token) {
-      return res.status(401).json({ error: 'No valid eBay token — re-authenticate in Settings' });
-    }
-
-    // Pull global settings the same way the worker does
-    const markupRaw    = await db.getSetting('markup');
-    const globalMarkup = markupRaw != null ? parseFloat(markupRaw) : 0;
-    const handlingCost = parseFloat(await db.getSetting('handlingCost') || 2);
-    const webhookUrl   = await db.getSetting('webhookUrl') || null;
-    const effMarkup    = (merged.markup != null && merged.markup >= 0) ? merged.markup : globalMarkup;
-
-    // Bypass the 6h cooldown — manual sync is an explicit user action, run NOW.
-    // Only this single call ignores the cooldown; worker-driven syncs still respect it.
-    const productForSync = { ...merged, pushedAt: null, lastSyncedAt: null, lastSynced: null };
-
-    const result = await reviseProduct(productForSync, token, effMarkup, handlingCost, webhookUrl);
-
-    if (result.status === 'ok') {
-      return res.json({
-        success: true,
-        status: result.status,
-        wentOos: result.wentOos,
-        priceChanges: result.priceChanges,
-        stockChanges: result.stockChanges,
-      });
-    }
-    const isErr = result.status === 'error' || result.status === 'revise_failed';
-    return res.status(isErr ? 500 : 200).json({
-      success: !isErr,
-      status:  result.status,
-      error:   result.error || null,
-    });
-  } catch(e) {
-    console.error('[manual-sync] error:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete('/api/products/:id', async (req, res) => {
-  try {
-    await db.pool.query('DELETE FROM products WHERE id=$1 AND account_id=$2', [req.params.id, acctOf(req)]);
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.get('/api/products/count', async (req, res) => {
-  try {
-    const { status } = req.query;
-    const count = await db.countProducts(status, acctOf(req));
-    res.json({ count });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
+async function countProducts(status, account = 'default') {
+  const q = status
+    ? 'SELECT COUNT(*) FROM products WHERE status=$1 AND account_id=$2'
+    : 'SELECT COUNT(*) FROM products WHERE account_id=$1';
+  const r = await pool.query(q, status ? [status, account] : [account]);
+  return parseInt(r.rows[0].count);
+}
 
 // ── Logs ──────────────────────────────────────────────────────────────────────
-app.get('/api/logs', async (req, res) => {
-  try {
-    const { limit = 200, offset = 0, type } = req.query;
-    const account = acctOf(req);
-    const logs = await db.getLogs({ limit: parseInt(limit), offset: parseInt(offset), type, account });
-    const total = await db.countLogs(account);
-    res.json({ logs, total });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/logs', async (req, res) => {
-  try {
-    const { type, title, detail, meta } = req.body;
-    await db.addLog(type, title, detail, meta || {}, acctOf(req));
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/logs/bulk', async (req, res) => {
-  try {
-    const { logs } = req.body;
-    if (!Array.isArray(logs)) return res.status(400).json({ error: 'logs array required' });
-    const account = acctOf(req);
-    for (const l of logs) {
-      await db.addLog(l.type, l.title, l.detail, l.meta || {}, account);
-    }
-    res.json({ success: true, saved: logs.length });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Browser relay ─────────────────────────────────────────────────────────────
-// The browser tab acts as a residential-IP fetch proxy for Amazon URLs that
-// Railway's IP gets blocked on. ebay.js fetchPage enqueues a job, the
-// browser polls /needs and claims it, fetches Amazon directly, POSTs the HTML
-// back to /submit. Heartbeat tells the server whether to use relay at all.
-
-let _relayHeartbeatTs = 0;
-
-app.post('/api/relay/heartbeat', (req, res) => {
-  _relayHeartbeatTs = Date.now();
-  res.json({ ok: true, ts: _relayHeartbeatTs });
-});
-
-// Server-side helper used by ebay.js to decide whether to use relay
-app.get('/api/relay/status', (req, res) => {
-  const ageSec = _relayHeartbeatTs ? (Date.now() - _relayHeartbeatTs) / 1000 : 999999;
-  res.json({ alive: ageSec < 60, ageSec, lastHeartbeat: _relayHeartbeatTs });
-});
-
-// Browser polls this. Returns next pending job or { empty: true }.
-app.get('/api/relay/needs', async (req, res) => {
-  try {
-    _relayHeartbeatTs = Date.now(); // polling counts as heartbeat too
-    const job = await db.claimNextRelayJob();
-    if (!job) return res.json({ empty: true });
-    res.json({ id: job.id, url: job.url, asin: job.asin });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// Browser POSTs the fetched HTML (or error)
-app.post('/api/relay/submit', async (req, res) => {
-  try {
-    const { id, html, error } = req.body;
-    if (!id) return res.status(400).json({ error: 'id required' });
-    await db.submitRelayResult(id, html, error);
-    res.json({ ok: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// Cleanup old jobs every 5 min
-setInterval(() => db.cleanupOldRelayJobs().catch(() => {}), 5 * 60 * 1000);
-
-// Expose isRelayAlive() to other modules via app.locals
-app.locals.isRelayAlive = () => (Date.now() - _relayHeartbeatTs) < 60000;
-app.locals.relayDb = db; // ebay.js will read this for enqueue/await
-
-
-app.get('/api/worker/status', async (req, res) => {
-  try {
-    const lastRun     = await db.getSetting('last_sync_run');
-    const lastSummary = await db.getSetting('last_sync_summary');
-    const listed      = await db.countProducts('listed');
-    res.json({ lastRun, lastSummary, listedProducts: listed, workerRunning: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/api/worker/run', async (req, res) => {
-  // Manual trigger
-  runForever().catch(console.error);
-  res.json({ success: true, message: 'Sync started' });
-});
-
-// Old external proxy removed — now handled by ebay.js directly below
-
-// ── eBay Orders endpoint ──────────────────────────────────────────────────────
-app.get('/api/orders', async (req, res) => {
-  try {
-    const { getValidToken } = require('./worker');
-    const token = await getValidToken();
-    if (!token) return res.status(401).json({ error: 'No valid eBay token' });
-
-    const fetch = require('node-fetch');
-    const limit = req.query.limit || 50;
-    const offset = req.query.offset || 0;
-    // Filter: last 90 days
-    const fromDate = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
-
-    const r = await fetch(
-      `https://api.ebay.com/sell/fulfillment/v1/order?limit=${limit}&offset=${offset}&filter=lastmodifieddate:[${fromDate}..]`,
-      { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
-    );
-    if (!r.ok) {
-      const err = await r.text();
-      return res.status(r.status).json({ error: err });
-    }
-    const d = await r.json();
-    res.json(d);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-
-// ── Import migration endpoint ─────────────────────────────────────────────────
-app.post('/api/migrate', async (req, res) => {
-  try {
-    const { products = [], logs = [], settings = {} } = req.body;
-    let savedProducts = 0, savedLogs = 0;
-
-    for (const p of products) {
-      if (p.id) { await db.upsertProduct(p); savedProducts++; }
-    }
-    for (const l of logs) {
-      await db.addLog(l.type||'import', l.title||'', l.detail||'', l.meta||{});
-      savedLogs++;
-    }
-    for (const [k, v] of Object.entries(settings)) {
-      if (!['token','refreshToken','accessToken'].includes(k)) {
-        await db.setSetting(k, v);
-      }
-    }
-
-    res.json({ success: true, savedProducts, savedLogs });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Backfill ebay_item_id from data blob ─────────────────────────────────────
-app.post('/api/backfill-listing-ids', async (req, res) => {
-  try {
-    const r = await db.pool.query("SELECT id, data FROM products WHERE ebay_item_id IS NULL AND data IS NOT NULL");
-    let fixed = 0;
-    for (const row of r.rows) {
-      const d = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-      const id = d?.ebayListingId || d?.ebayItemId || d?.ebay_item_id;
-      if (id) {
-        await db.pool.query('UPDATE products SET ebay_item_id=$1 WHERE id=$2', [id, row.id]);
-        fixed++;
-      }
-    }
-    res.json({ success: true, fixed, total: r.rows.length });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Amazon proxy — DISABLED (July 2026) ─────────────────────────────────────
-// BROWSER-ONLY POLICY: the server never fetches Amazon. This endpoint used
-// Railway's datacenter IP (blocked by Amazon, and every hit degraded the IP's
-// reputation further). All Amazon fetching goes through the Chrome extension
-// on the user's residential IP.
-app.get('/api/amazon', (req, res) => {
-  res.status(410).json({
-    error: 'Server-side Amazon fetching is permanently disabled (browser-only policy). Install the DropSync Amazon Bridge extension.',
-  });
-});
-
-// (original proxy implementation removed)
-
-
-// ── eBay API handler — all actions run in-process on Railway ────────────────
-const handleEbay = require('./ebay');
-app.all('/api/ebay', handleEbay);
-
-// ── AliExpress OAuth callback — AliExpress redirects sellers here after auth
-// Forwards to ebay.js handler with action=ali_callback. Separate route so the
-// callback URL is clean and registered with AliExpress exactly as required.
-app.get('/api/aliexpress/callback', (req, res, next) => {
-  req.query.action = 'ali_callback';
-  return handleEbay(req, res, next);
-});
-
-// Inject the relay handle into ebay.js so fetchPage() can route Amazon URLs
-// through the browser-fetched queue when a tab is alive. Without this wire,
-// fetchPage falls back to direct fetch behavior (current pre-relay behavior).
-if (typeof handleEbay.setRelayHandle === 'function') {
-  handleEbay.setRelayHandle({
-    isAlive: () => app.locals.isRelayAlive(),
-    db: {
-      enqueueRelayFetch: db.enqueueRelayFetch,
-      awaitRelayResult:  db.awaitRelayResult,
-    },
-  });
-  console.log('[Server] relay handle wired into ebay.js fetchPage');
+async function addLog(type, title, detail, meta = {}, account = 'default') {
+  await pool.query(
+    'INSERT INTO logs(type,title,detail,product_id,meta,account_id) VALUES($1,$2,$3,$4,$5,$6)',
+    [type, title, detail || '', meta.productId || null, JSON.stringify(meta), account]
+  );
 }
 
-// ── DAILY ALIEXPRESS SYNC ─────────────────────────────────────────────────
-// AliExpress prices change often. Run a cron daily at 03:00 UTC that:
-// 1. Pulls all listings with _source='aliexpress' from db
-// 2. Resyncs each via the AliExpress API (no scraping, no proxy)
-// 3. Updates eBay listing price/qty via bulkUpdatePriceQuantity
-// Self-contained — doesn't require the browser tab to be open.
-const cron = require('node-cron');
-let _aliSyncRunning = false;
-async function runDailyAliSync() {
-  if (_aliSyncRunning) { console.log('[ali_cron] previous run still in flight — skipping'); return; }
-  _aliSyncRunning = true;
-  console.log('[ali_cron] starting daily AliExpress sync…');
-  try {
-    // Get a valid eBay token (worker has the refresh logic)
-    let accessToken;
-    try { accessToken = await getValidToken(); }
-    catch(e) { console.warn('[ali_cron] no eBay token available — aborting:', e.message); _aliSyncRunning = false; return; }
-    // Fetch all listed products via the existing db API. Paginate to avoid OOM.
-    const aliProducts = [];
-    let offset = 0;
-    const pageSize = 500;
-    while (true) {
-      const page = await db.getProducts({ status: 'listed', limit: pageSize, offset });
-      if (!page || page.length === 0) break;
-      for (const p of page) {
-        const d = p.data || p;
-        if (d._source === 'aliexpress' && d.aliProductId && d.ebaySku) {
-          aliProducts.push(p);
-        }
-      }
-      if (page.length < pageSize) break;
-      offset += pageSize;
-    }
-    console.log(`[ali_cron] found ${aliProducts.length} AliExpress listings to sync`);
-    if (aliProducts.length === 0) { _aliSyncRunning = false; return; }
-    // Process in chunks of 25 to spread API load
-    let ok = 0, failed = 0;
-    for (let i = 0; i < aliProducts.length; i += 25) {
-      const chunk = aliProducts.slice(i, i + 25);
-      const payload = {
-        access_token: accessToken,
-        products: chunk.map(p => ({
-          ...(p.data || p),
-          ebaySku: p.data?.ebaySku || p.ebaySku,
-          ebayListingId: p.data?.ebayListingId || p.ebayListingId,
-          aliProductId: p.data?.aliProductId || p.aliProductId,
-          _source: 'aliexpress',
-        })),
-        limit: 25,
-      };
-      // Internal call rather than HTTP
-      let captured;
-      const mockReq = { method: 'POST', body: payload, query: { action: 'ali_bulk_sync' }, headers: {} };
-      const mockRes = { json: j => captured = j, status: s => ({ json: j => captured = { ...j, _status: s } }) };
-      await handleEbay(mockReq, mockRes);
-      ok += captured?.ok || 0;
-      failed += captured?.failed || 0;
-      if (captured?.errors?.length) console.log('[ali_cron] errors:', captured.errors.slice(0, 5));
-      // Pause 2s between chunks to keep AliExpress happy
-      await new Promise(r => setTimeout(r, 2000));
-    }
-    console.log(`[ali_cron] DAILY SYNC DONE: ${ok} ok, ${failed} failed of ${aliProducts.length} total`);
-  } catch(e) {
-    console.error('[ali_cron] fatal:', e.message);
-  } finally {
-    _aliSyncRunning = false;
-  }
+async function getLogs({ limit = 200, offset = 0, type, account = 'default' } = {}) {
+  let q = 'SELECT * FROM logs WHERE account_id=$1';
+  const params = [account];
+  if (type) { q += ' AND type=$2'; params.push(type); }
+  q += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
+  params.push(limit, offset);
+  const r = await pool.query(q, params);
+  return r.rows;
 }
-// Schedule: every day at 03:00 UTC (low traffic, before US morning checks)
-cron.schedule('0 3 * * *', runDailyAliSync, { timezone: 'UTC' });
-console.log('[ali_cron] daily AliExpress sync scheduled at 03:00 UTC');
-// Also expose a manual trigger endpoint: GET /api/aliexpress/sync-now
-app.get('/api/aliexpress/sync-now', async (req, res) => {
-  if (_aliSyncRunning) return res.json({ status: 'already_running' });
-  runDailyAliSync(); // fire and forget
-  res.json({ status: 'started', note: 'AliExpress daily sync started in background. Watch server logs.' });
-});
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-async function start() {
-  try {
-    await db.initDB();
-    console.log('[Server] DB initialized');
-    // VeRO / IP risk screening — audit report + do-not-relist enforcement
-    try { await vero.initVero(db.pool); vero.mountVero(app, db); }
-    catch(e) { console.warn('[vero] init failed:', e.message); }
-    // eBay My Messages scanner — auto-flags listings named in policy/VeRO notices
+async function countLogs(account = 'default') {
+  const r = await pool.query('SELECT COUNT(*) FROM logs WHERE account_id=$1', [account]);
+  return parseInt(r.rows[0].count);
+}
+
+// MULTI-ACCOUNT MIGRATION: adopt all 'default' rows into a real account.
+async function claimDefaultAccount(account) {
+  if (!account || account === 'default') throw new Error('invalid account');
+  const out = {};
+  for (const t of ['products', 'logs', 'settings', 'relay_state']) {
     try {
-      await veroInbox.initInbox(db.pool);
-      veroInbox.mountInbox(app, require('./ebay').getEbayUrls);
-      // Poll every 3h using the stored token of each account (best effort —
-      // the button in /vero-report uses your live token and is authoritative).
-      setInterval(async () => {
-        try {
-          const r = await db.pool.query(
-            `SELECT account_id, value FROM settings WHERE key = 'access_token'`);
-          for (const row of r.rows) {
-            let tok = row.value;
-            try { tok = JSON.parse(tok); } catch(e) {}
-            if (!tok || typeof tok !== 'string') continue;
-            await veroInbox.scanMessages({
-              token: tok, accountId: row.account_id,
-              tradingUrl: 'https://api.ebay.com/ws/api.dll',
-              days: 7, autoFlag: true, autoAddBrand: true,
-            }).catch(e => console.warn('[vero-inbox] poll', row.account_id, e.message));
-          }
-        } catch(e) { console.warn('[vero-inbox] poll cycle:', e.message); }
-      }, 3 * 3600 * 1000);
-    } catch(e) { console.warn('[vero-inbox] init failed:', e.message); }
-    // ── WORKER DISABLED ──────────────────────────────────────────────────────
-    // Hard kill switch — worker does not start. To re-enable, uncomment the
-    // startWorker() line below. Manual sync from the modal still works (calls
-    // the API directly), so listings can be synced one at a time on demand.
-    // startWorker();
-    console.log('[Server] ⛔ Worker is DISABLED (hard kill switch in server.js). Manual sync still works.');
-    app.listen(PORT, '0.0.0.0', () => console.log(`[Server] Running on port ${PORT}`));
-  } catch(e) {
-    console.error('[Server] Failed to start:', e.message);
-    process.exit(1);
+      const r = await pool.query(`UPDATE ${t} SET account_id=$1 WHERE account_id='default'`, [account]);
+      out[t] = r.rowCount;
+    } catch(e) { out[t] = 'err:' + e.message.slice(0, 60); }
   }
+  return out;
 }
 
-start();
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function dbToProduct(row) {
+  if (row.data) {
+    const d = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
+    return {
+      ...d,
+      status:       row.status        || d.status,
+      myPrice:      row.my_price      ? parseFloat(row.my_price)      : d.myPrice,
+      amazonPrice:  row.amazon_price  ? parseFloat(row.amazon_price)  : d.amazonPrice,
+      quantity:     row.quantity      != null ? row.quantity           : d.quantity,
+      lastSynced:   row.last_synced   || d.lastSynced,
+      ebaySku:      row.ebay_sku      || d.ebaySku,
+      ebayListingId: d.ebayListingId  || row.ebay_item_id || null,
+    };
+  }
+  return {
+    id:           row.id,
+    asin:         row.asin,
+    ebaySku:      row.ebay_sku,
+    ebayListingId: row.ebay_item_id,
+    title:        row.title,
+    sourceUrl:    row.source_url,
+    myPrice:      row.my_price      ? parseFloat(row.my_price)      : null,
+    amazonPrice:  row.amazon_price  ? parseFloat(row.amazon_price)  : null,
+    cost:         row.cost          ? parseFloat(row.cost)          : null,
+    status:       row.status,
+    quantity:     row.quantity,
+    hasVariations: row.has_variations,
+    variations:   row.variations,
+    images:       row.image_url ? [row.image_url] : [],
+    category:     row.category,
+    conditionId:  row.condition_id,
+    lastSynced:   row.last_synced,
+    createdAt:    row.created_at,
+    updatedAt:    row.updated_at,
+  };
+}
+
+// ── Relay queue ──────────────────────────────────────────────────────────────
+// Browser-relayed Amazon fetches. The push handler enqueues a URL it needs
+// fetched, then awaits a result row. A browser tab polls /api/relay/needs,
+// claims the job, fetches Amazon from its residential IP + cookies, then
+// POSTs the HTML back to /api/relay/submit which marks the job done.
+//
+// Lifecycle: pending -> claimed -> (done | failed)
+// Stale claimed jobs (> 60s old) get returned to pending so a different
+// browser session can try them.
+async function enqueueRelayFetch(url, asin) {
+  // Dedup: if there's already a pending/claimed job for the same URL within
+  // the last 60s, return that ID instead of creating a new one. Push and
+  // sync often want the same ASIN within a few seconds.
+  const existing = await pool.query(
+    `SELECT id FROM relay_queue
+     WHERE url=$1 AND status IN ('pending','claimed')
+       AND requested_at > NOW() - INTERVAL '60 seconds'
+     ORDER BY id DESC LIMIT 1`, [url]);
+  if (existing.rows[0]) return existing.rows[0].id;
+  const r = await pool.query(
+    `INSERT INTO relay_queue(url, asin, status) VALUES($1, $2, 'pending') RETURNING id`,
+    [url, asin || null]);
+  return r.rows[0].id;
+}
+
+async function claimNextRelayJob() {
+  // Atomically grab the oldest pending job and mark it claimed. Use
+  // SKIP LOCKED so multiple concurrent pollers don't get the same row.
+  // Also auto-recover stale claims (claimed > 60s ago).
+  await pool.query(
+    `UPDATE relay_queue SET status='pending', claimed_at=NULL
+     WHERE status='claimed' AND claimed_at < NOW() - INTERVAL '60 seconds'`);
+  const r = await pool.query(
+    `UPDATE relay_queue SET status='claimed', claimed_at=NOW()
+     WHERE id = (
+       SELECT id FROM relay_queue WHERE status='pending'
+       ORDER BY requested_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED
+     )
+     RETURNING id, url, asin`);
+  return r.rows[0] || null;
+}
+
+async function submitRelayResult(id, html, error) {
+  await pool.query(
+    `UPDATE relay_queue
+     SET status=$2, html=$3, error=$4, completed_at=NOW()
+     WHERE id=$1`,
+    [id, error ? 'failed' : 'done', html || null, error || null]);
+}
+
+async function getRelayJob(id) {
+  const r = await pool.query(`SELECT * FROM relay_queue WHERE id=$1`, [id]);
+  return r.rows[0] || null;
+}
+
+// Poll the queue until the job is done/failed or timeout. Returns html or null.
+// After a successful read, we immediately null out the html column so the big
+// payload doesn't sit in Postgres waiting for cleanupOldRelayJobs an hour later.
+// Big egress win: a 2MB HTML blob gets written once, read once, then dropped.
+async function awaitRelayResult(id, timeoutMs = 30000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const job = await getRelayJob(id);
+    if (!job) return null;
+    if (job.status === 'done') {
+      const html = job.html;
+      // Fire-and-forget — don't block the caller on this cleanup write
+      pool.query(`UPDATE relay_queue SET html=NULL WHERE id=$1`, [id]).catch(() => {});
+      return html;
+    }
+    if (job.status === 'failed') return null;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  return null; // timeout — caller falls back to direct fetch
+}
+
+async function cleanupOldRelayJobs() {
+  // Drop jobs older than 1 hour to keep table lean
+  await pool.query(`DELETE FROM relay_queue WHERE requested_at < NOW() - INTERVAL '1 hour'`);
+}
+
+module.exports = {
+  pool, initDB,
+  getSetting, setSetting, getAllSettings,
+  // Relay
+  enqueueRelayFetch, claimNextRelayJob, submitRelayResult,
+  awaitRelayResult, getRelayJob, cleanupOldRelayJobs,
+  upsertProduct, getProducts, getProduct, updateProductSync,
+  getProductsForSync, countProducts,
+  addLog, getLogs, countLogs,
+  claimDefaultAccount,
+};

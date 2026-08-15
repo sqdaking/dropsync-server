@@ -967,9 +967,28 @@ const VERO_STRIP = [
 // Strips: problematic HTML (tables, scripts, iframes, forms, style blocks),
 // VERO brand names, banned words (authentic, genuine, etc.). Used by push,
 // resync, smartSync inv-item PUT, and smartSync offer PUT.
-function sanitizeDescription(desc, fallback) {
+function sanitizeDescription(desc, fallback, variantCtx) {
   if (!desc) return fallback || 'Product';
   let d = desc;
+  // VARIANT-NEUTRALISATION (Aug 2026): Amazon's parent description describes
+  // ONE variant. On a multi-variant eBay listing that misdescribes every other
+  // variant ("100 Pack" copy on a listing that also sells the 1000 pack) —
+  // which is a misleading listing and an INAD/return magnet. Strip claims that
+  // conflict across variants; shared specs are preserved.
+  if (variantCtx && (variantCtx.variations || variantCtx.variantCount >= 2)) {
+    try {
+      const { neutralizeDescription } = require('./neutralize');
+      const r = neutralizeDescription(d, variantCtx);
+      if (r.changed) {
+        d = r.description;
+        if (r.removed.length) {
+          console.log(`[desc] neutralised ${r.removed.length} variant-specific claim(s): ` +
+            r.removed.slice(0, 3).map(x => '"' + x.slice(0, 60) + '"').join(', ') +
+            (r.removed.length > 3 ? '…' : ''));
+        }
+      }
+    } catch(e) { console.warn('[desc] neutralise skipped:', e.message); }
+  }
   // Strip problematic HTML elements eBay rejects in inventory item descriptions
   d = d.replace(/<table[\s\S]*?<\/table>/gi, '');
   d = d.replace(/<script[\s\S]*?<\/script>/gi, '');
@@ -4838,7 +4857,14 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
 
   // ── Sanitize description: strip garbage phrases ──────────────────────────────
   if (product.description) {
-    product.description = sanitizeDescription(product.description, product.title);
+    product.description = sanitizeDescription(product.description, product.title, {
+      variations: product.variationValues || product.variations ||
+                  (product.comboAsin ? Object.keys(product.comboAsin) : null),
+      variantCount: product.variations
+        ? (Array.isArray(product.variations) ? product.variations.length
+           : Object.keys(product.variations).length)
+        : (product.comboAsin ? Object.keys(product.comboAsin).length : 0),
+    });
   }
   if (product.bullets?.length) {
     const GARBAGE = [/image\s*(unavailable|not\s*available)/i, /select\s*your\s*preferred/i,
@@ -9513,7 +9539,11 @@ module.exports = async (req, res) => {
               // words are present, even on a routine qty PUT.
               const _prod = { ..._id.product };
               if (_prod.title) _prod.title = sanitizeTitle(_prod.title);
-              if (_prod.description) _prod.description = sanitizeDescription(_prod.description, _prod.title);
+              if (_prod.description) _prod.description = sanitizeDescription(_prod.description, _prod.title, {
+                variations: _prod.variationValues ||
+                            (_prod.comboAsin ? Object.keys(_prod.comboAsin) : null),
+                variantCount: _prod.comboAsin ? Object.keys(_prod.comboAsin).length : 0,
+              });
               const _ib = {
                 condition: _id.condition,
                 product: _prod,
