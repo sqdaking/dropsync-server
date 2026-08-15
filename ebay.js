@@ -540,6 +540,7 @@ async function _resolveEbayAccountId(accessToken, hintedId) {
 
 // ── relay_state schema — created/migrated once per boot ───────────────────────
 let _relaySchemaReady = false;
+let _dnrColumnExists = null; // null = not yet checked
 async function _ensureRelayStateSchema() {
   if (_relaySchemaReady || !_cachePool) return;
   await _cachePool.query(`
@@ -8057,6 +8058,18 @@ module.exports = async (req, res) => {
       if (!_cachePool) return res.status(500).json({ error: 'DB not ready' });
       try {
         await _ensureRelayStateSchema();
+        // The do_not_relist filter depends on vero.js having migrated the
+        // products table. If vero init failed, referencing a missing column
+        // makes the WHOLE batch query error out and every extension tick dies
+        // with an opaque failure. Detect once and degrade gracefully instead.
+        if (_dnrColumnExists === null) {
+          const c = await _cachePool.query(
+            `SELECT 1 FROM information_schema.columns
+              WHERE table_name='products' AND column_name='do_not_relist' LIMIT 1`
+          ).catch(() => ({ rows: [] }));
+          _dnrColumnExists = c.rows.length > 0;
+          if (!_dnrColumnExists) console.warn('[relay] products.do_not_relist missing — VeRO filter disabled until vero.js migrates');
+        }
         // MULTI-ACCOUNT: resolve which eBay account this token belongs to and
         // only hand out THAT account's listings. Without this, one extension
         // instance would sync another account's listings with the wrong token.
@@ -8071,8 +8084,8 @@ module.exports = async (req, res) => {
           WHERE ebay_sku IN (
             SELECT ebay_sku FROM relay_state
             WHERE account_id = $2
-              AND ebay_sku NOT IN (
-                SELECT ebay_sku FROM products WHERE do_not_relist AND ebay_sku IS NOT NULL)
+              ${_dnrColumnExists ? `AND ebay_sku NOT IN (
+                SELECT ebay_sku FROM products WHERE do_not_relist AND ebay_sku IS NOT NULL)` : ''}
               AND (cooldown_until IS NULL OR cooldown_until < NOW())
               AND (last_dispatched IS NULL OR last_dispatched < NOW() - INTERVAL '5 minutes')
               AND source_url LIKE '%amazon%'
@@ -8118,7 +8131,7 @@ module.exports = async (req, res) => {
         });
       } catch(e) {
         console.error('[relay_next_batch] error:', e.message);
-        return res.status(500).json({ error: e.message });
+        return res.status(500).json({ error: `relay_next_batch: ${e.message}` });
       }
     }
 
