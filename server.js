@@ -8,6 +8,7 @@ const cors = require('cors');
 const db = require('./db');
 const vero = require('./vero');
 const veroInbox = require('./vero-inbox');
+const descRefresh = require('./descrefresh');
 const { startWorker, runForever, getValidToken } = require('./worker');
 
 const app = express();
@@ -572,6 +573,11 @@ async function start() {
         } catch(e) { console.warn('[vero-inbox] poll cycle:', e.message); }
       }, 3 * 3600 * 1000);
     } catch(e) { console.warn('[vero-inbox] init failed:', e.message); }
+    // In-place description refresh (variant-neutral copy, no relisting)
+    try {
+      descRefresh.initDescRefresh(db.pool);
+      descRefresh.mountDescRefresh(app, require('./ebay').getEbayUrls);
+    } catch(e) { console.warn('[desc] init failed:', e.message); }
     // ── WORKER DISABLED ──────────────────────────────────────────────────────
     // Hard kill switch — worker does not start. To re-enable, uncomment the
     // startWorker() line below. Manual sync from the modal still works (calls
