@@ -1,3 +1,7 @@
+// Log capture must load FIRST so it captures output from every later require.
+const logtail = require('./logtail');
+logtail.install();
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -7,6 +11,7 @@ const veroInbox = require('./vero-inbox');
 const { startWorker, runForever, getValidToken } = require('./worker');
 
 const app = express();
+logtail.mountLogTail(app);
 
 // Explicit CORS — allow all origins for every request including preflight
 const corsOptions = {
