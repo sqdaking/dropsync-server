@@ -656,7 +656,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-07-21.4 (map-repair)');
+console.log('[dropsync] build 2026-07-21.5 (map-repair + priority refetch)');
 
 // Force a listing (or all listings) to rebuild its variant maps from scratch.
 // Use when a listing keeps re-publishing the same wrong price: the stored
@@ -1276,6 +1276,15 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   // fetches in one shot (the #1 cause of blocks).
   let toFetch = uniqueAsins.filter(a => !result[a]);
   const _opts = (typeof _rotOpts === 'object' && _rotOpts) || {};
+  // Priority ASINs jump the rotation queue — their variants are unbuyable
+  // (qty=0) until they get a price, so waiting for the rotation costs sales.
+  if (Array.isArray(_opts.priority) && _opts.priority.length) {
+    const pr = _opts.priority.filter(a => toFetch.includes(a));
+    if (pr.length) {
+      toFetch = [...pr, ...toFetch.filter(a => !pr.includes(a))];
+      console.log(`[prefetchAsin] ${pr.length} priority ASINs moved to front (corrected mappings awaiting price)`);
+    }
+  }
   if (_opts.maxFetch > 0 && toFetch.length > _opts.maxFetch) {
     const off = Math.max(0, parseInt(_opts.offset) || 0) % toFetch.length;
     toFetch = toFetch.slice(off, off + _opts.maxFetch)
@@ -7736,7 +7745,7 @@ async function smartSyncProduct(p) {
           if (dimM) _freshDims = JSON.parse(dimM[1]);
           if (_freshDta) console.log(`[smartSync] fresh dta: ${Object.keys(_freshDta).length} combos, dims=[${(_freshDims||[]).join(',')}]`);
         } catch(_me) {}
-        _clientAsinData = await prefetchAsinPrices(parentHtml, { maxFetch: 15, offset: p._asinOffset || 0 });
+        _clientAsinData = await prefetchAsinPrices(parentHtml, { maxFetch: 15, offset: p._asinOffset || 0, priority: p._priorityAsins });
         const _n = Object.keys(_clientAsinData || {}).length;
         if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
         else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices extracted`);
@@ -7810,6 +7819,10 @@ async function smartSyncProduct(p) {
     if (d.offerIdsBySku && Object.keys(d.offerIdsBySku).length > 0) {
       p.offerIdCache = d.offerIdsBySku; p.offerIdCacheAt = Date.now();
     }
+    // ASINs whose variants are sitting at qty=0 waiting for a price (mapping
+    // was corrected). Fetch these FIRST next cycle so they go buyable again.
+    p._priorityAsins = (d.priorityAsins && d.priorityAsins.length) ? d.priorityAsins : undefined;
+    if (d.correctedCount) console.log(`[smartSync] ${d.correctedCount} mappings corrected on ${p.ebaySku} — ${(d.priorityAsins||[]).length} ASINs queued for priority refetch`);
     // Save next ASIN offset for progressive slicing (large products)
     p._asinOffset = d.nextAsinOffset || 0;
     if (d.nextAsinOffset > 0) console.log(`[smartSync] ${p.ebaySku?.slice(-10)} → next cycle: ASINs from offset ${d.nextAsinOffset}/${d.totalAsins}`);

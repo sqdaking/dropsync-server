@@ -538,6 +538,60 @@ async function _resolveEbayAccountId(accessToken, hintedId) {
 }
 // (exposed on module.exports at bottom of file)
 
+// ── SERVER-SIDE TOKEN REFRESH (Aug 2026) ─────────────────────────────────────
+// eBay access tokens last ~2h. The extension is handed a token once and never
+// refreshes it, so background syncs started failing with 401 partway through —
+// worst case PHASE 1 zeroed a listing and PHASE 2 got 401, leaving every
+// variant unbuyable. The server holds refresh_token per account in settings,
+// so it can mint a fresh access token itself and keep going.
+const _tokCache = new Map(); // accountId → { token, exp }
+async function _refreshAccessTokenFor(accountId) {
+  if (!_cachePool || !accountId) return null;
+  const hit = _tokCache.get(accountId);
+  if (hit && Date.now() < hit.exp - 60000) return hit.token;
+  try {
+    const r = await _cachePool.query(
+      `SELECT value FROM settings WHERE key='refresh_token' AND account_id=$1`, [accountId]);
+    let rt = r.rows[0]?.value;
+    if (!rt) return null;
+    try { rt = JSON.parse(rt); } catch(e) {}
+    if (typeof rt !== 'string' || rt.length < 20) return null;
+    const E = getEbayUrls();
+    const creds = Buffer.from(`${E.CLIENT_ID}:${E.CLIENT_SECRET}`).toString('base64');
+    const tr = await fetch(E.EBAY_TOK, {
+      method: 'POST',
+      headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(rt)}&scope=${encodeURIComponent(SCOPES)}`,
+    });
+    const d = await tr.json().catch(() => ({}));
+    if (!d.access_token) {
+      console.warn(`[auth] refresh failed for ${accountId}: ${JSON.stringify(d).slice(0,160)}`);
+      return null;
+    }
+    const exp = Date.now() + ((d.expires_in || 7200) - 120) * 1000;
+    _tokCache.set(accountId, { token: d.access_token, exp });
+    await _cachePool.query(
+      `INSERT INTO settings(account_id,key,value,updated_at) VALUES($1,'access_token',$2,NOW())
+       ON CONFLICT(account_id,key) DO UPDATE SET value=$2, updated_at=NOW()`,
+      [accountId, JSON.stringify(d.access_token)]).catch(() => {});
+    console.log(`[auth] refreshed access token for ${accountId}`);
+    return d.access_token;
+  } catch(e) {
+    console.warn('[auth] refresh error:', e.message);
+    return null;
+  }
+}
+
+// Is this token still usable? One cheap authenticated call.
+async function _tokenIsValid(token) {
+  try {
+    const r = await fetch(`${getEbayUrls().EBAY_API}/sell/account/v1/privilege`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return r.status !== 401;
+  } catch(e) { return true; } // network blip — don't block the sync
+}
+
 // ── relay_state schema — created/migrated once per boot ───────────────────────
 let _relaySchemaReady = false;
 let _dnrColumnExists = null; // null = not yet checked
@@ -9330,6 +9384,28 @@ module.exports = async (req, res) => {
       // COST: two bulk passes instead of one (~2 extra API calls per 25
       // variants) and a brief window where the listing is unbuyable. Set
       // TWO_PHASE_SYNC=off to fall back to single-pass.
+      // ── AUTH PRE-FLIGHT ───────────────────────────────────────────────────
+      // PHASE 1 zeroes the listing. If the token dies between phase 1 and
+      // phase 2, every variant is left unbuyable — a token expiry becomes an
+      // outage. So verify (and if needed refresh) BEFORE writing anything, and
+      // abort untouched if we can't get a working token.
+      let _tok = access_token;
+      if (updates.length > 0) {
+        if (!(await _tokenIsValid(_tok))) {
+          const _acct = body.accountId || await _resolveEbayAccountId(_tok).catch(() => null);
+          const fresh = _acct ? await _refreshAccessTokenFor(_acct) : null;
+          if (fresh && await _tokenIsValid(fresh)) {
+            _tok = fresh;
+            auth.Authorization = `Bearer ${fresh}`;
+            console.log(`[smartSync] token had expired — refreshed and continuing`);
+          } else {
+            console.error(`[smartSync] ${ebaySku}: token expired and refresh failed — ABORTING before any write (listing untouched)`);
+            return res.json({ success: false, authExpired: true,
+              error: 'eBay token expired and could not be refreshed. Reconnect eBay in DropSync settings.' });
+          }
+        }
+      }
+
       const _twoPhase = (process.env.TWO_PHASE_SYNC || 'on').toLowerCase() !== 'off';
       let okCount = 0, failCount = 0;
       const _failReasons = { get429: 0, get4xx: 0, get5xx: 0, getNet: 0,
@@ -9669,6 +9745,71 @@ module.exports = async (req, res) => {
           if (_cheapMax > 0 && _curPrice > 0 && _curPrice <= _cheapMax) return true;
           return false;
         });
+        // ── DELETION GATE (Aug 2026) ──────────────────────────────────────────
+        // Deleting a variant is IRREVERSIBLE without a full re-push, but the
+        // conditions that put a SKU on this list are transient: one failed
+        // match, one partial variant map, one blocked Amazon page. The logs
+        // showed 13 healthy variants (NAVY_LARGE, BLACK_LARGE …) queued for
+        // deletion purely because reconstruction missed them that cycle — and
+        // only eBay's error 25604 stopped the listing being gutted.
+        //
+        // Zeroing already makes a bad variant unsellable and is reversible, so
+        // deletion now requires the SAME variant to fail on 3 SEPARATE syncs
+        // spanning 24h+, and is opt-in via AUTO_DELETE_VARIANTS=on.
+        const _autoDelete = (process.env.AUTO_DELETE_VARIANTS || 'off').toLowerCase() === 'on';
+        const _STRIKES_NEEDED = parseInt(process.env.DELETE_STRIKES) || 3;
+        let _toDeleteFinal = [];
+        if (_toDelete.length && _cachePool) {
+          try {
+            await _cachePool.query(`
+              CREATE TABLE IF NOT EXISTS variant_strikes (
+                group_sku TEXT NOT NULL,
+                variant_sku TEXT NOT NULL,
+                strikes INTEGER NOT NULL DEFAULT 1,
+                first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (group_sku, variant_sku)
+              );`).catch(() => {});
+            // Clear strikes for anything healthy again this cycle
+            const _healthy = _allGroupSkus.filter(s => !_toDelete.includes(s));
+            if (_healthy.length) {
+              await _cachePool.query(
+                `DELETE FROM variant_strikes WHERE group_sku = $1 AND variant_sku = ANY($2)`,
+                [normSku, _healthy]).catch(() => {});
+            }
+            // Count a strike — but only once per hour, so rapid re-syncs of the
+            // same listing can't stack three strikes in three minutes.
+            const _sr = await _cachePool.query(`
+              INSERT INTO variant_strikes (group_sku, variant_sku)
+              SELECT $1, x FROM unnest($2::text[]) AS x
+              ON CONFLICT (group_sku, variant_sku) DO UPDATE
+                SET strikes = CASE WHEN variant_strikes.last_seen < NOW() - INTERVAL '1 hour'
+                                   THEN variant_strikes.strikes + 1 ELSE variant_strikes.strikes END,
+                    last_seen = NOW()
+              RETURNING variant_sku, strikes, first_seen`,
+              [normSku, _toDelete]);
+            const _ready = _sr.rows.filter(r =>
+              r.strikes >= _STRIKES_NEEDED &&
+              (Date.now() - new Date(r.first_seen).getTime()) > 24 * 3600 * 1000);
+            _toDeleteFinal = _autoDelete ? _ready.map(r => r.variant_sku) : [];
+            const _pending = _sr.rows.filter(r => !_ready.includes(r));
+            console.log(`[smartSync] cleanup: ${_toDelete.length} candidate(s) — ` +
+              `${_ready.length} at ${_STRIKES_NEEDED}+ strikes over 24h, ${_pending.length} still accruing` +
+              (_autoDelete ? '' : ' — AUTO_DELETE_VARIANTS=off, zeroed only (nothing deleted)'));
+          } catch(e) {
+            console.warn('[smartSync] cleanup: strike tracking failed, skipping deletion:', e.message);
+            _toDeleteFinal = [];
+          }
+        }
+        // NEVER shrink a multi-variant listing to a single SKU — eBay rejects
+        // it (error 25604) and it would wreck the listing if it succeeded.
+        if (_toDeleteFinal.length && _allGroupSkus.length - _toDeleteFinal.length < 2) {
+          console.warn(`[smartSync] cleanup: refusing to delete ${_toDeleteFinal.length}/${_allGroupSkus.length} — would leave <2 variants`);
+          _toDeleteFinal = [];
+        }
+        _toDelete.length = 0;
+        _toDelete.push(..._toDeleteFinal);
+
         if (_toDelete.length === 0) {
           console.log(`[smartSync] cleanup: nothing to delete (group has ${_allGroupSkus.length} SKUs, all valid)`);
         } else {

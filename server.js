@@ -100,8 +100,22 @@ app.get('/api/settings', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/settings', async (req, res) => {
+// Single-key read. The UI calls GET /api/settings/worker_paused on load; only
+// the all-keys route existed, so every page load logged a 404 in the console.
+// Returns 200 with value:null for unknown keys — absence is a valid answer,
+// not an error, and the UI treats a failed response as "unknown" anyway.
+app.get('/api/settings/:key', async (req, res) => {
   try {
+    const key = String(req.params.key || '');
+    if (!/^[\w.\-]{1,64}$/.test(key)) return res.status(400).json({ error: 'bad key' });
+    // Never hand out credentials through this route.
+    if (/token|secret|password/i.test(key)) return res.status(403).json({ error: 'not readable' });
+    const value = await db.getSetting(key, acctOf(req));
+    res.json({ key, value: value === undefined ? null : value });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/settings', async (req, res) => {  try {
     const { key, value } = req.body;
     if (!key) return res.status(400).json({ error: 'key required' });
     await db.setSetting(key, value, acctOf(req));
