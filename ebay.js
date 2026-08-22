@@ -4481,6 +4481,15 @@ async function handleRevise(body, res) {
         price:             { value: priceToSend.toFixed(2), currency: 'USD' },
       });
 
+      // Flag big jumps — usually a variant that went stale while Amazon moved.
+      if (newEbayPrice && offer.currentPrice > 0) {
+        const _delta = (newEbayPrice - offer.currentPrice) / offer.currentPrice;
+        if (Math.abs(_delta) > 0.15) {
+          console.log(`[smartSync] ${sku.slice(-20)} price moved ${(_delta*100).toFixed(0)}%: ` +
+            `$${offer.currentPrice.toFixed(2)} → $${newEbayPrice.toFixed(2)} (amazon $${amazonPrice}) ` +
+            `— was likely stale since the last successful fetch of ${asin}`);
+        }
+      }
       if (newEbayPrice && Math.abs(newEbayPrice - offer.price) >= 0.01)
         priceChanges.push(`${asin}: $${offer.price}→$${newEbayPrice.toFixed(2)}`);
       if (newQty !== offer.qty)
@@ -8424,7 +8433,13 @@ module.exports = async (req, res) => {
         return Math.ceil(((c + handling) * (1 + markupPct / 100) / (1 - 0.1335) + 0.30) * 100) / 100;
       };
       const normSku = ebaySku.trim().replace(/\s+/g, '');
+      // Log the PRICING INPUTS actually in effect. Without this, a wrong price
+      // is unattributable: you can't tell a bad markup setting from a stale
+      // Amazon price, because both produce "an eBay price that looks wrong".
       console.log(`[smartSync] ${normSku} — ${sourceUrl}`);
+      console.log(`[smartSync] pricing inputs: markup=${markupPct}% handling=$${handling} fee=13.35% qty=${defaultQty}` +
+        ` (source: ${mkRaw != null ? 'request' : 'DEFAULT 23'}/${handRaw != null ? 'request' : 'DEFAULT 2'})` +
+        ` — e.g. $10.00 → $${applyMk(10).toFixed(2)}`);
 
       // ── STEP 1: Determine ASIN list ────────────────────────────────────────
       // With mini-endpoint fetching, we don't need to scrape the parent page
