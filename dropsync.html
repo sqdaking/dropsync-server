@@ -539,9 +539,9 @@ async function _registerListingsForRelay() {
       // Per-listing settings — background syncs use YOUR markup/handling/qty,
       // not hardcoded server defaults (23%/$2/1 was silently mispricing
       // everything the extension synced).
-      markup:       p.markup != null ? p.markup : (S.markup ?? 23),
-      handlingCost: S.handlingCost ?? 2,
-      quantity:     p.quantity || S.quantity || 1,
+      markup:       amzMarkup(p),
+      handlingCost: amzHandling(p),
+      quantity:     amzQty(p),
       // Cached offer IDs — lets the server skip the entire eBay offer
       // discovery chain on background syncs.
       offerIds:     p.offerIdCache || null,
@@ -656,7 +656,72 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-22.2 (relay singleton + cooldown-aware)');
+console.log('[dropsync] build 2026-08-22.3 (global markup authoritative)');
+
+// ── AMAZON PRICING RESOLUTION (Aug 2026) ─────────────────────────────────────
+// Previously every sync used `p.markup != null ? p.markup : S.markup`, so the
+// markup captured at IMPORT time won permanently. Changing Amazon Settings
+// then did nothing to existing listings — you could set 35% and have the whole
+// catalogue keep repricing at 23% with no indication anything was ignored.
+//
+// Now the Settings value is AUTHORITATIVE and applies the moment you save it.
+// A listing only keeps its own markup if you explicitly locked it
+// (p.markupLocked === true), so deliberate per-listing pricing still survives.
+function amzMarkup(p) {
+  if (p && p.markupLocked === true && p.markup != null) return parseFloat(p.markup);
+  return parseFloat(S.markup ?? 23);
+}
+function amzHandling(p) {
+  if (p && p.markupLocked === true && p.handlingCost != null) return parseFloat(p.handlingCost);
+  return parseFloat(S.handlingCost ?? 2);
+}
+function amzQty(p) {
+  if (p && p.markupLocked === true && p.quantity != null) return parseInt(p.quantity);
+  return parseInt(S.quantity ?? p?.quantity ?? 1);
+}
+window.amzMarkup = amzMarkup; window.amzHandling = amzHandling; window.amzQty = amzQty;
+
+// Console helpers for per-listing markup locks.
+//   pricingReport()          — what markup each listing will actually use
+//   lockMarkup(sku, 45)      — pin this listing to 45%, ignoring global changes
+//   unlockMarkup(sku)        — back to following Amazon Settings
+//   unlockAllMarkups()       — clear every lock
+function pricingReport() {
+  const listed = (S.products||[]).filter(p => p.status === 'listed');
+  const locked = listed.filter(p => p.markupLocked === true);
+  console.log(`Amazon Settings: ${S.markup}% + $${S.handlingCost}, qty ${S.quantity}`);
+  console.log(`${listed.length - locked.length} listings follow Settings · ${locked.length} locked`);
+  if (locked.length) console.table(locked.slice(0, 50).map(p => ({
+    sku: p.ebaySku, markup: p.markup + '%', handling: '$' + (p.handlingCost ?? S.handlingCost),
+    title: (p.title||'').slice(0, 40) })));
+  return { following: listed.length - locked.length, locked: locked.length };
+}
+function lockMarkup(ebaySku, markup, handling) {
+  const p = (S.products||[]).find(x => normaliseGroupSku(x.ebaySku) === normaliseGroupSku(ebaySku));
+  if (!p) { console.warn('no listing with sku', ebaySku); return; }
+  p.markupLocked = true;
+  if (markup   != null) p.markup       = parseFloat(markup);
+  if (handling != null) p.handlingCost = parseFloat(handling);
+  markDirty(p.id); save();
+  _lastRelayRegister = 0; _registerListingsForRelay().catch(()=>{});
+  console.log(`locked ${p.ebaySku} at ${p.markup}%${handling!=null?' + $'+p.handlingCost:''}`);
+}
+function unlockMarkup(ebaySku) {
+  const p = (S.products||[]).find(x => normaliseGroupSku(x.ebaySku) === normaliseGroupSku(ebaySku));
+  if (!p) { console.warn('no listing with sku', ebaySku); return; }
+  p.markupLocked = false; markDirty(p.id); save();
+  _lastRelayRegister = 0; _registerListingsForRelay().catch(()=>{});
+  console.log(`${p.ebaySku} now follows Amazon Settings (${S.markup}%)`);
+}
+function unlockAllMarkups() {
+  let n = 0;
+  for (const p of (S.products||[])) if (p.markupLocked) { p.markupLocked = false; markDirty(p.id); n++; }
+  save(); _lastRelayRegister = 0; _registerListingsForRelay().catch(()=>{});
+  console.log(`${n} listings unlocked — all now follow Amazon Settings`);
+  return n;
+}
+window.pricingReport = pricingReport; window.lockMarkup = lockMarkup;
+window.unlockMarkup = unlockMarkup; window.unlockAllMarkups = unlockAllMarkups;
 
 // Force a listing (or all listings) to rebuild its variant maps from scratch.
 // Use when a listing keeps re-publishing the same wrong price: the stored
@@ -5860,7 +5925,7 @@ async function syncOne(pid) {
       skuToAsin:       p.skuToAsin  || null,
       ebayListingId:   p.ebayListingId || '',
       fallbackTitle:   p.ebayTitle || p.title || '',
-      markup:          p.markup != null ? p.markup : (S.markup || 23),
+      markup:          amzMarkup(p),
       handlingCost:    S.handlingCost || 2,
       quantity:        p.quantity || S.quantity || 1,
       cachedOfferIds:  _cachedOfferIds,
@@ -7838,9 +7903,9 @@ async function smartSyncProduct(p) {
         ebaySku:         normaliseGroupSku(p.ebaySku),
         ebayListingId:   p.ebayListingId || '',
         sourceUrl:       p.sourceUrl,
-        markup:          p.markup != null ? p.markup : (S.markup || 23),
-        handlingCost:    S.handlingCost || 2,
-        quantity:        S.quantity || p.quantity || 1,
+        markup:          amzMarkup(p),
+        handlingCost:    amzHandling(p),
+        quantity:        amzQty(p),
         // Browser-prefetched ASIN data — server skips its own fetching when this is provided
         clientAsinData:           _clientAsinData,
         // Fresh variant maps from the parent page — enables exact per-SKU ASIN matching
@@ -9010,10 +9075,27 @@ async function savePricingDefaults() {
   const handlingVal = parseFloat($('def-handling')?.value);
   const qtyVal      = parseInt($('def-qty')?.value);
   if (isNaN(markupVal) || markupVal < 0) { toast('Markup must be a valid number (e.g. 23 for 23%)', 'error'); return; }
+  const _prevMk = S.markup, _prevH = S.handlingCost;
   S.markup      = markupVal;
   S.handlingCost = isNaN(handlingVal) ? 2 : handlingVal;
   S.quantity     = isNaN(qtyVal) ? 1 : qtyVal;
   save();
+
+  // Background (extension) syncs read markup from relay_state, which is only
+  // refreshed every 10 minutes. Without forcing a re-register, a settings
+  // change wouldn't reach background syncs until that window elapsed — so the
+  // catalogue would keep repricing at the OLD markup with no sign of it.
+  if (_prevMk !== S.markup || _prevH !== S.handlingCost) {
+    _lastRelayRegister = 0;
+    try {
+      await _registerListingsForRelay();
+      console.log(`[pricing] markup ${_prevMk}% → ${S.markup}%, handling $${_prevH} → $${S.handlingCost} — re-registered listings for background sync`);
+    } catch(e) { console.warn('[pricing] re-register failed:', e.message); }
+    const _locked = (S.products||[]).filter(p => p.markupLocked === true).length;
+    if (_locked > 0) {
+      toast(`New pricing applies to all listings except ${_locked} with a locked per-listing markup`, 'info', 6000);
+    }
+  }
 
   // Push to Railway DB so the background worker uses the same values
   if (S.serverUrl) {
