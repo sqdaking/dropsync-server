@@ -656,7 +656,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-22.1 (browser-fetch rescrape)');
+console.log('[dropsync] build 2026-08-22.2 (relay singleton + cooldown-aware)');
 
 // Force a listing (or all listings) to rebuild its variant maps from scratch.
 // Use when a listing keeps re-publishing the same wrong price: the stored
@@ -1081,7 +1081,17 @@ async function fetchAmazonInBrowser(url) {
       }
       console.warn(`[browserFetch] extension returned empty/small (len=${html?.length||0}) — trying proxies`);
     } catch(e) {
-      console.warn('[browserFetch] extension failed:', e.message, '— trying proxies');
+      // A cooldown is NOT a failure to route around — it's the extension
+      // deliberately pausing after Amazon blocks. Churning through listings
+      // during it wastes rotation slots and marks good listings as skipped,
+      // so flag it and let the relay sleep instead.
+      if (/cooldown/i.test(e.message || '')) {
+        const err = new Error('extension cooldown');
+        err.cooldown = true;
+        console.warn('[browserFetch] extension in cooldown — pausing relay rather than skipping listings');
+        throw err;
+      }
+      console.warn('[browserFetch] extension failed:', e.message);
     }
   }
 
@@ -2504,6 +2514,25 @@ async function bulkFetchDeals(dept) {
   // Always use the currently selected dept from global if not explicitly passed
   dept = dept || window.BULK_SELECTED_DEPT || 'all';
   console.log('[bulk] fetching dept:', dept);
+  // SHARED-BUDGET GUARD (Aug 2026): deal scraping and the sync relay both hit
+  // Amazon through the SAME extension budget. Running them together doubles
+  // the request rate and is what pushed the extension into block cooldown —
+  // which then stalled syncing entirely. Syncing your live listings matters
+  // more than sourcing new ones, so deal fetching waits.
+  if (_relayActive || _relayTimer) {
+    const msg = 'Sync relay is running — pause it in Settings before fetching deals (both share the same Amazon request budget).';
+    console.warn('[bulk] blocked:', msg);
+    toast(msg, 'warn', 7000);
+    return;
+  }
+  try {
+    const _st = await window.dsExt?.getStatus?.();
+    if (_st?.cooldownUntil && _st.cooldownUntil > Date.now()) {
+      const secs = Math.ceil((_st.cooldownUntil - Date.now()) / 1000);
+      toast(`Amazon cooldown active — wait ${secs}s before fetching deals`, 'warn', 6000);
+      return;
+    }
+  } catch(e) {}
   if (!S.serverUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
   // Ensure BULK is initialized before checking scraping state
   if (!window.BULK) { bulkLoadState?.(); }
@@ -5463,14 +5492,23 @@ function _stopRelayBackground() {
   }
 }
 
+let _relayActive = false;   // set SYNCHRONOUSLY — see below
 async function startBrowserRelay() {
-  if (_relayTimer) return; // already running
+  // _relayTimer is only assigned at the END of a tick, so during the first
+  // (long) tick it stays null and every auto-start call launched ANOTHER
+  // concurrent relay. The console showed 4+ "Auto-starting" lines and the
+  // duplicate loops multiplied the Amazon request rate until the extension
+  // hit its block cooldown. This flag is set before any await, so it actually
+  // guards.
+  if (_relayActive || _relayTimer) return;
+  _relayActive = true;
   console.log('[relay] revise rotation started (extension handles Amazon fetches)');
   _renderRelayStatus();
   _relayTick();
 }
 
 function stopBrowserRelay() {
+  _relayActive = false;
   if (_relayTimer) { clearTimeout(_relayTimer); _relayTimer = null; }
   _stopRelayBackground();
   _relayRunning = false;
@@ -7777,9 +7815,14 @@ async function smartSyncProduct(p) {
         if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
         else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices extracted`);
       } else {
-        console.warn(`[smartSync] ${p.ebaySku}: browser fetch failed (all proxies blocked) — skipping cycle`);
+        console.warn(`[smartSync] ${p.ebaySku}: browser fetch returned nothing — skipping cycle`);
       }
-    } catch(_pe) { console.warn(`[smartSync] prefetch failed:`, _pe.message); }
+    } catch(_pe) {
+      // Cooldown must not be swallowed as a generic prefetch failure — the
+      // relay needs to know to sleep instead of burning the next rotation slot.
+      if (_pe && _pe.cooldown) return { skipped: true, cooldown: true, reason: 'extension cooldown' };
+      console.warn(`[smartSync] prefetch failed:`, _pe.message);
+    }
     // BROWSER-ONLY: if no client data, skip this cycle. Server is configured to
     // refuse Amazon fetches without browser data anyway, so don't waste a request.
     if (!_clientAsinData || Object.keys(_clientAsinData).length === 0) {
