@@ -656,7 +656,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-07-21.5 (map-repair + priority refetch)');
+console.log('[dropsync] build 2026-08-22.1 (browser-fetch rescrape)');
 
 // Force a listing (or all listings) to rebuild its variant maps from scratch.
 // Use when a listing keeps re-publishing the same wrong price: the stored
@@ -4657,9 +4657,27 @@ async function rescrapeAllDrafts() {
     if (stopped) break;
     if (btn) btn.innerHTML = `⏹ Stop  ${done}/${drafts.length}`;
     try {
+      // BROWSER-FIRST (Aug 2026): this loop used to send only the URL, so the
+      // SERVER fetched Amazon from Railway's datacenter IP — blocked every
+      // time ("bot detection" on every ASIN). Fetch through the extension on
+      // the residential IP and hand the HTML to the server, exactly like the
+      // sync path does.
+      let _html = null;
+      try { _html = await fetchAmazonInBrowser(p.sourceUrl); } catch(e) {}
+      if (!_html) {
+        // No HTML means the extension is missing or Amazon blocked us. Sending
+        // the bare URL would just make the server retry from a blocked IP, so
+        // skip and back off instead of burning the request.
+        errors++;
+        console.warn(`[rescrape] ${p.sourceUrl.match(/\/dp\/([A-Z0-9]{10})/)?.[1] || p.sourceUrl}: no browser HTML — skipping (extension missing or Amazon cooldown)`);
+        await new Promise(r2 => setTimeout(r2, 4000 + Math.random() * 4000));
+        continue;
+      }
+      let _cad = null;
+      try { _cad = await prefetchAsinPrices(_html, { maxFetch: 15, offset: 0 }); } catch(e) {}
       const r = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ url: p.sourceUrl }),
+        body: JSON.stringify({ url: p.sourceUrl, pageHtml: _html, clientAsinData: _cad }),
       });
       const sd = await r.json().catch(()=>({}));
       const scraped = sd.product || sd;
@@ -4686,7 +4704,10 @@ async function rescrapeAllDrafts() {
 
     // Save every 5 to avoid losing progress
     if (done % 5 === 0) save();
-    await new Promise(r => setTimeout(r, 500)); // 500ms between scrapes
+    // Human-shaped pacing. 500ms back-to-back was itself a bot signal; each
+    // rescrape also triggers up to 15 variant fetches, so the real request
+    // rate was far higher than one every 500ms.
+    await new Promise(r => setTimeout(r, 2500 + Math.random() * 2500));
   }
 
   save(); renderDrafts();
@@ -4708,9 +4729,13 @@ async function draftEditScrape(pid) {
   const statusEl = document.getElementById('de-scrape-status');
   if (statusEl) { statusEl.textContent = '⏳ Scraping Amazon…'; statusEl.style.color = 'var(--text3)'; }
   try {
+    // Browser-fetch first — a URL-only scrape makes the SERVER hit Amazon from
+    // Railway's datacenter IP, which is blocked every time.
+    let _h = null;
+    try { _h = await fetchAmazonInBrowser(p.sourceUrl); } catch(e) {}
     const r = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ url: p.sourceUrl }),
+      body: JSON.stringify({ url: p.sourceUrl, pageHtml: _h || undefined }),
     });
     // Guard against non-JSON responses (server errors return HTML)
     const contentType = r.headers.get('content-type') || '';
@@ -5652,9 +5677,11 @@ async function pushAll() {
       let productToPost = { ...p };
       if (!productToPost.images?.length && productToPost.sourceUrl) {
         try {
+          let _bh = null;
+          try { _bh = await fetchAmazonInBrowser(productToPost.sourceUrl); } catch(e) {}
           const sr = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url: productToPost.sourceUrl })
+            body: JSON.stringify({ url: productToPost.sourceUrl, pageHtml: _bh || undefined })
           });
           const sd = await safeJson(sr);
           const scraped = sd.product || sd;
@@ -9901,9 +9928,13 @@ async function backfillParentAsins() {
       // Cheap path: if comboAsin exists and the product's own asin is in it, the
       // scraped parentAsin is whatever Amazon's URL tree says — but we still
       // need a real lookup to know the parent. So we always re-scrape.
+      let _ph = null;
+      try { _ph = await fetchAmazonInBrowser(p.sourceUrl); } catch(e) {}
+      if (!_ph) { /* blocked or no extension — skip rather than retry from a blocked IP */
+        await new Promise(r2 => setTimeout(r2, 4000 + Math.random() * 4000)); continue; }
       const r = await fetch(`${S.serverUrl}/api/ebay?action=scrape`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ url: p.sourceUrl, lightweight: true }),
+        body: JSON.stringify({ url: p.sourceUrl, lightweight: true, pageHtml: _ph }),
       });
       const d = await safeJson(r);
       if (d.success && d.product?.parentAsin) {
