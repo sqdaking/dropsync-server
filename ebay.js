@@ -7321,7 +7321,17 @@ module.exports = async (req, res) => {
       try {
         const product = await scrapeAmazonProduct(url, clientHtml, clientAsinData, primeOnly, true);
         if (!product || !product.title) {
-          return res.json({ success: false, error: 'Amazon blocked the request (bot detection). Wait 30 seconds and try again, or paste the URL directly.' });
+          // Distinguish the two very different causes. Without browser HTML the
+          // server had to fetch from Railway's datacenter IP, which Amazon
+          // blocks 100% of the time — that's a caller bug, not a cooldown, and
+          // telling the user to "wait 30 seconds" sends them down a dead end.
+          if (!clientHtml) {
+            console.warn(`[scrape] ${url}: no browser HTML supplied — server-side fetch from datacenter IP always fails`);
+            return res.json({ success: false, needsBrowserFetch: true,
+              error: 'No page data from the browser. The DropSync Amazon Bridge extension must be installed and the DropSync tab open — the server cannot fetch Amazon directly.' });
+          }
+          return res.json({ success: false,
+            error: 'Amazon returned a block page for this request. Wait ~30 seconds and retry, or open the URL in a tab first.' });
         }
         // Build colorAsinMap for worker
         const colorAsinMap = {};
@@ -8544,9 +8554,26 @@ module.exports = async (req, res) => {
         // Parser-default detector: distinct ASINs should rarely ALL carry the
         // exact same price. When they do (esp. $9.99), the extractor probably
         // grabbed one page-level price and reused it for every variant.
-        const _distinctPrices = new Set(Object.values(clientAsinData).map(d => d && d.price).filter(p => p > 0));
+        const _priced = Object.entries(clientAsinData).filter(([, d]) => d && d.price > 0);
+        const _distinctPrices = new Set(_priced.map(([, d]) => d.price));
         if (_used >= 4 && _distinctPrices.size === 1) {
-          console.warn(`[smartSync] ⚠ all ${_used} fresh ASINs share ONE price ($${[..._distinctPrices][0]}) — suspect parser default, verify against Amazon before trusting these`);
+          // Identical prices across variants are COMMON and legitimate for
+          // apparel (one price, many colours/sizes). They're only suspicious
+          // if the extractor reused one page-level price. The distinguishing
+          // evidence is shipping: a real per-variant fetch yields varied
+          // shipping/stock data, whereas a reused page price makes every field
+          // identical. Print enough to settle it without guessing.
+          const _p = [..._distinctPrices][0];
+          const _shipSet = new Set(_priced.map(([, d]) => d.shipping || 0));
+          const _stockSet = new Set(_priced.map(([, d]) => d.inStock !== false));
+          const _sample = _priced.slice(0, 3).map(([a]) => a).join(', ');
+          const _identicalEverything = _shipSet.size === 1 && _stockSet.size === 1;
+          console.warn(`[smartSync] ⚠ all ${_used} fresh ASINs share ONE price ($${_p})` +
+            ` — shipping variants: ${_shipSet.size}, stock variants: ${_stockSet.size}` +
+            (_identicalEverything
+              ? ` — EVERY field identical, likely one page-level price reused. Verify: https://www.amazon.com/dp/${_priced[0][0]}`
+              : ` — other fields differ, so this is probably a genuine single-price product`) +
+            ` (sample ASINs: ${_sample})`);
         }
         // Even though we have client data, fill gaps from the 7-day cache for
         // any ASIN NOT covered by the browser. This way variant-rich listings
