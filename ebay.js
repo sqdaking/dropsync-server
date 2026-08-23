@@ -617,6 +617,7 @@ async function _ensureRelayStateSchema() {
     ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS quantity        INTEGER;
     ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS last_dispatched TIMESTAMPTZ;
     ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS priority_asins  TEXT[];
+    ALTER TABLE relay_state ADD COLUMN IF NOT EXISTS pinned_asins    TEXT[];
     CREATE INDEX IF NOT EXISTS relay_state_acct_idx ON relay_state(account_id, last_synced);
   `).catch(e => console.warn('[relay] schema migrate:', e.message));
   _relaySchemaReady = true;
@@ -8167,7 +8168,7 @@ module.exports = async (req, res) => {
             FOR UPDATE SKIP LOCKED
           )
           RETURNING ebay_sku, source_url, last_synced, comboAsin, skuToAsin,
-                    offer_ids, asin_offset, markup, handling_cost, quantity, priority_asins
+                    offer_ids, asin_offset, markup, handling_cost, quantity, priority_asins, pinned_asins
         `, [cap, accountId]);
 
         // Tell the extension which ASINs already have fresh cache (<20h old)
@@ -8197,6 +8198,7 @@ module.exports = async (req, res) => {
             offerIds:     row.offer_ids || {},
             asinOffset:   parseInt(row.asin_offset) || 0,
             priorityAsins: row.priority_asins || [],
+            pinnedAsins:   row.pinned_asins || [],
             markup:       row.markup       != null ? parseFloat(row.markup)        : null,
             handlingCost: row.handling_cost != null ? parseFloat(row.handling_cost) : null,
             quantity:     row.quantity     != null ? parseInt(row.quantity)        : null,
@@ -8250,6 +8252,8 @@ module.exports = async (req, res) => {
           body: { access_token, ebaySku, sourceUrl,
                   markup: _mk, handlingCost: _hand, quantity: _qty,
                   clientAsinData, comboAsin, skuToAsin,
+                  pinnedAsins:          (body.pinnedAsins && body.pinnedAsins.length)
+                                          ? body.pinnedAsins : (_row?.pinned_asins || undefined),
                   freshDta:             body.freshDta             || undefined,
                   freshVariationValues: body.freshVariationValues || undefined,
                   freshDimOrder:        body.freshDimOrder        || undefined,
@@ -8357,8 +8361,8 @@ module.exports = async (req, res) => {
           if (!l.ebaySku || !l.sourceUrl) continue;
           if (!/amazon\.(com|co\.uk|de|ca)/.test(l.sourceUrl)) continue; // only Amazon for now
           await _cachePool.query(`
-            INSERT INTO relay_state (ebay_sku, source_url, account_id, comboAsin, skuToAsin, offer_ids, markup, handling_cost, quantity, updated_at)
-            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, NOW())
+            INSERT INTO relay_state (ebay_sku, source_url, account_id, comboAsin, skuToAsin, offer_ids, markup, handling_cost, quantity, pinned_asins, updated_at)
+            VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, $10, NOW())
             ON CONFLICT (ebay_sku) DO UPDATE
               SET source_url = EXCLUDED.source_url,
                   account_id = EXCLUDED.account_id,
@@ -8368,6 +8372,7 @@ module.exports = async (req, res) => {
                   markup        = COALESCE(EXCLUDED.markup,        relay_state.markup),
                   handling_cost = COALESCE(EXCLUDED.handling_cost, relay_state.handling_cost),
                   quantity      = COALESCE(EXCLUDED.quantity,      relay_state.quantity),
+                  pinned_asins  = COALESCE(EXCLUDED.pinned_asins,  relay_state.pinned_asins),
                   updated_at = NOW()
           `, [l.ebaySku, l.sourceUrl, accountId,
               JSON.stringify(l.comboAsin || {}), JSON.stringify(l.skuToAsin || {}),
@@ -8375,6 +8380,7 @@ module.exports = async (req, res) => {
               l.markup       != null ? parseFloat(l.markup)       : null,
               l.handlingCost != null ? parseFloat(l.handlingCost) : null,
               l.quantity     != null ? parseInt(l.quantity)       : null,
+              (Array.isArray(l.pinnedAsins) && l.pinnedAsins.length) ? l.pinnedAsins : null,
           ]).catch(() => {});
           registered++;
         }
@@ -8515,8 +8521,19 @@ module.exports = async (req, res) => {
       const nextAsinOffset = (asinOffset + MAX_VARIANTS_PER_SYNC >= allUniqueAsins.length)
         ? 0
         : asinOffset + MAX_VARIANTS_PER_SYNC;
-      // uniqueAsins = full list — coverage now comes from client data + cache,
-      // not from which slice the server would have proxy-fetched (proxy is dead).
+      // PINNED SET (Aug 2026): a parent with 250+ variants used to cost
+      // hundreds of Amazon fetches for one listing. The client pins at most 25
+      // variants once; only those are priced and updated from then on.
+      const _pinned = Array.isArray(body.pinnedAsins)
+        ? body.pinnedAsins.filter(a => /^[A-Z0-9]{10}$/.test(String(a))) : [];
+      const _pinnedSet = _pinned.length ? new Set(_pinned) : null;
+      if (_pinnedSet) {
+        const _before = allUniqueAsins.length;
+        allUniqueAsins = allUniqueAsins.filter(a => _pinnedSet.has(a));
+        if (_before !== allUniqueAsins.length) {
+          console.log(`[smartSync] pinned set: tracking ${allUniqueAsins.length} of ${_before} variants (untracked ones stay unbuyable)`);
+        }
+      }
       const uniqueAsins = allUniqueAsins;
 
       console.log(`[smartSync] ${allUniqueAsins.length} ASINs total — rotation offset ${asinOffset}${nextAsinOffset ? ` → next: ${nextAsinOffset}` : ' (full coverage this cycle)'}`);
@@ -9241,6 +9258,8 @@ module.exports = async (req, res) => {
       // SKUs we couldn't resolve because the variant map was partial this cycle.
       // Left untouched on eBay (not zeroed) and retried next cycle.
       const _unresolvedSkus = [];
+      // Variants outside the pinned set — deliberately unbuyable, not errors.
+      const _untrackedSkus = [];
       for (const [sku, offer] of Object.entries(offerMap)) {
         let asin = null;
 
@@ -9335,6 +9354,20 @@ module.exports = async (req, res) => {
               availableQuantity: 0,
               price:             { value: _highestSiblingPrice.toFixed(2), currency: 'USD' },
             });
+            continue;
+          }
+          // UNTRACKED variant (outside the pinned set): it will never receive
+          // fresh pricing, so it must not be buyable. Zero it ONCE, then leave
+          // it alone — no fetches, no repricing, no churn.
+          if (_pinnedSet && !_pinnedSet.has(asin)) {
+            const _cur = parseFloat(offer.currentPrice) || 0;
+            const _q = parseInt(offer.currentQty);
+            if (Number.isFinite(_q) && _q === 0) { _untrackedSkus.push(sku); continue; }
+            if (_cur > 0) {
+              updates.push({ offerId: offer.offerId, sku, availableQuantity: 0,
+                             price: { value: _cur.toFixed(2), currency: 'USD' } });
+            }
+            _untrackedSkus.push(sku);
             continue;
           }
           // A CORRECTED mapping means the live price came from the wrong ASIN.
@@ -9510,6 +9543,7 @@ module.exports = async (req, res) => {
       let _zeroed = 0;
       if (_twoPhase) {
         const _wanted = new Map(updates.map(u => [u.sku, u]));
+        const _untrackedSet = new Set(_untrackedSkus);
         const zeroEntries = [];
         for (const [sku, offer] of Object.entries(offerMap)) {
           if (!offer?.offerId) continue;
@@ -9519,6 +9553,9 @@ module.exports = async (req, res) => {
           // Skip only when we KNOW the variant is already at 0 (quantity is
           // unknown on the cached-offer-ID path — then we zero to be safe).
           if (!want && Number.isFinite(cur) && cur === 0) continue;
+          // Untracked variants are handled above (zeroed once) — re-zeroing
+          // them every cycle would burn revisions for no change.
+          if (!want && _untrackedSet.has(sku)) continue;
           // Skip if phase 2 will set this exact SKU to 0 anyway (avoids a
           // duplicate write while keeping the same end state).
           if (want && want.availableQuantity === 0) continue;
@@ -9892,12 +9929,17 @@ module.exports = async (req, res) => {
         }
       } catch(_ce) { console.warn(`[smartSync] cleanup threw: ${_ce.message}`); }
 
+      if (_untrackedSkus.length > 0) {
+        console.log(`[smartSync] ${_untrackedSkus.length} variants outside the pinned set — kept unbuyable, not fetched`);
+      }
       if (_unresolvedSkus.length > 0) {
         console.warn(`[smartSync] ⚠ ${_unresolvedSkus.length} variants UNRESOLVED (variant map partial this cycle) — left untouched, will retry: ${_unresolvedSkus.slice(0,5).map(s => s.slice(-24)).join(', ')}${_unresolvedSkus.length > 5 ? '…' : ''}`);
       }
       return res.json({
         success: true, synced: okCount, failed: failCount,
         zeroedFirst: _zeroed,
+        untrackedCount: _untrackedSkus.length,
+        trackedAsins: allUniqueAsins.length,
         unresolvedCount: _unresolvedSkus.length,
         orphanedCount: _orphanedSkus.length,
         orphanedSkus:  _orphanedSkus.length > 0 ? _orphanedSkus.slice(0, 20) : undefined,
