@@ -656,7 +656,89 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-22.3 (global markup authoritative)');
+console.log('[dropsync] build 2026-08-22.4 (adaptive scheduler)');
+
+// ── ADAPTIVE SYNC SCHEDULER (Aug 2026) ───────────────────────────────────────
+// Manual pacing is guesswork: too slow wastes days of coverage, too fast trips
+// Amazon's bot detection and costs MORE time in cooldowns than it saved. The
+// right interval isn't a constant — it depends on how expensive a listing
+// currently is (a cold-cache listing costs ~30 Amazon fetches, a warm one ~2)
+// and how close the IP is to being blocked.
+//
+// So the scheduler measures both each cycle and solves for the interval:
+//   1. cost   = Amazon fetches actually spent on the last listings
+//   2. budget = the extension's current requests/min ceiling
+//   3. safe interval ≈ cost / (budget × utilisation)
+// then clamps it, and backs off hard on any block.
+//
+// Targets a full catalogue pass per COVERAGE_DAYS, but never faster than the
+// measured budget allows — the budget always wins over the target.
+const SCHED = {
+  enabled: true,
+  minMs: 15000,           // never hammer faster than this
+  maxMs: 300000,          // never crawl slower than this
+  utilisation: 0.75,      // leave 25% headroom for extension background ticks
+  coverageDays: 1,        // aim for one full pass per day
+  lastFetches: null, lastSynced: null, lastAt: 0,
+  ema: null,              // smoothed fetches-per-listing
+  blocks: 0, lastBlocked: 0,
+  current: null,
+};
+
+async function _schedNextInterval(listingCount) {
+  if (!SCHED.enabled) return null;
+  let st = null;
+  try { st = await window.dsExt?.getStatus?.(); } catch(e) {}
+  if (!st || !st.ok) return null;                       // no extension → caller falls back
+
+  // Cost per listing, measured from the extension's own counters.
+  if (SCHED.lastFetches != null && st.fetchesToday >= SCHED.lastFetches) {
+    const dF = st.fetchesToday - SCHED.lastFetches;
+    const dS = Math.max(1, (st.syncedToday || 0) - (SCHED.lastSynced || 0));
+    // Only trust the sample if real work happened; a tick that synced nothing
+    // would otherwise report an absurd cost and slam the brakes for no reason.
+    if (dF > 0 && dS > 0) {
+      const sample = dF / dS;
+      SCHED.ema = SCHED.ema == null ? sample : (SCHED.ema * 0.7 + sample * 0.3);
+    }
+  }
+  SCHED.lastFetches = st.fetchesToday;
+  SCHED.lastSynced  = st.syncedToday;
+
+  // React to blocks BEFORE anything else — a rising block count means the
+  // current rate is already too high, whatever the arithmetic says.
+  if ((st.blockedToday || 0) > SCHED.blocks) {
+    SCHED.blocks = st.blockedToday;
+    SCHED.lastBlocked = Date.now();
+    SCHED.current = Math.min(SCHED.maxMs, Math.round((SCHED.current || 60000) * 2));
+    console.warn(`[sched] block detected → backing off to ${Math.round(SCHED.current/1000)}s`);
+    return SCHED.current;
+  }
+  if (st.cooldownUntil && st.cooldownUntil > Date.now()) {
+    return Math.min(SCHED.maxMs, st.cooldownUntil - Date.now() + 5000);
+  }
+
+  const costPerListing = SCHED.ema || 30;               // assume cold cache until measured
+  const budgetPerMin   = Math.max(3, st.budget || 8);
+  // Interval the budget can sustain
+  const budgetMs = (costPerListing / (budgetPerMin * SCHED.utilisation)) * 60000;
+  // Interval needed to cover the catalogue in the target window
+  const targetMs = (SCHED.coverageDays * 86400000) / Math.max(1, listingCount);
+  // Budget wins — going faster than it allows just buys cooldowns.
+  let next = Math.max(budgetMs, Math.min(targetMs, SCHED.maxMs));
+
+  // Ease back toward normal only once a block is well behind us.
+  if (SCHED.lastBlocked && Date.now() - SCHED.lastBlocked < 10 * 60000) {
+    next = Math.max(next, (SCHED.current || next) * 0.9);
+  }
+  next = Math.round(Math.min(SCHED.maxMs, Math.max(SCHED.minMs, next)));
+  SCHED.current = next;
+  const passDays = (next * listingCount) / 86400000;
+  console.log(`[sched] cost≈${costPerListing.toFixed(1)} fetches/listing · budget ${budgetPerMin}/min · ` +
+    `interval ${Math.round(next/1000)}s → full pass in ${passDays.toFixed(1)}d`);
+  return next;
+}
+window.SCHED = SCHED;
 
 // ── AMAZON PRICING RESOLUTION (Aug 2026) ─────────────────────────────────────
 // Previously every sync used `p.markup != null ? p.markup : S.markup`, so the
@@ -5690,10 +5772,19 @@ async function _relayTick() {
     // request pattern doesn't look like a bot. Default 2-3 minutes between
     // listings. User can override via S.relaySlowMs (base) — set lower if
     // catalog is small and you have time.
-    const baseMs = (S.relaySlowMs != null) ? S.relaySlowMs : 120000; // 2 min default
-    const jitterMs = Math.floor(Math.random() * 60000);              // 0-60s jitter
+    // Adaptive interval when available; manual S.relaySlowMs still overrides,
+    // so setting it explicitly turns the scheduler off for that value.
+    let baseMs;
+    if (S.relaySlowMs != null) {
+      baseMs = S.relaySlowMs;
+    } else {
+      baseMs = await _schedNextInterval(listed.length).catch(() => null) ?? 120000;
+    }
+    // Jitter scales with the interval — a fixed 0-60s window is a huge relative
+    // swing at 20s intervals and a small one at 5 minutes.
+    const jitterMs = Math.floor(Math.random() * Math.min(60000, baseMs * 0.4));
     const nextMs = baseMs + jitterMs;
-    console.log(`[relay] ✓ done — next in ${Math.round(nextMs/1000)}s (slow mode, randomized)`);
+    console.log(`[relay] ✓ done — next in ${Math.round(nextMs/1000)}s${S.relaySlowMs != null ? ' (manual)' : ' (adaptive)'}`);
     _relayRunning = false;
     _relayTimer = setTimeout(_relayTick, nextMs);
     _renderRelayStatus();
