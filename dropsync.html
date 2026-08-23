@@ -545,6 +545,7 @@ async function _registerListingsForRelay() {
       // Cached offer IDs — lets the server skip the entire eBay offer
       // discovery chain on background syncs.
       offerIds:     p.offerIdCache || null,
+      pinnedAsins:  (p.pinnedAsins && p.pinnedAsins.length) ? p.pinnedAsins : null,
     }));
   if (!items.length) return;
   // Push in chunks of 500 — token included so the server tags every listing
@@ -656,7 +657,33 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-22.4 (adaptive scheduler)');
+console.log('[dropsync] build 2026-08-22.5 (pinned 25-ASIN cap)');
+
+// ── PINNED VARIANT SET (Aug 2026) ────────────────────────────────────────────
+// Some parents carry 250+ variants. Fetching them all cost hundreds of Amazon
+// requests for ONE listing — the single biggest driver of block cooldowns, and
+// it starved every other listing of budget.
+//
+// From now on each listing tracks at most MAX_TRACKED_ASINS variants, chosen
+// ONCE and then pinned. Every later sync fetches exactly that set — no
+// re-selection, no drift, no extra fetching. Cost per listing becomes bounded
+// and predictable instead of scaling with the parent's variant count.
+//
+// Variants outside the pinned set are set unbuyable (qty 0) once and then left
+// alone: never fetched, never repriced. They can't sell at a stale price, and
+// they cost nothing.
+const MAX_TRACKED_ASINS = 25;
+
+// Choose which variants to pin. Preference order:
+//   1. ones already priced from the parent page (free — no fetch needed)
+//   2. twister order, which roughly tracks Amazon's own popularity ordering
+function pickPinnedAsins(allAsins, alreadyPriced) {
+  const priced = allAsins.filter(a => alreadyPriced && alreadyPriced[a]);
+  const rest   = allAsins.filter(a => !(alreadyPriced && alreadyPriced[a]));
+  return [...priced, ...rest].slice(0, MAX_TRACKED_ASINS);
+}
+window.MAX_TRACKED_ASINS = MAX_TRACKED_ASINS;
+window.pickPinnedAsins = pickPinnedAsins;
 
 // ── ADAPTIVE SYNC SCHEDULER (Aug 2026) ───────────────────────────────────────
 // Manual pacing is guesswork: too slow wastes days of coverage, too fast trips
@@ -1433,6 +1460,22 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   // fetches in one shot (the #1 cause of blocks).
   let toFetch = uniqueAsins.filter(a => !result[a]);
   const _opts = (typeof _rotOpts === 'object' && _rotOpts) || {};
+  // PINNED SET: when the caller supplies one, fetch ONLY those ASINs.
+  if (Array.isArray(_opts.pinned) && _opts.pinned.length) {
+    const pin = new Set(_opts.pinned);
+    const before = toFetch.length;
+    toFetch = toFetch.filter(a => pin.has(a));
+    if (before !== toFetch.length) {
+      console.log(`[prefetchAsin] pinned set: fetching ${toFetch.length} of ${before} uncovered (${_opts.pinned.length} tracked)`);
+    }
+  }
+  // HARD CEILING for every caller — six call sites passed no cap at all, which
+  // is how one listing ended up firing 257 individual fetches.
+  const _hardCap = Math.min(_opts.maxFetch || MAX_TRACKED_ASINS, MAX_TRACKED_ASINS);
+  if (toFetch.length > _hardCap) {
+    console.log(`[prefetchAsin] capping ${toFetch.length} → ${_hardCap} individual fetches`);
+    toFetch = toFetch.slice(0, _hardCap);
+  }
   // Priority ASINs jump the rotation queue — their variants are unbuyable
   // (qty=0) until they get a price, so waiting for the rotation costs sales.
   if (Array.isArray(_opts.priority) && _opts.priority.length) {
@@ -7966,7 +8009,21 @@ async function smartSyncProduct(p) {
           if (dimM) _freshDims = JSON.parse(dimM[1]);
           if (_freshDta) console.log(`[smartSync] fresh dta: ${Object.keys(_freshDta).length} combos, dims=[${(_freshDims||[]).join(',')}]`);
         } catch(_me) {}
-        _clientAsinData = await prefetchAsinPrices(parentHtml, { maxFetch: 15, offset: p._asinOffset || 0, priority: p._priorityAsins });
+        // Establish the pinned set on first sync, then reuse it unchanged.
+        if (!Array.isArray(p.pinnedAsins) || p.pinnedAsins.length === 0) {
+          const _all = [...new Set(Object.values(_freshDta || p.comboAsin || {}))]
+            .filter(a => /^[A-Z0-9]{10}$/.test(String(a)));
+          if (_all.length) {
+            p.pinnedAsins = pickPinnedAsins(_all, null);
+            markDirty(p.id);
+            console.log(`[smartSync] ${p.ebaySku}: pinned ${p.pinnedAsins.length} of ${_all.length} variants (fixed from now on)`);
+          }
+        }
+        _clientAsinData = await prefetchAsinPrices(parentHtml, {
+          maxFetch: MAX_TRACKED_ASINS,
+          pinned: p.pinnedAsins,
+          priority: p._priorityAsins,
+        });
         const _n = Object.keys(_clientAsinData || {}).length;
         if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
         else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices extracted`);
@@ -7999,6 +8056,8 @@ async function smartSyncProduct(p) {
         quantity:        amzQty(p),
         // Browser-prefetched ASIN data — server skips its own fetching when this is provided
         clientAsinData:           _clientAsinData,
+        // Only these variants are tracked; everything else is left unbuyable.
+        pinnedAsins:              (p.pinnedAsins && p.pinnedAsins.length) ? p.pinnedAsins : undefined,
         // Fresh variant maps from the parent page — enables exact per-SKU ASIN matching
         freshDta:                 _freshDta   || undefined,
         freshVariationValues:     _freshVV    || undefined,
