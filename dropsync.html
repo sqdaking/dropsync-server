@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-24.5 (import visibility + foreground fetch)');
+console.log('[dropsync] build 2026-08-24.6 (tab fetch for low-yield pages)');
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -2759,7 +2759,15 @@ async function fetchDealsAsins(dept) {
   for (let i = 0; i < urlsData.urls.length; i++) {
     const { url, dept: d } = urlsData.urls[i];
     try {
-      const r = await window.dsExt.fetchAmazon(url);
+      let r = await window.dsExt.fetchAmazon(url);
+      // TAB FALLBACK: retry refused pages as a real tab load. Amazon 503s
+      // automated requests to search URLs, but serves them normally to a
+      // genuine navigation.
+      if (!r.ok && window.dsExt.fetchAmazonTab) {
+        console.log(`[bulk] page ${i+1} refused (${r.reason}) — retrying as a real tab load…`);
+        const t = await window.dsExt.fetchAmazonTab(url).catch(() => null);
+        if (t && t.ok) { r = t; console.log(`[bulk] page ${i+1} tab load OK (${Math.round(t.html.length/1024)}KB)`); }
+      }
       if (!r.ok) {
         // This only went to the UI log before, so a run where every page was
         // refused looked in the console like the import simply stopped.
@@ -2768,7 +2776,7 @@ async function fetchDealsAsins(dept) {
         blockedPages++;
         continue;
       }
-      const html = r.html;
+      let html = r.html;
       // ASIN EXTRACTION (Aug 2026): the old pattern required data-asin AND an
       // ASIN starting with "B0". Amazon's current search/deals markup doesn't
       // always expose data-asin, and plenty of valid ASINs don't start with B0
@@ -2785,7 +2793,33 @@ async function fetchDealsAsins(dept) {
       _collect(/\/dp\/([A-Z0-9]{10})/g, 1);
       _collect(/"asin"\s*:\s*"([A-Z0-9]{10})"/g, 1);
       _collect(/data-csa-c-item-id="[^"]*?([A-Z0-9]{10})"/g, 1);
-      const asinMatches = [..._asinSet.entries()].map(([a, idx]) => ({ 1: a, index: idx }));
+      let asinMatches = [..._asinSet.entries()].map(([a, idx]) => ({ 1: a, index: idx }));
+      // LOW-YIELD RETRY: a page can load fine and still contain almost nothing,
+      // because its results are rendered client-side — a fetch returns the
+      // shell. Page 2 came back at 348KB with exactly ONE ASIN. A tab load runs
+      // the page's JavaScript, so the results are actually there.
+      if (asinMatches.length < 5 && !r.viaTab && window.dsExt.fetchAmazonTab) {
+        console.log(`[bulk] page ${i+1} yielded only ${asinMatches.length} asins — retrying as a real tab load…`);
+        const t = await window.dsExt.fetchAmazonTab(url).catch(() => null);
+        if (t && t.ok) {
+          const set2 = new Map();
+          const collect2 = (re, g) => {
+            for (const m of t.html.matchAll(re)) {
+              const a = m[g];
+              if (/^[A-Z0-9]{10}$/.test(a) && !set2.has(a)) set2.set(a, m.index);
+            }
+          };
+          collect2(/data-asin="([A-Z0-9]{10})"/g, 1);
+          collect2(/\/dp\/([A-Z0-9]{10})/g, 1);
+          collect2(/"asin"\s*:\s*"([A-Z0-9]{10})"/g, 1);
+          collect2(/data-csa-c-item-id="[^"]*?([A-Z0-9]{10})"/g, 1);
+          if (set2.size > asinMatches.length) {
+            console.log(`[bulk] page ${i+1} tab load found ${set2.size} asins (was ${asinMatches.length})`);
+            html = t.html;
+            asinMatches = [...set2.entries()].map(([a, idx]) => ({ 1: a, index: idx }));
+          }
+        }
+      }
       let added = 0, dupes = 0, veroSkipped = 0;
       for (const m of asinMatches) {
         const asin = m[1];
