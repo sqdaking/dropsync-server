@@ -10827,6 +10827,9 @@ module.exports = async (req, res) => {
           'https://www.amazon.com/s?k=usb+accessories&i=electronics',
         ],
         fashion_women: [
+          'https://www.amazon.com/b?node=7147440011',
+          'https://www.amazon.com/gp/bestsellers/fashion/2475809011',
+          'https://www.amazon.com/gp/new-releases/fashion/2475809011',
           'https://www.amazon.com/s?k=women+dresses&i=fashion-womens',
           'https://www.amazon.com/s?k=women+tops+blouses&i=fashion-womens',
           'https://www.amazon.com/s?k=women+leggings&i=fashion-womens',
@@ -10834,6 +10837,8 @@ module.exports = async (req, res) => {
           'https://www.amazon.com/s?k=women+pajamas&i=fashion-womens',
         ],
         fashion_men: [
+          'https://www.amazon.com/gp/bestsellers/fashion/2475817011',
+          'https://www.amazon.com/gp/new-releases/fashion/2475817011',
           'https://www.amazon.com/s?k=men+shirts&i=fashion-mens',
           'https://www.amazon.com/s?k=men+shorts&i=fashion-mens',
           'https://www.amazon.com/s?k=men+hoodies&i=fashion-mens',
