@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-24.3 (free availability from twister)');
+console.log('[dropsync] build 2026-08-24.5 (import visibility + foreground fetch)');
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -2751,7 +2751,7 @@ async function fetchDealsAsins(dept) {
 
   // Step 3: fetch each URL via extension, extract ASINs
   const productMap = {};
-  let pagesLoaded = 0;
+  let pagesLoaded = 0, blockedPages = 0;
   const VERO = ['samsung','apple','nike','adidas','sony','microsoft','lg','bose','beats','dyson','lego','gucci','louis vuitton','chanel','rolex','prada','versace','burberry','yeezy','jordan','off-white','supreme','north face','ugg','timberland','new balance','under armour','reebok','puma','vans','converse','crocs','birkenstock','kindle','echo','ring','roomba','nintendo','playstation','xbox','fitbit','garmin','gopro','pokemon','disney','marvel'];
   const isVeroT = (t) => { const x = (t||'').toLowerCase(); return VERO.some(b => x.includes(b)); };
 
@@ -2761,17 +2761,36 @@ async function fetchDealsAsins(dept) {
     try {
       const r = await window.dsExt.fetchAmazon(url);
       if (!r.ok) {
+        // This only went to the UI log before, so a run where every page was
+        // refused looked in the console like the import simply stopped.
+        console.warn(`[bulk] page ${i+1}/${urlsData.urls.length} REFUSED: ${r.reason} — ${url}`);
         bulkLog(`⚠ Page ${i+1}/${urlsData.urls.length} blocked (${r.reason}) — continuing`, 'warn');
+        blockedPages++;
         continue;
       }
       const html = r.html;
-      // Extract ASINs from data-asin attributes (most reliable)
-      const asinMatches = [...html.matchAll(/data-asin="(B0[A-Z0-9]{8})"/g)];
-      let added = 0;
+      // ASIN EXTRACTION (Aug 2026): the old pattern required data-asin AND an
+      // ASIN starting with "B0". Amazon's current search/deals markup doesn't
+      // always expose data-asin, and plenty of valid ASINs don't start with B0
+      // — so every page yielded "+0" while loading perfectly fine.
+      // Collect from several shapes and de-duplicate.
+      const _asinSet = new Map();   // asin → index of first occurrence
+      const _collect = (re, group) => {
+        for (const m of html.matchAll(re)) {
+          const a = m[group];
+          if (/^[A-Z0-9]{10}$/.test(a) && !_asinSet.has(a)) _asinSet.set(a, m.index);
+        }
+      };
+      _collect(/data-asin="([A-Z0-9]{10})"/g, 1);
+      _collect(/\/dp\/([A-Z0-9]{10})/g, 1);
+      _collect(/"asin"\s*:\s*"([A-Z0-9]{10})"/g, 1);
+      _collect(/data-csa-c-item-id="[^"]*?([A-Z0-9]{10})"/g, 1);
+      const asinMatches = [..._asinSet.entries()].map(([a, idx]) => ({ 1: a, index: idx }));
+      let added = 0, dupes = 0, veroSkipped = 0;
       for (const m of asinMatches) {
         const asin = m[1];
         if (productMap[asin]) continue;
-        if (usedAsins.has(asin)) continue;
+        if (usedAsins.has(asin)) { dupes++; continue; }
         // Try to find a nearby title (h2/h5 within ~2000 chars of the asin tag)
         const idx = m.index;
         const slice = html.slice(idx, idx + 3000);
@@ -2779,12 +2798,20 @@ async function fetchDealsAsins(dept) {
                     || slice.match(/<h2[^>]*>\s*<a[^>]*>\s*<span[^>]*>([^<]{20,200})</)
                     || slice.match(/aria-label="([^"]{20,200})"/);
         const title = titleM ? titleM[1].replace(/&amp;/g,'&').replace(/&quot;/g,'"').trim() : '';
-        if (title && isVeroT(title)) continue;
+        if (title && isVeroT(title)) { veroSkipped++; continue; }
         productMap[asin] = { asin, title, dept: d };
         added++;
       }
       pagesLoaded++;
-      console.log(`[bulk] page ${i+1}/${urlsData.urls.length} ${d}: +${added} pool=${Object.keys(productMap).length}`);
+      // Say WHY a page contributed nothing: no ASINs found at all is a broken
+      // extractor, whereas all-duplicates just means you already own them.
+      console.log(`[bulk] page ${i+1}/${urlsData.urls.length} ${d}: +${added} pool=${Object.keys(productMap).length}` +
+        ` (found ${asinMatches.length} asins, ${dupes} already owned, ${veroSkipped} VeRO-skipped, html ${Math.round(html.length/1024)}KB)`);
+      if (asinMatches.length === 0) {
+        console.warn(`[bulk] page ${i+1} returned NO ASINs — url: ${url}`);
+        console.warn('[bulk] page starts: ' + html.replace(/<script[\s\S]*?<\/script>/gi,' ')
+          .replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().slice(0, 300));
+      }
       bulkLog(`Page ${i+1}/${urlsData.urls.length}: +${added} (pool: ${Object.keys(productMap).length})`);
       // Stop early if we have plenty
       if (Object.keys(productMap).length >= 100) break;
@@ -2796,7 +2823,15 @@ async function fetchDealsAsins(dept) {
   }
 
   if (Object.keys(productMap).length === 0) {
-    throw new Error('No products found. Extension may be blocked by Amazon — wait a few minutes.');
+    // "Amazon blocked us" was the stock explanation, but pages that load fine
+    // and yield nothing mean something else entirely. Report what happened.
+    throw new Error(
+      `No new products found. ${pagesLoaded} page(s) loaded, ${blockedPages} refused. ` +
+      (pagesLoaded === 0
+        ? 'No pages loaded at all — check the extension popup for a block reason.'
+        : 'Pages loaded fine, so either the ASIN extractor found nothing (see the console warnings above) ' +
+          'or every product found is already in your catalogue. With 8,000+ listings the latter is likely — ' +
+          'try a different department, or use custom search URLs.'));
   }
 
   // Filter + dedupe + dept balance
