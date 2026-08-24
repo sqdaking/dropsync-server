@@ -8577,9 +8577,36 @@ module.exports = async (req, res) => {
       // repeated syncs always choose the SAME variants.
       let _autoPinned = false;
       if (!_pinned.length && allUniqueAsins.length > MAX_TRACKED) {
-        _pinned = allUniqueAsins.slice(0, MAX_TRACKED);
+        // PIN THE VARIANTS YOU ACTUALLY SELL (fixed Aug 2026).
+        // Taking the first 25 ASINs off the Amazon parent was wrong: a parent
+        // may carry 260 variants while your eBay group lists 30, and the two
+        // sets barely overlap. The logs showed the result — 25 ASINs fetched
+        // successfully, "0 variants have price data", coverage at 7%. We were
+        // pricing variants you don't sell and never fetching the ones you do.
+        // So: prefer ASINs referenced by this listing's OWN SKUs.
+        const _ownAsins = [...new Set(Object.values(body.skuToAsin || {}))]
+          .filter(a => /^[A-Z0-9]{10}$/.test(String(a)) && allUniqueAsins.includes(a));
+        const _rest = allUniqueAsins.filter(a => !_ownAsins.includes(a));
+        _pinned = [..._ownAsins, ..._rest].slice(0, MAX_TRACKED);
         _autoPinned = true;
-        console.log(`[smartSync] auto-pinned ${_pinned.length} of ${allUniqueAsins.length} variants (no pin supplied — fixed from now on)`);
+        console.log(`[smartSync] auto-pinned ${_pinned.length} of ${allUniqueAsins.length} variants ` +
+          `(${Math.min(_ownAsins.length, MAX_TRACKED)} from this listing's own SKUs)`);
+      }
+      if (_pinned.length && !_autoPinned) {
+        const _ownAsins = [...new Set(Object.values(body.skuToAsin || {}))]
+          .filter(a => /^[A-Z0-9]{10}$/.test(String(a)));
+        if (_ownAsins.length) {
+          const _hit = _ownAsins.filter(a => _pinned.includes(a)).length;
+          // A pin covering under half of the SKUs' ASINs is worse than useless:
+          // it guarantees permanent low coverage. Rebuild it once, then it's
+          // fixed again from here.
+          if (_hit / _ownAsins.length < 0.5) {
+            const _rest = allUniqueAsins.filter(a => !_ownAsins.includes(a));
+            _pinned = [..._ownAsins.filter(a => allUniqueAsins.includes(a)), ..._rest].slice(0, MAX_TRACKED);
+            _autoPinned = true;
+            console.log(`[smartSync] REPINNED — old pin covered only ${_hit}/${_ownAsins.length} of this listing's ASINs`);
+          }
+        }
       }
       const _pinnedSet = _pinned.length ? new Set(_pinned) : null;
       if (_pinnedSet) {
