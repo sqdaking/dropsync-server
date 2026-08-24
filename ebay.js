@@ -582,6 +582,19 @@ async function _refreshAccessTokenFor(accountId) {
   }
 }
 
+const _tokValidCache = new Map();   // token tail → { ok, ts }
+// Is this token still usable? One cheap authenticated call, cached 5 min so
+// this doesn't add a round-trip to every single listing sync.
+async function _tokenIsValidCached(token) {
+  const k = String(token).slice(-40);
+  const hit = _tokValidCache.get(k);
+  if (hit && Date.now() - hit.ts < 300000) return hit.ok;
+  const ok = await _tokenIsValid(token);
+  _tokValidCache.set(k, { ok, ts: Date.now() });
+  if (_tokValidCache.size > 200) _tokValidCache.delete(_tokValidCache.keys().next().value);
+  return ok;
+}
+
 // Is this token still usable? One cheap authenticated call.
 async function _tokenIsValid(token) {
   try {
@@ -8128,7 +8141,14 @@ module.exports = async (req, res) => {
     // so we can throttle the next batch.
     if (action === 'relay_next_batch') {
       const { access_token, limit = 15 } = body;
-      if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+      // accountId alone is enough to hand out work: this endpoint only READS
+      // the queue, and every write path re-validates the token server-side.
+      // Requiring a live token here was a hidden tab dependency — once the
+      // extension's stored token aged out, background syncing stopped even
+      // though the server could refresh it perfectly well.
+      if (!access_token && !body.accountId) {
+        return res.status(400).json({ error: 'Missing access_token or accountId' });
+      }
       if (!_cachePool) return res.status(500).json({ error: 'DB not ready' });
       try {
         await _ensureRelayStateSchema();
@@ -8285,8 +8305,8 @@ module.exports = async (req, res) => {
         if (_cachePool) {
           const _stale = _result && _result.offersCacheStale === true;
           await _cachePool.query(`
-            INSERT INTO relay_state (ebay_sku, source_url, account_id, last_synced, comboAsin, skuToAsin, offer_ids, asin_offset, priority_asins, block_count, updated_at)
-            VALUES ($1, $2, $3, NOW(), $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, 0, NOW())
+            INSERT INTO relay_state (ebay_sku, source_url, account_id, last_synced, comboAsin, skuToAsin, offer_ids, asin_offset, priority_asins, pinned_asins, block_count, updated_at)
+            VALUES ($1, $2, $3, NOW(), $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, $9, 0, NOW())
             ON CONFLICT (ebay_sku) DO UPDATE
               SET last_synced = NOW(),
                   source_url  = EXCLUDED.source_url,
@@ -8296,6 +8316,7 @@ module.exports = async (req, res) => {
                   offer_ids   = ${_stale ? 'NULL' : 'COALESCE(EXCLUDED.offer_ids, relay_state.offer_ids)'},
                   asin_offset = EXCLUDED.asin_offset,
                   priority_asins = EXCLUDED.priority_asins,
+                  pinned_asins   = COALESCE(EXCLUDED.pinned_asins, relay_state.pinned_asins),
                   block_count = 0,
                   cooldown_until = NULL,
                   updated_at  = NOW()
@@ -8305,6 +8326,7 @@ module.exports = async (req, res) => {
               _result?.offerIdsBySku ? JSON.stringify(_result.offerIdsBySku) : null,
               parseInt(_result?.nextAsinOffset) || 0,
               (_result?.priorityAsins && _result.priorityAsins.length) ? _result.priorityAsins : null,
+              (_result?.pinnedAsins && _result.pinnedAsins.length) ? _result.pinnedAsins : null,
           ]).catch(e => {
             console.warn('[relay_result] db update failed:', e.message);
           });
@@ -8427,8 +8449,27 @@ module.exports = async (req, res) => {
       const markupPct  = parseFloat(mkRaw  ?? 23);
       const handling   = parseFloat(handRaw ?? 2);
       const defaultQty = parseInt(qtyRaw) || 1;
+      // ── AUTH PRE-FLIGHT (moved to the top, Aug 2026) ──────────────────────
+      // This used to run just before PHASE 1 — far too late. Offer discovery
+      // happens well before that, so an expired token produced "found 0 offer
+      // IDs" and the sync ran against an empty group. Validating FIRST is also
+      // what lets syncing run with the DropSync tab closed: the server holds
+      // refresh_token, so it can mint a working token without the browser.
+      let _tok = access_token;
+      if (!(await _tokenIsValidCached(_tok))) {
+        const _acct = body.accountId || await _resolveEbayAccountId(_tok).catch(() => null);
+        const fresh = _acct ? await _refreshAccessTokenFor(_acct) : null;
+        if (fresh) {
+          _tok = fresh;
+          console.log(`[smartSync] token expired — refreshed server-side (tab not required)`);
+        } else {
+          console.error(`[smartSync] ${ebaySku}: token expired and no usable refresh_token for ${_acct || 'unknown account'} — aborting before any write`);
+          return res.json({ success: false, authExpired: true,
+            error: 'eBay token expired and could not be refreshed. Open DropSync and reconnect eBay once to store a fresh refresh token.' });
+        }
+      }
       const auth = {
-        Authorization: `Bearer ${access_token}`,
+        Authorization: `Bearer ${_tok}`,
         'Content-Type': 'application/json',
         'Content-Language': 'en-US',
         'Accept-Language': 'en-US',
@@ -8524,8 +8565,20 @@ module.exports = async (req, res) => {
       // PINNED SET (Aug 2026): a parent with 250+ variants used to cost
       // hundreds of Amazon fetches for one listing. The client pins at most 25
       // variants once; only those are priced and updated from then on.
-      const _pinned = Array.isArray(body.pinnedAsins)
+      const MAX_TRACKED = parseInt(process.env.MAX_TRACKED_ASINS) || 25;
+      let _pinned = Array.isArray(body.pinnedAsins)
         ? body.pinnedAsins.filter(a => /^[A-Z0-9]{10}$/.test(String(a))) : [];
+      // AUTO-PIN (Aug 2026): the browser establishes pins, but listings synced
+      // only by the extension never went through that path — logs still showed
+      // 304-ASIN listings burning the whole fetch budget. Pin here too, so it
+      // happens no matter which path syncs the listing. Deterministic order, so
+      // repeated syncs always choose the SAME variants.
+      let _autoPinned = false;
+      if (!_pinned.length && allUniqueAsins.length > MAX_TRACKED) {
+        _pinned = allUniqueAsins.slice(0, MAX_TRACKED);
+        _autoPinned = true;
+        console.log(`[smartSync] auto-pinned ${_pinned.length} of ${allUniqueAsins.length} variants (no pin supplied — fixed from now on)`);
+      }
       const _pinnedSet = _pinned.length ? new Set(_pinned) : null;
       if (_pinnedSet) {
         const _before = allUniqueAsins.length;
@@ -9459,28 +9512,7 @@ module.exports = async (req, res) => {
       // COST: two bulk passes instead of one (~2 extra API calls per 25
       // variants) and a brief window where the listing is unbuyable. Set
       // TWO_PHASE_SYNC=off to fall back to single-pass.
-      // ── AUTH PRE-FLIGHT ───────────────────────────────────────────────────
-      // PHASE 1 zeroes the listing. If the token dies between phase 1 and
-      // phase 2, every variant is left unbuyable — a token expiry becomes an
-      // outage. So verify (and if needed refresh) BEFORE writing anything, and
-      // abort untouched if we can't get a working token.
-      let _tok = access_token;
-      if (updates.length > 0) {
-        if (!(await _tokenIsValid(_tok))) {
-          const _acct = body.accountId || await _resolveEbayAccountId(_tok).catch(() => null);
-          const fresh = _acct ? await _refreshAccessTokenFor(_acct) : null;
-          if (fresh && await _tokenIsValid(fresh)) {
-            _tok = fresh;
-            auth.Authorization = `Bearer ${fresh}`;
-            console.log(`[smartSync] token had expired — refreshed and continuing`);
-          } else {
-            console.error(`[smartSync] ${ebaySku}: token expired and refresh failed — ABORTING before any write (listing untouched)`);
-            return res.json({ success: false, authExpired: true,
-              error: 'eBay token expired and could not be refreshed. Reconnect eBay in DropSync settings.' });
-          }
-        }
-      }
-
+      // (auth pre-flight now runs at the top of smartSync)
       const _twoPhase = (process.env.TWO_PHASE_SYNC || 'on').toLowerCase() !== 'off';
       let okCount = 0, failCount = 0;
       const _failReasons = { get429: 0, get4xx: 0, get5xx: 0, getNet: 0,
@@ -9537,10 +9569,48 @@ module.exports = async (req, res) => {
         return { ok: okSet, failed };
       };
 
+      // ── SAFETY GUARD: never zero a listing we have no data for ───────────
+      // A listing with 300 variants but only 15 fetched per cycle produced
+      // "PHASE 1 zeroing 75/100, PHASE 2 restoring 0" — the entire listing went
+      // unbuyable because none of the fetched ASINs belonged to the matched
+      // SKUs. Zeroing everything while knowing nothing is indistinguishable
+      // from a data outage, so it must never happen.
+      //
+      // Genuinely-all-out-of-stock is different: there we HAVE fresh data, it
+      // just says out of stock. That case still proceeds.
+      const _confirmedInStock = updates.filter(u => u.availableQuantity > 0).length;
+      const _dataCoverage = Object.keys(offerMap).filter(sku => {
+        const a = skuToAsin[sku];
+        return a && asinPrice[a] !== undefined;
+      }).length;
+      if (_confirmedInStock === 0 && _dataCoverage === 0) {
+        console.error(`[smartSync] ${normSku}: ABORTING — 0 variants have price data ` +
+          `(${Object.keys(offerMap).length} SKUs, ${allUniqueAsins.length} ASINs, ` +
+          `${Object.keys(clientAsinData || {}).length} priced this cycle). ` +
+          `Zeroing now would make the whole listing unbuyable on no evidence. Listing left untouched.`);
+        return res.json({ success: false, aborted: 'no_price_data',
+          groupSkus: Object.keys(offerMap).length,
+          totalAsins: allUniqueAsins.length,
+          hint: allUniqueAsins.length > 25
+            ? 'This parent has more variants than one cycle can fetch. Pin a fixed set (MAX_TRACKED_ASINS) so the same variants are refreshed every sync.'
+            : 'No ASIN prices arrived from the browser this cycle — check the extension.' });
+      }
+
       // ── PHASE 1: zero everything ─────────────────────────────────────────────
       // eBay requires price > 0 on every entry, so we resend each offer's
       // CURRENT price — phase 1 changes quantity only, never price.
       let _zeroed = 0;
+      // Coverage ratio decides how aggressive zeroing may be. With full
+      // coverage, zero-then-restore is safe and correct. With thin coverage,
+      // zeroing variants we simply haven't looked at destroys live inventory.
+      const _coverageRatio = Object.keys(offerMap).length
+        ? _dataCoverage / Object.keys(offerMap).length : 0;
+      const _MIN_COVERAGE = parseFloat(process.env.ZERO_MIN_COVERAGE || '0.5');
+      if (_twoPhase && _coverageRatio < _MIN_COVERAGE) {
+        console.warn(`[smartSync] ${normSku}: coverage ${(_coverageRatio*100).toFixed(0)}% ` +
+          `(${_dataCoverage}/${Object.keys(offerMap).length}) below ${(_MIN_COVERAGE*100)}% — ` +
+          `zeroing ONLY variants with fresh data saying out-of-stock, leaving un-fetched ones as they are`);
+      }
       if (_twoPhase) {
         const _wanted = new Map(updates.map(u => [u.sku, u]));
         const _untrackedSet = new Set(_untrackedSkus);
@@ -9556,6 +9626,11 @@ module.exports = async (req, res) => {
           // Untracked variants are handled above (zeroed once) — re-zeroing
           // them every cycle would burn revisions for no change.
           if (!want && _untrackedSet.has(sku)) continue;
+          // Thin coverage: only touch variants we actually have data for.
+          if (_coverageRatio < _MIN_COVERAGE && !want) {
+            const _a = skuToAsin[sku];
+            if (!_a || asinPrice[_a] === undefined) continue;   // no data → leave alone
+          }
           // Skip if phase 2 will set this exact SKU to 0 anyway (avoids a
           // duplicate write while keeping the same end state).
           if (want && want.availableQuantity === 0) continue;
@@ -9940,6 +10015,8 @@ module.exports = async (req, res) => {
         zeroedFirst: _zeroed,
         untrackedCount: _untrackedSkus.length,
         trackedAsins: allUniqueAsins.length,
+        pinnedAsins: _pinned.length ? _pinned : undefined,
+        autoPinned: _autoPinned || undefined,
         unresolvedCount: _unresolvedSkus.length,
         orphanedCount: _orphanedSkus.length,
         orphanedSkus:  _orphanedSkus.length > 0 ? _orphanedSkus.slice(0, 20) : undefined,
