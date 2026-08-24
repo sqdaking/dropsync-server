@@ -10898,6 +10898,19 @@ module.exports = async (req, res) => {
           for (const u of list) urls.push({ url: u, dept: d });
         }
       }
+      // FETCHABILITY ORDER (Aug 2026): Amazon returns 503 for automated
+      // requests to /s?k= search URLs, while bestsellers and browse-node pages
+      // load normally. Put the reliable ones first so an import yields results
+      // immediately instead of burning its first pages on refusals (search
+      // URLs still run, via the extension's tab-load fallback).
+      const _rank = (u) => {
+        if (/\/gp\/bestsellers/.test(u)) return 0;
+        if (/node=/.test(u)) return 1;
+        if (/\/deals/.test(u)) return 2;
+        if (/[?&]k=/.test(u)) return 4;      // search — least reliable
+        return 3;
+      };
+      urls.sort((a, b) => _rank(a.url) - _rank(b.url));
       return res.json({ success: true, urls });
     }
 
