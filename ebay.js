@@ -8340,7 +8340,9 @@ module.exports = async (req, res) => {
 
     // Extension reports a block from Amazon — put this ASIN in cooldown.
     if (action === 'relay_blocked') {
-      const { ebaySku, reason = 'amazon_block', cooldownMinutes = 30 } = body;
+      // 30 minutes benched a listing for half an hour over one bad fetch.
+      // 10 is plenty to avoid retrying it in the same pass.
+      const { ebaySku, reason = 'amazon_block', cooldownMinutes = 10 } = body;
       if (!ebaySku) return res.status(400).json({ error: 'Missing ebaySku' });
       try {
         await _ensureRelayStateSchema();
