@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-24.2 (import priority)');
+console.log('[dropsync] build 2026-08-24.3 (free availability from twister)');
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -1505,8 +1505,40 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     if (p > 0 && p < 10000 && !result[m[1]]) result[m[1]] = { price: p, inStock: true };
   }
 
+  // ── FREE AVAILABILITY (Aug 2026) ──────────────────────────────────────────
+  // The probe showed Amazon no longer embeds per-variant PRICES in the parent
+  // page — but dimensionValuesDisplayData does carry per-variant
+  // `dimensionValueState`. Any variant marked other than AVAILABLE is out of
+  // stock, and we can know that WITHOUT spending a fetch on it.
+  //
+  // Only used to mark OOS (never to claim in-stock): a false OOS costs a
+  // missed sale, a false in-stock sells something we can't fulfil.
+  let _freeOos = 0;
+  try {
+    const H = mainHtml || '';
+    for (const m of H.matchAll(/"defaultAsin"\s*:\s*"([A-Z0-9]{10})"[\s\S]{0,200}?"dimensionValueState"\s*:\s*"([A-Z_]+)"/g)) {
+      const [, asin, state] = m;
+      if (state !== 'AVAILABLE' && !result[asin] && uniqueAsins.includes(asin)) {
+        result[asin] = { price: 0, inStock: false };
+        _freeOos++;
+      }
+    }
+    // same pair in the reverse order
+    for (const m of H.matchAll(/"dimensionValueState"\s*:\s*"([A-Z_]+)"[\s\S]{0,200}?"defaultAsin"\s*:\s*"([A-Z0-9]{10})"/g)) {
+      const [, state, asin] = m;
+      if (state !== 'AVAILABLE' && !result[asin] && uniqueAsins.includes(asin)) {
+        result[asin] = { price: 0, inStock: false };
+        _freeOos++;
+      }
+    }
+    if (_freeOos > 0) {
+      console.log(`[prefetchAsin] ${_freeOos} variants marked out-of-stock from the parent page (no fetch needed)`);
+    }
+  } catch(e) {}
+
   const bulkHits = Object.keys(result).length;
-  console.log(`[prefetchAsin] bulk extracted ${bulkHits}/${uniqueAsins.length} prices from parent page HTML`);
+  console.log(`[prefetchAsin] bulk extracted ${bulkHits}/${uniqueAsins.length} prices from parent page HTML` +
+    (_freeOos ? ` (${_freeOos} of them free OOS flags)` : ''));
 
   // SELF-DIAGNOSING PROBE (Aug 2026): bulk extraction has returned 0 on every
   // listing, which means each one pays ~25 individual fetches for prices the
@@ -1531,7 +1563,8 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
       'a-price-whole':          H.includes('a-price-whole'),
       'data-asin= + $':         /data-asin="[A-Z0-9]{10}"[\s\S]{0,400}?\$\d/.test(H),
     };
-    console.warn('[prefetchAsin] BULK EXTRACTION FOUND NOTHING — page markers present:');
+    console.warn('[prefetchAsin] no per-variant prices in parent HTML (expected on current Amazon layout — ' +
+      'prices live on each variant page, so individual fetches are required). Markers present:');
     console.table(markers);
     // Show the surroundings of a real variant ASIN so the actual price
     // structure is visible rather than inferred.
