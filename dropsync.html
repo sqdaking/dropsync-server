@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-22.5 (pinned 25-ASIN cap)');
+console.log('[dropsync] build 2026-08-24.1 (sched baseline + bulk-extract diag)');
 
 // ── PINNED VARIANT SET (Aug 2026) ────────────────────────────────────────────
 // Some parents carry 250+ variants. Fetching them all cost hundreds of Amazon
@@ -708,7 +708,7 @@ const SCHED = {
   coverageDays: 1,        // aim for one full pass per day
   lastFetches: null, lastSynced: null, lastAt: 0,
   ema: null,              // smoothed fetches-per-listing
-  blocks: 0, lastBlocked: 0,
+  blocks: 0, blocksInit: false, lastBlocked: 0,
   current: null,
 };
 
@@ -732,6 +732,15 @@ async function _schedNextInterval(listingCount) {
   SCHED.lastFetches = st.fetchesToday;
   SCHED.lastSynced  = st.syncedToday;
 
+  // Baseline the block counter on FIRST observation. It started at 0, so any
+  // blocks that happened earlier today were counted as "new" on the very first
+  // scheduler run and triggered an immediate back-off before a single listing
+  // had been synced.
+  if (SCHED.blocksInit !== true) {
+    SCHED.blocks = st.blockedToday || 0;
+    SCHED.blocksInit = true;
+    if (SCHED.blocks > 0) console.log(`[sched] baseline: ${SCHED.blocks} blocks already recorded today (not counted as new)`);
+  }
   // React to blocks BEFORE anything else — a rising block count means the
   // current rate is already too high, whatever the arithmetic says.
   if ((st.blockedToday || 0) > SCHED.blocks) {
@@ -1452,6 +1461,46 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
 
   const bulkHits = Object.keys(result).length;
   console.log(`[prefetchAsin] bulk extracted ${bulkHits}/${uniqueAsins.length} prices from parent page HTML`);
+
+  // SELF-DIAGNOSING PROBE (Aug 2026): bulk extraction has returned 0 on every
+  // listing, which means each one pays ~25 individual fetches for prices the
+  // parent page probably already contains. The patterns were written against
+  // an older Amazon layout; rather than guess at the new one, report which
+  // price structures the page ACTUALLY contains so they can be matched exactly.
+  // Runs at most once per session — it's a diagnostic, not a hot path.
+  if (bulkHits === 0 && uniqueAsins.length >= 5 && !window._bulkProbeDone) {
+    window._bulkProbeDone = true;
+    const H = mainHtml || '';
+    const markers = {
+      'percent savings':        /\$\d[\d.]*\s+with\s+\d+\s*percent\s+savings/.test(H),
+      '"priceAmount"':          H.includes('"priceAmount"'),
+      '"variationPrices"':      H.includes('"variationPrices"'),
+      '"priceToPay"':           H.includes('"priceToPay"'),
+      'twister-plus-price-data': H.includes('twister-plus-price-data'),
+      'twisterSlotJson':        H.includes('twisterSlotJson'),
+      'dimensionValuesDisplayData': H.includes('dimensionValuesDisplayData'),
+      'asinVariationValues':    H.includes('asinVariationValues'),
+      'landingAsinPrice':       H.includes('landingAsinPrice'),
+      '"displayPrice"':         H.includes('"displayPrice"'),
+      'a-price-whole':          H.includes('a-price-whole'),
+      'data-asin= + $':         /data-asin="[A-Z0-9]{10}"[\s\S]{0,400}?\$\d/.test(H),
+    };
+    console.warn('[prefetchAsin] BULK EXTRACTION FOUND NOTHING — page markers present:');
+    console.table(markers);
+    // Show the surroundings of a real variant ASIN so the actual price
+    // structure is visible rather than inferred.
+    const other = uniqueAsins.find(a => H.includes(a));
+    if (other) {
+      const i = H.indexOf(other);
+      console.log('[prefetchAsin] context around variant ASIN ' + other + ':\n' +
+        H.slice(Math.max(0, i - 200), i + 400).replace(/\s+/g, ' '));
+    } else {
+      console.log('[prefetchAsin] none of the variant ASINs appear in the parent HTML at all — ' +
+        'prices for them cannot be there either, so individual fetches are unavoidable for this listing.');
+    }
+    const pa = H.match(/"priceAmount"[\s\S]{0,200}/);
+    if (pa) console.log('[prefetchAsin] priceAmount sample:\n' + pa[0].replace(/\s+/g, ' '));
+  }
 
   // ── FALLBACK: only fetch ASINs not covered by bulk extraction ──────────────
   // EXTENSION-ONLY (July 2026): CORS proxies removed (blocked + leaky).
@@ -9130,7 +9179,9 @@ function renderSettings() {
   if (!_relayTimer && S.browserRelay !== false) {
     if (S.browserRelay === undefined) { S.browserRelay = true; save(); }
     startBrowserRelay();
+    if (!_relayActive && !_relayTimer) {
     console.log('[relay] auto-started — browser fetches Amazon, server is fallback only');
+  }
   }
   _maybeStartRelay();
   if (S.token && S.serverUrl) loadPolicies();
