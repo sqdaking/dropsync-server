@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-24.6 (tab fetch for low-yield pages)');
+console.log('[dropsync] build 2026-08-24.7 (pin the variants you actually sell)');
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -723,10 +723,17 @@ const MAX_TRACKED_ASINS = 25;
 // Choose which variants to pin. Preference order:
 //   1. ones already priced from the parent page (free — no fetch needed)
 //   2. twister order, which roughly tracks Amazon's own popularity ordering
-function pickPinnedAsins(allAsins, alreadyPriced) {
-  const priced = allAsins.filter(a => alreadyPriced && alreadyPriced[a]);
-  const rest   = allAsins.filter(a => !(alreadyPriced && alreadyPriced[a]));
-  return [...priced, ...rest].slice(0, MAX_TRACKED_ASINS);
+function pickPinnedAsins(allAsins, alreadyPriced, ownAsins) {
+  // Order of preference:
+  //   1. ASINs this eBay listing's own SKUs map to — the variants you SELL.
+  //      Skipping this pinned variants off the Amazon parent that the listing
+  //      doesn't even carry, so coverage sat at 7% and syncs aborted.
+  //   2. ones already priced from the parent page (free)
+  //   3. remaining variants, in twister order
+  const own = (ownAsins || []).filter(a => allAsins.includes(a));
+  const priced = allAsins.filter(a => !own.includes(a) && alreadyPriced && alreadyPriced[a]);
+  const rest = allAsins.filter(a => !own.includes(a) && !priced.includes(a));
+  return [...own, ...priced, ...rest].slice(0, MAX_TRACKED_ASINS);
 }
 window.MAX_TRACKED_ASINS = MAX_TRACKED_ASINS;
 window.pickPinnedAsins = pickPinnedAsins;
@@ -8218,9 +8225,12 @@ async function smartSyncProduct(p) {
           const _all = [...new Set(Object.values(_freshDta || p.comboAsin || {}))]
             .filter(a => /^[A-Z0-9]{10}$/.test(String(a)));
           if (_all.length) {
-            p.pinnedAsins = pickPinnedAsins(_all, null);
+            const _own = [...new Set(Object.values(p.skuToAsin || {}))]
+              .filter(a => /^[A-Z0-9]{10}$/.test(String(a)));
+            p.pinnedAsins = pickPinnedAsins(_all, null, _own);
             markDirty(p.id);
-            console.log(`[smartSync] ${p.ebaySku}: pinned ${p.pinnedAsins.length} of ${_all.length} variants (fixed from now on)`);
+            console.log(`[smartSync] ${p.ebaySku}: pinned ${p.pinnedAsins.length} of ${_all.length} variants ` +
+              `(${_own.filter(a => p.pinnedAsins.includes(a)).length} from this listing's own SKUs)`);
           }
         }
         _clientAsinData = await prefetchAsinPrices(parentHtml, {
@@ -8313,7 +8323,8 @@ async function smartSyncProduct(p) {
     p._priorityAsins = (d.priorityAsins && d.priorityAsins.length) ? d.priorityAsins : undefined;
     // If the SERVER established the pin (listing synced via the extension
     // first), adopt it so both paths track the identical variants.
-    if (d.pinnedAsins && d.pinnedAsins.length && (!p.pinnedAsins || !p.pinnedAsins.length)) {
+    if (d.pinnedAsins && d.pinnedAsins.length &&
+        (!p.pinnedAsins || !p.pinnedAsins.length || d.autoPinned)) {
       p.pinnedAsins = d.pinnedAsins; markDirty(p.id);
       console.log(`[smartSync] adopted server pin for ${p.ebaySku}: ${d.pinnedAsins.length} variants`);
     }
