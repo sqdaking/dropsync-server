@@ -8107,6 +8107,12 @@ async function smartSyncProduct(p) {
     // ASINs whose variants are sitting at qty=0 waiting for a price (mapping
     // was corrected). Fetch these FIRST next cycle so they go buyable again.
     p._priorityAsins = (d.priorityAsins && d.priorityAsins.length) ? d.priorityAsins : undefined;
+    // If the SERVER established the pin (listing synced via the extension
+    // first), adopt it so both paths track the identical variants.
+    if (d.pinnedAsins && d.pinnedAsins.length && (!p.pinnedAsins || !p.pinnedAsins.length)) {
+      p.pinnedAsins = d.pinnedAsins; markDirty(p.id);
+      console.log(`[smartSync] adopted server pin for ${p.ebaySku}: ${d.pinnedAsins.length} variants`);
+    }
     if (d.correctedCount) console.log(`[smartSync] ${d.correctedCount} mappings corrected on ${p.ebaySku} — ${(d.priorityAsins||[]).length} ASINs queued for priority refetch`);
     // Save next ASIN offset for progressive slicing (large products)
     p._asinOffset = d.nextAsinOffset || 0;
