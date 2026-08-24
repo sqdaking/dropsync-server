@@ -657,7 +657,53 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-24.1 (sched baseline + bulk-extract diag)');
+console.log('[dropsync] build 2026-08-24.2 (import priority)');
+
+// ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
+// Import and background sync both hit Amazon through one residential IP and
+// one fetch budget. Previously import was simply REFUSED while the relay ran,
+// which meant you had to stop syncing by hand, remember to restart it, and any
+// overlap risked blocks. Import now takes precedence automatically: the relay
+// pauses, the extension's background ticks pause, the import runs with the
+// whole budget, and everything resumes afterwards — including on failure.
+let _importDepth = 0;
+let _relayWasRunningBeforeImport = false;
+
+async function beginImportPriority(reason, estimateMs) {
+  _importDepth++;
+  if (_importDepth > 1) return;              // already paused by an outer import
+  _relayWasRunningBeforeImport = !!(_relayActive || _relayTimer);
+  if (_relayWasRunningBeforeImport) {
+    stopBrowserRelay();
+    console.log(`[priority] relay paused for ${reason}`);
+  }
+  try {
+    await window.dsExt?.pauseSync?.(estimateMs || 15 * 60000, reason);
+  } catch(e) {}
+  try { toast(`Sync paused — ${reason} has priority`, 'info', 3500); } catch(e) {}
+}
+
+async function endImportPriority(reason) {
+  _importDepth = Math.max(0, _importDepth - 1);
+  if (_importDepth > 0) return;              // an outer import is still running
+  try { await window.dsExt?.resumeSync?.(); } catch(e) {}
+  if (_relayWasRunningBeforeImport) {
+    _relayWasRunningBeforeImport = false;
+    // Small delay so the last import fetch fully settles before syncing resumes
+    setTimeout(() => { startBrowserRelay(); console.log('[priority] relay resumed'); }, 5000);
+  }
+  console.log(`[priority] ${reason} finished — background sync released`);
+}
+
+// Wrap any async job so it owns the Amazon budget for its duration.
+async function withImportPriority(reason, fn, estimateMs) {
+  await beginImportPriority(reason, estimateMs);
+  try { return await fn(); }
+  finally { await endImportPriority(reason); }
+}
+window.beginImportPriority = beginImportPriority;
+window.endImportPriority = endImportPriority;
+window.withImportPriority = withImportPriority;
 
 // ── PINNED VARIANT SET (Aug 2026) ────────────────────────────────────────────
 // Some parents carry 250+ variants. Fetching them all cost hundreds of Amazon
@@ -2758,24 +2804,21 @@ async function bulkFetchDeals(dept) {
   // the request rate and is what pushed the extension into block cooldown —
   // which then stalled syncing entirely. Syncing your live listings matters
   // more than sourcing new ones, so deal fetching waits.
-  if (_relayActive || _relayTimer) {
-    const msg = 'Sync relay is running — pause it in Settings before fetching deals (both share the same Amazon request budget).';
-    console.warn('[bulk] blocked:', msg);
-    toast(msg, 'warn', 7000);
-    return;
-  }
+  // Import wins: take the budget rather than refusing.
+  await beginImportPriority('deal import', 20 * 60000);
   try {
     const _st = await window.dsExt?.getStatus?.();
     if (_st?.cooldownUntil && _st.cooldownUntil > Date.now()) {
       const secs = Math.ceil((_st.cooldownUntil - Date.now()) / 1000);
-      toast(`Amazon cooldown active — wait ${secs}s before fetching deals`, 'warn', 6000);
-      return;
+      toast(`Amazon is cooling down — starting in ${secs}s`, 'warn', 5000);
+      await new Promise(r => setTimeout(r, Math.min(60000, _st.cooldownUntil - Date.now() + 1000)));
     }
   } catch(e) {}
-  if (!S.serverUrl) { toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
-  // Ensure BULK is initialized before checking scraping state
+  // Any early return past this point must release priority, or background
+  // sync would stay paused indefinitely.
+  if (!S.serverUrl) { await endImportPriority('deal import'); toast('Set Railway URL in Settings first', 'error'); nav('settings'); return; }
   if (!window.BULK) { bulkLoadState?.(); }
-  if (typeof BULK === 'undefined' || BULK.scraping) return;
+  if (typeof BULK === 'undefined' || BULK.scraping) { await endImportPriority('deal import'); return; }
   BULK.scraping = true;
   BULK._scrapingStartedAt = Date.now(); // track start so stuck flag can be auto-cleared
   renderBulk();
@@ -2965,6 +3008,10 @@ async function bulkFetchDeals(dept) {
     bulkLog(`Done! ${ok} products ready to push, ${skipped} skipped`, ok>0?'success':'warn');
   } catch(e) {
     bulkLog('Error: ' + e.message, 'error');
+  } finally {
+    // Release even on error — otherwise a failed import leaves syncing
+    // paused forever with no visible reason.
+    await endImportPriority('deal import');
   }
 
   BULK.scraping = false;
@@ -4912,6 +4959,9 @@ async function draftSmartSync(pid) {
 async function rescrapeAllDrafts() {
   const drafts = (S.products||[]).filter(p => p.status === 'draft' && p.sourceUrl);
   if (!drafts.length) { toast('No drafts to rescrape', 'info', 2000); return; }
+  // Rescraping is an import-class job: give it the whole Amazon budget.
+  await beginImportPriority('draft rescrape', Math.min(2*3600000, drafts.length * 6000));
+  try {
 
   const btn = document.getElementById('draft-rescrape-btn');
   const origHtml = btn?.innerHTML || '🔄 Rescrape All';
@@ -4989,6 +5039,9 @@ async function rescrapeAllDrafts() {
     : `✅ Rescraped ${done} drafts fresh from Amazon${errors ? ` (${errors} blocked/errors)` : ''}`;
   toast(msg, errors > done/2 ? 'warn' : 'success', 5000);
   addLog('info', 'Rescrape All Drafts', msg, {});
+  } finally {
+    await endImportPriority('draft rescrape');
+  }
 }
 
 async function draftEditScrape(pid) {
