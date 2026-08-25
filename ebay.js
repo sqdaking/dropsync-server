@@ -8626,6 +8626,14 @@ module.exports = async (req, res) => {
           }
         }
       }
+      // CHUNKED FULL COVERAGE (Aug 2026)
+      //   chunkAsins     = refresh these on THIS pass
+      //   pinned/tracked = the full set we intend to keep buyable
+      // A tracked variant outside this chunk is LEFT ALONE, never zeroed —
+      // otherwise chunk 2 would knock out whatever chunk 1 just restored.
+      const _chunk = Array.isArray(body.chunkAsins)
+        ? body.chunkAsins.filter(a => /^[A-Z0-9]{10}$/.test(String(a))) : [];
+      const _chunkSet = _chunk.length ? new Set(_chunk) : null;
       let _pinnedSet = _pinned.length ? new Set(_pinned) : null;
       if (_pinnedSet) {
         const _before = allUniqueAsins.length;
