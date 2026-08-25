@@ -6955,6 +6955,24 @@ module.exports = async (req, res) => {
       } catch(e) { return res.status(500).json({ error: e.message }); }
     }
 
+    // Which of these ASINs already have fresh cached data? The in-tab relay
+    // had no cache awareness at all, so when it and the extension both touched
+    // a listing, every ASIN was fetched twice. This lets the browser skip what
+    // the server already knows.
+    if (action === 'cache_fresh') {
+      if (!_cacheReady) return res.json({ fresh: [] });
+      const asins = Array.isArray(body.asins) ? body.asins.filter(a => /^[A-Z0-9]{10}$/.test(String(a))) : [];
+      if (!asins.length) return res.json({ fresh: [] });
+      const hrs = Math.max(1, Math.min(168, parseInt(body.maxAgeHours) || 20));
+      try {
+        const r = await _cachePool.query(
+          `SELECT asin FROM asin_cache WHERE asin = ANY($1::text[])
+             AND fetched_at > NOW() - ($2 || ' hours')::interval`,
+          [asins, String(hrs)]);
+        return res.json({ fresh: r.rows.map(x => x.asin), checked: asins.length, maxAgeHours: hrs });
+      } catch(e) { return res.json({ fresh: [], error: e.message }); }
+    }
+
     if (action === 'cache_clear') {
       if (!_cacheReady) return res.json({ ready: false });
       const asins = body.asins;
@@ -8608,7 +8626,7 @@ module.exports = async (req, res) => {
           }
         }
       }
-      const _pinnedSet = _pinned.length ? new Set(_pinned) : null;
+      let _pinnedSet = _pinned.length ? new Set(_pinned) : null;
       if (_pinnedSet) {
         const _before = allUniqueAsins.length;
         allUniqueAsins = allUniqueAsins.filter(a => _pinnedSet.has(a));
@@ -9303,6 +9321,36 @@ module.exports = async (req, res) => {
           }
         }
         console.log(`[smartSync] aspect-slug upgrade: ${_aspectUpgrades} corrected, ${_aspectNewMatches} new matches (from ${Object.keys(skuAspects).length} SKUs with aspects, compound-only${_mDim ? ', multi-dim' : ''})`);
+      }
+
+      // ── PIN CORRECTION, NOW THAT WE KNOW THE MAPPING (Aug 2026) ───────────
+      // Pinning runs at the START of the sync, but skuToAsin is only rebuilt
+      // HERE. When the stored map arrived empty, the pin was chosen from
+      // arbitrary parent variants — the logs showed "25 of 107 variants (0 from
+      // this listing's own SKUs)" and coverage stuck at 18-33%.
+      // Now that the SKU→ASIN mapping is known, re-derive the pin from the
+      // variants this listing actually sells. It's returned to the caller and
+      // persisted, so the next sync fetches the right ASINs.
+      {
+        const _mapped = [...new Set(Object.values(skuToAsin))]
+          .filter(a => /^[A-Z0-9]{10}$/.test(String(a)));
+        if (_mapped.length && _pinnedSet) {
+          const _hit = _mapped.filter(a => _pinnedSet.has(a)).length;
+          if (_hit / _mapped.length < 0.8) {
+            const _rest = allUniqueAsins.filter(a => !_mapped.includes(a));
+            const _newPin = [..._mapped, ..._rest].slice(0, MAX_TRACKED);
+            console.log(`[smartSync] pin corrected: covered ${_hit}/${_mapped.length} of this listing's ASINs → now ${Math.min(_mapped.length, MAX_TRACKED)}/${_mapped.length}`);
+            _pinned = _newPin;
+            _pinnedSet.clear();
+            for (const a of _newPin) _pinnedSet.add(a);
+            _autoPinned = true;
+          }
+        } else if (_mapped.length && !_pinnedSet && _mapped.length > MAX_TRACKED) {
+          _pinned = _mapped.slice(0, MAX_TRACKED);
+          _pinnedSet = new Set(_pinned);
+          _autoPinned = true;
+          console.log(`[smartSync] pinned ${_pinned.length} of ${_mapped.length} mapped variants`);
+        }
       }
 
       // Pre-sort valToAsin entries by key length desc — same reason as the reconstruction
