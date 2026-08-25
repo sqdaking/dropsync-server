@@ -9336,7 +9336,12 @@ module.exports = async (req, res) => {
           .filter(a => /^[A-Z0-9]{10}$/.test(String(a)));
         if (_mapped.length && _pinnedSet) {
           const _hit = _mapped.filter(a => _pinnedSet.has(a)).length;
-          if (_hit / _mapped.length < 0.8) {
+          // Compare against what's ACHIEVABLE, not against 100%. A listing with
+          // 43 mapped ASINs can never exceed 25 tracked, so measuring "25/43 =
+          // 58%" against an 80% bar made the correction re-fire on every sync
+          // forever, re-persisting an identical pin each time.
+          const _best = Math.min(MAX_TRACKED, _mapped.length);
+          if (_hit < _best * 0.9) {
             const _rest = allUniqueAsins.filter(a => !_mapped.includes(a));
             const _newPin = [..._mapped, ..._rest].slice(0, MAX_TRACKED);
             console.log(`[smartSync] pin corrected: covered ${_hit}/${_mapped.length} of this listing's ASINs → now ${Math.min(_mapped.length, MAX_TRACKED)}/${_mapped.length}`);
