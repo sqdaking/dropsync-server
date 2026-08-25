@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-24.7 (pin the variants you actually sell)');
+console.log('[dropsync] build 2026-08-25.1 (gentler import pacing)');
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -1603,6 +1603,13 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     if (before !== toFetch.length) {
       console.log(`[prefetchAsin] pinned set: fetching ${toFetch.length} of ${before} uncovered (${_opts.pinned.length} tracked)`);
     }
+  }
+  // Drop ASINs the server already has fresh — it fills them from cache.
+  if (Array.isArray(_opts.skipFresh) && _opts.skipFresh.length) {
+    const skip = new Set(_opts.skipFresh);
+    const before = toFetch.length;
+    toFetch = toFetch.filter(a => !skip.has(a));
+    if (before !== toFetch.length) console.log(`[prefetchAsin] skipped ${before - toFetch.length} server-cached ASINs`);
   }
   // HARD CEILING for every caller — six call sites passed no cap at all, which
   // is how one listing ended up firing 257 individual fetches.
@@ -2856,8 +2863,12 @@ async function fetchDealsAsins(dept) {
       bulkLog(`Page ${i+1}/${urlsData.urls.length}: +${added} (pool: ${Object.keys(productMap).length})`);
       // Stop early if we have plenty
       if (Object.keys(productMap).length >= 100) break;
-      // Brief pause between pages
-      await new Promise(r => setTimeout(r, 800 + Math.random()*600));
+      // Import pages are search/browse pages loaded in real tabs — heavier and
+      // far more sensitive than product pages. 0.8-1.4s between them was the
+      // pace that made blocks cluster around imports while ordinary syncing ran
+      // clean for hours. 4-8s costs a couple of minutes per import and keeps
+      // the shared budget healthy for the sync engine afterwards.
+      await new Promise(r => setTimeout(r, 4000 + Math.random()*4000));
     } catch(e) {
       console.warn(`[bulk] page ${i+1} error:`, e.message);
     }
@@ -8233,10 +8244,25 @@ async function smartSyncProduct(p) {
               `(${_own.filter(a => p.pinnedAsins.includes(a)).length} from this listing's own SKUs)`);
           }
         }
+        // Ask the server which ASINs it already has fresh data for. Without
+        // this the tab relay refetches ASINs the extension pulled minutes ago —
+        // pure duplicated cost across the two engines.
+        let _skipFresh = [];
+        try {
+          if (p.pinnedAsins && p.pinnedAsins.length) {
+            const cr = await fetch(`${S.serverUrl}/api/ebay?action=cache_fresh`, {
+              method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ asins: p.pinnedAsins, maxAgeHours: S.asinFreshHours ?? 20 }),
+            }).then(r => r.json());
+            _skipFresh = cr.fresh || [];
+            if (_skipFresh.length) console.log(`[smartSync] ${_skipFresh.length}/${p.pinnedAsins.length} ASINs already fresh on the server — not refetching`);
+          }
+        } catch(e) {}
         _clientAsinData = await prefetchAsinPrices(parentHtml, {
           maxFetch: MAX_TRACKED_ASINS,
           pinned: p.pinnedAsins,
           priority: p._priorityAsins,
+          skipFresh: _skipFresh,
         });
         const _n = Object.keys(_clientAsinData || {}).length;
         if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
