@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-25.1 (gentler import pacing)');
+console.log('[dropsync] build 2026-08-25.3 (chunked full coverage)');
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -718,7 +718,15 @@ window.withImportPriority = withImportPriority;
 // Variants outside the pinned set are set unbuyable (qty 0) once and then left
 // alone: never fetched, never repriced. They can't sell at a stale price, and
 // they cost nothing.
-const MAX_TRACKED_ASINS = 25;
+// How many variants a listing may keep BUYABLE. Beyond this they're set
+// unbuyable, so this is a sales decision, not a performance one.
+const MAX_TRACKED_ASINS = 100;
+// How many variants we refresh per pass. Bounded by the Amazon fetch budget,
+// not by eBay: one bulk call covers 25 SKUs, so a 100-variant listing costs
+// ~8 calls against a 250/day allowance.
+const CHUNK_ASINS = 25;
+// Safety stop so one enormous listing can't monopolise a whole session.
+const MAX_CHUNKS_PER_VISIT = 4;
 
 // Choose which variants to pin. Preference order:
 //   1. ones already priced from the parent page (free — no fetch needed)
@@ -1344,8 +1352,35 @@ async function fetchAmazonInBrowser(url) {
 
 // ── Extract price + OOS from a single Amazon product page HTML ─────────────────
 // Mirrors server-side extractPriceFromBuyBox + isAmazonOOS logic
-function _browserExtractAsinData(html) {
+// Which ASIN does this page actually describe? Amazon often serves the PARENT
+// (or a default child) instead of the variant you asked for. The price is then
+// perfectly valid — for the wrong variant — so every variant of a listing ends
+// up sharing one price, with identical shipping and stock. That's the exact
+// signature the logs kept flagging.
+function _pageCanonicalAsin(html) {
+  const pats = [
+    /"currentAsin"\s*:\s*"([A-Z0-9]{10})"/,
+    /id="ASIN"[^>]*value="([A-Z0-9]{10})"/,
+    /name="ASIN\.0"[^>]*value="([A-Z0-9]{10})"/,
+    /"parentAsin"\s*:\s*"[A-Z0-9]{10}"[\s\S]{0,200}?"asin"\s*:\s*"([A-Z0-9]{10})"/,
+    /<link[^>]+rel="canonical"[^>]+\/dp\/([A-Z0-9]{10})/,
+  ];
+  for (const p of pats) { const m = html.match(p); if (m) return m[1]; }
+  return null;
+}
+
+function _browserExtractAsinData(html, expectedAsin) {
   if (!html || html.length < 5000) return null;
+  // Reject data from a page that describes a different variant. A missing
+  // price costs one variant a refresh; a WRONG price is applied to every
+  // variant of the listing and can sell below cost.
+  if (expectedAsin) {
+    const canon = _pageCanonicalAsin(html);
+    if (canon && canon !== expectedAsin) {
+      console.warn(`[prefetchAsin] ${expectedAsin}: page is actually ${canon} — discarding (Amazon served a different variant)`);
+      return null;
+    }
+  }
   // Price: look for buy-box price patterns
   let price = 0;
   const pats = [
@@ -1656,7 +1691,7 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
             if (extHtml && !isBlocked(extHtml)) html = extHtml;
           } catch(e) {}
           if (html) {
-            const data = _browserExtractAsinData(html);
+            const data = _browserExtractAsinData(html, asin);
             if (data) result[asin] = data;
           }
         } catch(e) {}
@@ -8212,6 +8247,7 @@ async function smartSyncProduct(p) {
     // listing skips THIS sync cycle and retries on the next rotation.
     // Server never fetches Amazon directly (no DataImpulse, no Railway IP).
     let _clientAsinData = null;
+    let _chunkForSync = null;
     let _freshDta = null, _freshVV = null, _freshDims = null;
     try {
       const parentHtml = await fetchAmazonInBrowser(p.sourceUrl).catch(() => null);
@@ -8231,7 +8267,9 @@ async function smartSyncProduct(p) {
           if (dimM) _freshDims = JSON.parse(dimM[1]);
           if (_freshDta) console.log(`[smartSync] fresh dta: ${Object.keys(_freshDta).length} combos, dims=[${(_freshDims||[]).join(',')}]`);
         } catch(_me) {}
-        // Establish the pinned set on first sync, then reuse it unchanged.
+        // Which chunk of this listing's variants are we refreshing this pass?
+        // Cursor advances per visit so successive passes cover the whole set.
+        // Establish the tracked set on first sync, then reuse it unchanged.
         if (!Array.isArray(p.pinnedAsins) || p.pinnedAsins.length === 0) {
           const _all = [...new Set(Object.values(_freshDta || p.comboAsin || {}))]
             .filter(a => /^[A-Z0-9]{10}$/.test(String(a)));
@@ -8258,9 +8296,22 @@ async function smartSyncProduct(p) {
             if (_skipFresh.length) console.log(`[smartSync] ${_skipFresh.length}/${p.pinnedAsins.length} ASINs already fresh on the server — not refetching`);
           }
         } catch(e) {}
+        // Rotate a CHUNK_ASINS-sized window through the tracked set. Priority
+        // ASINs (corrected mappings sitting at qty=0) jump to the front.
+        const _tracked = (p.pinnedAsins && p.pinnedAsins.length) ? p.pinnedAsins : null;
+        let _chunk = null;
+        if (_tracked && _tracked.length > CHUNK_ASINS) {
+          const off = (p._chunkCursor || 0) % _tracked.length;
+          _chunk = _tracked.slice(off, off + CHUNK_ASINS);
+          if (_chunk.length < CHUNK_ASINS) _chunk = _chunk.concat(_tracked.slice(0, CHUNK_ASINS - _chunk.length));
+          const _prio = (p._priorityAsins || []).filter(a => _tracked.includes(a) && !_chunk.includes(a));
+          if (_prio.length) _chunk = [..._prio, ..._chunk].slice(0, CHUNK_ASINS);
+          console.log(`[smartSync] ${p.ebaySku}: chunk ${Math.floor(off / CHUNK_ASINS) + 1}/${Math.ceil(_tracked.length / CHUNK_ASINS)} — refreshing ${_chunk.length} of ${_tracked.length} tracked variants`);
+        }
+        _chunkForSync = _chunk;
         _clientAsinData = await prefetchAsinPrices(parentHtml, {
-          maxFetch: MAX_TRACKED_ASINS,
-          pinned: p.pinnedAsins,
+          maxFetch: CHUNK_ASINS,
+          pinned: _chunk || p.pinnedAsins,
           priority: p._priorityAsins,
           skipFresh: _skipFresh,
         });
@@ -8298,6 +8349,7 @@ async function smartSyncProduct(p) {
         clientAsinData:           _clientAsinData,
         // Only these variants are tracked; everything else is left unbuyable.
         pinnedAsins:              (p.pinnedAsins && p.pinnedAsins.length) ? p.pinnedAsins : undefined,
+        chunkAsins:               (_chunkForSync && _chunkForSync.length) ? _chunkForSync : undefined,
         // Fresh variant maps from the parent page — enables exact per-SKU ASIN matching
         freshDta:                 _freshDta   || undefined,
         freshVariationValues:     _freshVV    || undefined,
@@ -8347,6 +8399,12 @@ async function smartSyncProduct(p) {
     // ASINs whose variants are sitting at qty=0 waiting for a price (mapping
     // was corrected). Fetch these FIRST next cycle so they go buyable again.
     p._priorityAsins = (d.priorityAsins && d.priorityAsins.length) ? d.priorityAsins : undefined;
+    if (_chunkForSync && _chunkForSync.length) {
+      const _t = (p.pinnedAsins || []).length || 1;
+      p._chunkCursor = ((p._chunkCursor || 0) + CHUNK_ASINS) % Math.max(1, _t);
+      markDirty(p.id);
+      if (d.deferredCount) console.log(`[smartSync] ${p.ebaySku}: ${d.deferredCount} tracked variants deferred to the next chunk`);
+    }
     // If the SERVER established the pin (listing synced via the extension
     // first), adopt it so both paths track the identical variants.
     if (d.pinnedAsins && d.pinnedAsins.length &&
