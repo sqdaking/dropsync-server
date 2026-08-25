@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-25.3 (chunked full coverage)');
+console.log('[dropsync] build 2026-08-25.4 (auto full coverage, one click)');
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -8161,7 +8161,13 @@ function _pollUntilSynced(productId, attempts = 0) {
   }, 3000);
 }
 
-async function smartSyncProduct(p) {
+async function smartSyncProduct(p, _opts) {
+  // FULL COVERAGE IS AUTOMATIC (Aug 2026)
+  // Chunk continuation used to be the caller's job, so the manual Sync button
+  // did ONE chunk per click — a 100-variant listing needed four clicks. The
+  // loop belongs here, so every entry point (button, relay, bulk) covers the
+  // whole listing in a single action.
+  const _depth = (_opts && _opts._depth) || 0;
   // Lightweight: scrape Amazon price+stock, compare with eBay, only push changes
   if (!p?.sourceUrl || !p?.ebaySku || p.status !== 'listed') return { skipped: true };
   if (p.ebaySku.startsWith('DS-RECOVERED') || p.ebaySku.startsWith('DS-EXISTING')) return { skipped: true };
@@ -8433,6 +8439,29 @@ async function smartSyncProduct(p) {
       if (fd.shippingCost != null)                               p.shippingCost = fd.shippingCost;
     }
     markDirty(p.id); save();
+
+    // Still tracked variants left to refresh? Continue immediately — the
+    // cursor has advanced, so the next pass picks up the next chunk.
+    if (d.deferredCount > 0 && _depth + 1 < MAX_CHUNKS_PER_VISIT) {
+      // Never push through Amazon backing off: an unfinished listing is
+      // recoverable next visit, a cooldown stalls the whole queue.
+      let _backoff = false;
+      try {
+        const _st = await window.dsExt?.getStatus?.();
+        if (_st && (_st.cooldownUntil > Date.now() || _st.budget < 8)) _backoff = true;
+      } catch(e) {}
+      if (_backoff) {
+        console.log(`[smartSync] ${p.ebaySku}: ${d.deferredCount} variants left — pausing, extension is backing off`);
+        return d;
+      }
+      await new Promise(r => setTimeout(r, 5000 + Math.random() * 5000));
+      console.log(`[smartSync] ${p.ebaySku}: chunk ${_depth + 2} — ${d.deferredCount} variants still to refresh`);
+      const _next = await smartSyncProduct(p, { _depth: _depth + 1 });
+      return { ...(_next || {}),
+               synced: (d.synced || 0) + ((_next && _next.synced) || 0),
+               chunksRun: _depth + 2 };
+    }
+    if (_depth > 0) console.log(`[smartSync] ${p.ebaySku}: covered in ${_depth + 1} chunks`);
     return d;
   } catch(e) {
     return { error: e.message };
