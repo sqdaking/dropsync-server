@@ -8683,29 +8683,20 @@ module.exports = async (req, res) => {
         const _oosFlagged = Object.values(clientAsinData).filter(d => d && d.inStock === false).length;
         console.log(`[smartSync] using browser clientAsinData: ${_used} ASINs priced, ${_oosFlagged} flagged OOS by browser (cached for 7d, skipping server-side fetch)`);
         if (_used > 0 && _oosFlagged >= _used) console.warn(`[smartSync] ⚠ ALL priced ASINs flagged OOS — browser tab/extension likely running the OLD extractor. Hard-refresh the tab (Ctrl+Shift+R) and reload the extension.`);
-        // Parser-default detector: distinct ASINs should rarely ALL carry the
-        // exact same price. When they do (esp. $9.99), the extractor probably
-        // grabbed one page-level price and reused it for every variant.
+        // Identical prices across variants are NORMAL — apparel especially:
+        // one price, one shipping rule, all in stock. This used to raise a
+        // warning suggesting a parser fault, which was simply wrong and sent
+        // attention toward correct data.
+        //
+        // The real failure (Amazon serving the parent page for a variant URL,
+        // so every variant inherits one price) is now caught where the evidence
+        // actually exists: the browser compares each page's canonical ASIN to
+        // the one requested and discards mismatches. Anything that survives
+        // that check is genuine, so this is just an observation.
         const _priced = Object.entries(clientAsinData).filter(([, d]) => d && d.price > 0);
         const _distinctPrices = new Set(_priced.map(([, d]) => d.price));
         if (_used >= 4 && _distinctPrices.size === 1) {
-          // Identical prices across variants are COMMON and legitimate for
-          // apparel (one price, many colours/sizes). They're only suspicious
-          // if the extractor reused one page-level price. The distinguishing
-          // evidence is shipping: a real per-variant fetch yields varied
-          // shipping/stock data, whereas a reused page price makes every field
-          // identical. Print enough to settle it without guessing.
-          const _p = [..._distinctPrices][0];
-          const _shipSet = new Set(_priced.map(([, d]) => d.shipping || 0));
-          const _stockSet = new Set(_priced.map(([, d]) => d.inStock !== false));
-          const _sample = _priced.slice(0, 3).map(([a]) => a).join(', ');
-          const _identicalEverything = _shipSet.size === 1 && _stockSet.size === 1;
-          console.warn(`[smartSync] ⚠ all ${_used} fresh ASINs share ONE price ($${_p})` +
-            ` — shipping variants: ${_shipSet.size}, stock variants: ${_stockSet.size}` +
-            (_identicalEverything
-              ? ` — EVERY field identical, likely one page-level price reused. Verify: https://www.amazon.com/dp/${_priced[0][0]}`
-              : ` — other fields differ, so this is probably a genuine single-price product`) +
-            ` (sample ASINs: ${_sample})`);
+          console.log(`[smartSync] all ${_used} fresh ASINs share one price ($${[..._distinctPrices][0]}) — normal for single-price product lines`);
         }
         // Even though we have client data, fill gaps from the 7-day cache for
         // any ASIN NOT covered by the browser. This way variant-rich listings
@@ -9395,6 +9386,8 @@ module.exports = async (req, res) => {
       const _unresolvedSkus = [];
       // Variants outside the pinned set — deliberately unbuyable, not errors.
       const _untrackedSkus = [];
+      // Tracked variants deferred to a later chunk this cycle.
+      const _deferredSkus = [];
       for (const [sku, offer] of Object.entries(offerMap)) {
         let asin = null;
 
@@ -9489,6 +9482,11 @@ module.exports = async (req, res) => {
               availableQuantity: 0,
               price:             { value: _highestSiblingPrice.toFixed(2), currency: 'USD' },
             });
+            continue;
+          }
+          // Tracked, but not part of THIS pass — leave exactly as it is.
+          if (_chunkSet && !_chunkSet.has(asin) && (!_pinnedSet || _pinnedSet.has(asin))) {
+            _deferredSkus.push(sku);
             continue;
           }
           // UNTRACKED variant (outside the pinned set): it will never receive
@@ -9696,6 +9694,7 @@ module.exports = async (req, res) => {
       if (_twoPhase) {
         const _wanted = new Map(updates.map(u => [u.sku, u]));
         const _untrackedSet = new Set(_untrackedSkus);
+        const _deferredSet = new Set(_deferredSkus);
         const zeroEntries = [];
         for (const [sku, offer] of Object.entries(offerMap)) {
           if (!offer?.offerId) continue;
@@ -9708,6 +9707,9 @@ module.exports = async (req, res) => {
           // Untracked variants are handled above (zeroed once) — re-zeroing
           // them every cycle would burn revisions for no change.
           if (!want && _untrackedSet.has(sku)) continue;
+          // Never zero a variant this pass isn't responsible for — that's what
+          // would make chunk 2 undo chunk 1.
+          if (!want && _deferredSet.has(sku)) continue;
           // Thin coverage: only touch variants we actually have data for.
           if (_coverageRatio < _MIN_COVERAGE && !want) {
             const _a = skuToAsin[sku];
@@ -10097,6 +10099,16 @@ module.exports = async (req, res) => {
         zeroedFirst: _zeroed,
         untrackedCount: _untrackedSkus.length,
         trackedAsins: allUniqueAsins.length,
+        deferredCount: _deferredSkus.length,
+        chunkSize: _chunk.length || undefined,
+        // Everything this listing still needs refreshed, so the caller can run
+        // the next pass immediately instead of waiting for the rotation.
+        remainingAsins: _chunkSet
+          ? [...new Set(Object.values(skuToAsin))]
+              .filter(a => /^[A-Z0-9]{10}$/.test(String(a)) &&
+                           (!_pinnedSet || _pinnedSet.has(a)) && !_chunkSet.has(a))
+              .slice(0, 200)
+          : undefined,
         pinnedAsins: _pinned.length ? _pinned : undefined,
         autoPinned: _autoPinned || undefined,
         unresolvedCount: _unresolvedSkus.length,
