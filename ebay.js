@@ -8650,7 +8650,14 @@ module.exports = async (req, res) => {
       // never extended when the Amazon parent gains variants. An ASIN going out
       // of stock KEEPS its place — it syncs as qty 0 and restores itself when
       // Amazon restocks — so the fetch cost per listing is constant.
-      const MAX_TRACKED = parseInt(process.env.MAX_TRACKED_ASINS) || 25;
+      // Ceiling for the tracked set. Never let it fall below the number of
+      // variants this listing actually sells — capping a 40-SKU listing at 25
+      // forced 15 live variants unbuyable. The cap is here to skip the long
+      // tail of a huge Amazon parent, not to shrink the listing itself.
+      const _MAX_TRACKED_CFG = parseInt(process.env.MAX_TRACKED_ASINS) || 50;
+      const _ownCount = [...new Set(Object.values(body.skuToAsin || {}))]
+        .filter(a => /^[A-Z0-9]{10}$/.test(String(a))).length;
+      const MAX_TRACKED = Math.max(_MAX_TRACKED_CFG, Math.min(_ownCount || 0, 100));
       let _pinned = Array.isArray(body.pinnedAsins)
         ? body.pinnedAsins.filter(a => /^[A-Z0-9]{10}$/.test(String(a))) : [];
       // AUTO-PIN (Aug 2026): the browser establishes pins, but listings synced
@@ -8736,6 +8743,8 @@ module.exports = async (req, res) => {
       const asinPrice   = {};
       // Where each price came from: 'fresh' (fetched this cycle) or 'cache Nh'.
       const _asinSource = {};
+      // ASINs whose cached price is too old to sell on.
+      const _staleAsins = [];
       const asinInStock = {};
       const _fetchFailed = new Set(); // ASINs where fetchPage returned null
 
@@ -8799,13 +8808,28 @@ module.exports = async (req, res) => {
           await Promise.all(_uncoveredAsins.map(async asin => {
             const cached = await _asinCacheGet(asin);
             if (cached && typeof cached.price === 'number' && cached.price > 0) {
+              // STALE PRICE PROTECTION (Aug 2026)
+              // A full pass takes days, so a cached price can be badly out of
+              // date — one variant sat at $28.57 while Amazon had moved from
+              // $14.14 to $21.99, i.e. selling $12 under cost. Past a threshold
+              // we stop trusting the number: the variant stays listed but goes
+              // qty 0 until it's re-fetched, so a stale price can't sell.
+              const _ageH = cached._cacheAgeHours || 0;
+              const _maxAge = parseFloat(process.env.STALE_PRICE_HOURS || '72');
               asinPrice[asin]   = cached.price;
-              asinInStock[asin] = cached.inStock !== false;
-              _asinSource[asin] = `cache ${(cached._cacheAgeHours || 0).toFixed(0)}h`;
+              asinInStock[asin] = cached.inStock !== false && (_maxAge <= 0 || _ageH <= _maxAge);
+              _asinSource[asin] = `cache ${_ageH.toFixed(0)}h`;
+              if (_maxAge > 0 && _ageH > _maxAge) {
+                _asinSource[asin] += ' STALE';
+                _staleAsins.push(asin);
+              }
               _filled++;
             }
           }));
           if (_filled > 0) console.log(`[smartSync] cache-filled ${_filled}/${_uncoveredAsins.length} uncovered ASINs from 7-day cache`);
+          if (_staleAsins.length > 0) {
+            console.warn(`[smartSync] ${_staleAsins.length} ASIN(s) have prices older than ${process.env.STALE_PRICE_HOURS || 72}h — held at qty 0 until refreshed (prevents selling on an outdated price)`);
+          }
         }
       }
 
