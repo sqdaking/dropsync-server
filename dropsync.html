@@ -657,7 +657,74 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-26.4 (fetch accounting)');
+console.log('[dropsync] build 2026-08-26.5 (variant mapping probe)');
+
+// ── VARIANT MAPPING PROBE ────────────────────────────────────────────────────
+// probeVariants('DS-...-SKU')  or  probeVariants('B0DFMT3BB6')
+// Amazon encodes variants in several different shapes depending on category —
+// dimensionToAsinMap, twisterSlotJson, dimensionValuesDisplayData, or per-ASIN
+// JSON — so a mapping that works on shoes can fail on perfume. This shows which
+// shape THIS listing uses, what we parse out of it, and how that lines up with
+// the eBay SKUs, instead of inferring it from wrong prices after the fact.
+async function probeVariants(idOrAsin) {
+  const p = (S.products || []).find(x =>
+    normaliseGroupSku(x.ebaySku) === normaliseGroupSku(idOrAsin) || x.asin === idOrAsin);
+  const url = p ? p.sourceUrl : `https://www.amazon.com/dp/${idOrAsin}`;
+  console.log('[probe] parent:', url);
+  let html = null;
+  try { html = await _fetchAmazonViaExtension(url); }
+  catch (e) { console.error('[probe] fetch failed:', e.message); return; }
+  if (!html) { console.error('[probe] no HTML'); return; }
+  console.log(`[probe] ${Math.round(html.length/1024)}KB`);
+
+  // Which encoding does this page use?
+  const shapes = {
+    dimensionToAsinMap:        /"dimensionToAsinMap"\s*:\s*\{/.test(html),
+    variationValues:           /"variationValues"\s*:\s*\{/.test(html),
+    dimensions:                /"dimensions"\s*:\s*\[/.test(html),
+    twisterSlotJson:           html.includes('twisterSlotJson'),
+    dimensionValuesDisplayData: html.includes('dimensionValuesDisplayData'),
+    asinVariationValues:       html.includes('asinVariationValues'),
+    'per-ASIN "asin":'         : /"asin"\s*:\s*"[A-Z0-9]{10}"/.test(html),
+  };
+  console.table(shapes);
+
+  // What we actually parse
+  let dta = null, vv = null, dims = null;
+  try { const m = html.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/); if (m) dta = JSON.parse(m[1]); } catch(e) {}
+  try { const m = html.match(/"variationValues"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/); if (m) vv = JSON.parse(m[1]); } catch(e) {}
+  try { const m = html.match(/"dimensions"\s*:\s*(\[[^\]]{0,400}\])/); if (m) dims = JSON.parse(m[1]); } catch(e) {}
+  console.log('[probe] dimensions:', dims);
+  console.log('[probe] variationValues:', vv ? Object.fromEntries(Object.entries(vv).map(([k,v]) => [k, `${v.length} values: ${v.slice(0,4).join(' | ')}${v.length>4?' …':''}`])) : '(none)');
+  console.log('[probe] dimensionToAsinMap:', dta ? `${Object.keys(dta).length} combos` : '(none)');
+
+  // Resolve a few index keys into human combos so a wrong axis order is obvious
+  if (dta && vv && dims) {
+    const rows = Object.entries(dta).slice(0, 8).map(([idx, asin]) => {
+      const parts = String(idx).split('_');
+      const vals = dims.map((d, i) => (vv[d] || [])[parseInt(parts[i])] ?? '?');
+      return { indexKey: idx, combo: vals.join(' | '), asin };
+    });
+    console.table(rows);
+    const uniqAsins = new Set(Object.values(dta));
+    console.log(`[probe] ${Object.keys(dta).length} combos → ${uniqAsins.size} distinct ASINs` +
+      (uniqAsins.size < Object.keys(dta).length ? '  (some combos share an ASIN — normal when one ASIN covers several sizes)' : ''));
+  }
+
+  // How this lines up with the eBay listing
+  if (p) {
+    const mapped = Object.entries(p.skuToAsin || {});
+    const distinct = new Set(mapped.map(([,a]) => a));
+    console.log(`[probe] eBay SKUs: ${Object.keys(p.skuToAsin||{}).length}, distinct ASINs: ${distinct.size}` +
+      (distinct.size < mapped.length ? '  ← FEWER ASINs THAN SKUs: several SKUs share one ASIN, so they will share a price' : ''));
+    const byAsin = {};
+    for (const [sku, a] of mapped) (byAsin[a] = byAsin[a] || []).push(sku.slice(-24));
+    const shared = Object.entries(byAsin).filter(([,v]) => v.length > 1).slice(0, 5);
+    if (shared.length) console.table(shared.map(([a, skus]) => ({ asin: a, skuCount: skus.length, skus: skus.join(', ').slice(0,80) })));
+    console.log('[probe] pinned:', (p.pinnedAsins||[]).length, 'tracked ASINs');
+  }
+}
+window.probeVariants = probeVariants;
 
 // ── PRICE PROBE ──────────────────────────────────────────────────────────────
 // probeAsin('B0DQ2GCMRP') — fetches ONE ASIN and shows exactly what the page
