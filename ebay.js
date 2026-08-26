@@ -8734,6 +8734,8 @@ module.exports = async (req, res) => {
       // This means a transient Amazon block briefly OOSes a variant (safer than
       // selling at an unknown wrong price), and the next sync restores it.
       const asinPrice   = {};
+      // Where each price came from: 'fresh' (fetched this cycle) or 'cache Nh'.
+      const _asinSource = {};
       const asinInStock = {};
       const _fetchFailed = new Set(); // ASINs where fetchPage returned null
 
@@ -8752,6 +8754,7 @@ module.exports = async (req, res) => {
           const p = parseFloat(data.price);
           if (!isFinite(p)) continue;
           asinPrice[asin]   = p > 0 ? p : 0;
+          _asinSource[asin] = 'fresh';
           asinInStock[asin] = data.inStock !== false && p > 0;
           if (p > 0) _used++;
           // CRITICAL FIX (July 2026): write fresh browser data into the 7-day
@@ -8786,6 +8789,10 @@ module.exports = async (req, res) => {
         // any ASIN NOT covered by the browser. This way variant-rich listings
         // (where browser only sent the parent) can still publish with accurate
         // prices using cached data from prior syncs.
+        // PRICE PROVENANCE (Aug 2026): the log showed the resulting eBay price
+        // but never WHERE the Amazon number came from or how old it was, so a
+        // "wrong price" could be a stale cache hit, a mis-mapped ASIN or a bad
+        // markup and there was no way to tell them apart from the log.
         const _uncoveredAsins = uniqueAsins.filter(a => !(a in asinPrice));
         if (_uncoveredAsins.length > 0) {
           let _filled = 0;
@@ -8794,6 +8801,7 @@ module.exports = async (req, res) => {
             if (cached && typeof cached.price === 'number' && cached.price > 0) {
               asinPrice[asin]   = cached.price;
               asinInStock[asin] = cached.inStock !== false;
+              _asinSource[asin] = `cache ${(cached._cacheAgeHours || 0).toFixed(0)}h`;
               _filled++;
             }
           }));
@@ -9644,7 +9652,12 @@ module.exports = async (req, res) => {
           qty = 0; // fallback price → unbuyable, non-negotiable
         }
 
-        console.log(`[smartSync] ${sku.slice(-20)} asin=${asin||'?'} $${cost} → eBay $${putPrice.toFixed(2)} qty=${qty}`);
+        // Show the full derivation: Amazon cost, where it came from and how old
+        // it is, plus the markup applied. A price that looks wrong is then
+        // immediately attributable to a stale cache hit, a wrong ASIN, or the
+        // markup — instead of being indistinguishable in the log.
+        console.log(`[smartSync] ${sku.slice(-20)} asin=${asin||'?'} $${cost} [${_asinSource[asin] || 'unknown'}]` +
+          ` ×${markupPct}% +$${handling} fee13.35% → eBay $${putPrice.toFixed(2)} qty=${qty}`);
         updates.push({
           offerId:           offer.offerId,
           sku,
