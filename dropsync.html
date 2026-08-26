@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-26.5 (variant mapping probe)');
+console.log('[dropsync] build 2026-08-26.6 (fix 50k dta truncation)');
 
 // ── VARIANT MAPPING PROBE ────────────────────────────────────────────────────
 // probeVariants('DS-...-SKU')  or  probeVariants('B0DFMT3BB6')
@@ -1719,11 +1719,24 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   // Extract dimensionToAsinMap from HTML to get all ASINs
   let dtaMap = {};
   try {
-    const dtaM = mainHtml.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,50000}\})/);
+    // 50,000 was too small: a 92-combo listing's dimensionToAsinMap exceeds it,
+    // the regex then fails to match, uniqueAsins comes back empty and the
+    // function returns {} — so NO individual ASIN fetching happened at all, with
+    // nothing in the log to say why. Every other parser in this codebase uses
+    // 200,000; this one was the odd man out.
+    const dtaM = mainHtml.match(/"dimensionToAsinMap"\s*:\s*(\{[^}]{0,200000}\})/);
     if (dtaM) dtaMap = JSON.parse(dtaM[1]);
   } catch(e) {}
   const uniqueAsins = [...new Set(Object.values(dtaMap))].filter(a => a && /^[A-Z0-9]{10}$/.test(a));
-  if (!uniqueAsins.length) return {};
+  if (!uniqueAsins.length) {
+    // Say so rather than returning silently — an empty result here looks
+    // identical to "everything was already cached" from the caller's side.
+    const hasMap = /"dimensionToAsinMap"\s*:\s*\{/.test(mainHtml || '');
+    console.warn(`[prefetchAsin] no variant ASINs parsed from parent page` +
+      (hasMap ? ' — dimensionToAsinMap IS present but could not be parsed (too large or unexpected shape)'
+              : ' — page has no dimensionToAsinMap (single-variant product, or a different variant encoding)'));
+    return {};
+  }
 
   const result = {};
 
