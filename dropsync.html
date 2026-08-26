@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-26.6 (fix 50k dta truncation)');
+console.log('[dropsync] build 2026-08-26.7 (accounting vs tracked set)');
 
 // ── VARIANT MAPPING PROBE ────────────────────────────────────────────────────
 // probeVariants('DS-...-SKU')  or  probeVariants('B0DFMT3BB6')
@@ -1948,19 +1948,20 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   // were being ignored, when they were skipped as already-cached or already
   // known out of stock. Every ASIN is now accounted for, so a genuinely missing
   // variant is distinguishable from one that simply didn't need fetching.
-  const _acct = {
-    tracked: uniqueAsins.length,
-    priced: Object.keys(result).length,
-    fetchedNow: _fetchedCount,
-    freeOOS: _freeOos,
-    serverCached: _skippedFresh,
-    notCovered: uniqueAsins.filter(a => !result[a]).length,
-  };
-  console.log(`[prefetchAsin] done: ${_acct.priced}/${_acct.tracked} priced ` +
-    `(fetched ${_acct.fetchedNow} now, ${_acct.serverCached} already fresh on server, ` +
-    `${_acct.freeOOS} OOS from parent page, ${_acct.notCovered} still uncovered)`);
-  if (_acct.notCovered > 0) {
-    console.log(`[prefetchAsin] uncovered: ${uniqueAsins.filter(a => !result[a]).slice(0, 10).join(', ')}`);
+  // Report against the TRACKED set, not the parent's full combo list. Counting
+  // "88 still uncovered" out of 92 when only 25 are tracked made healthy cache
+  // reuse look like a failure — the other 67 are deliberately never fetched.
+  const _scope = (Array.isArray(_opts.pinned) && _opts.pinned.length)
+    ? _opts.pinned : uniqueAsins;
+  const _covered = _scope.filter(a => result[a]).length;
+  const _missing = _scope.filter(a => !result[a] && !(_opts.skipFresh || []).includes(a));
+  console.log(`[prefetchAsin] done: ${_covered + _skippedFresh}/${_scope.length} tracked ASINs have data ` +
+    `(fetched ${_fetchedCount} now, ${_skippedFresh} already fresh on server, ` +
+    `${_freeOos} OOS from parent page` +
+    (_scope.length !== uniqueAsins.length ? `; ${uniqueAsins.length - _scope.length} parent variants not tracked` : '') +
+    `)`);
+  if (_missing.length > 0) {
+    console.warn(`[prefetchAsin] ${_missing.length} tracked ASIN(s) have NO data: ${_missing.slice(0,10).join(', ')}`);
   }
   // Cache for future revises — avoids re-fetching from Amazon
   _cacheAsinPrices(result);
