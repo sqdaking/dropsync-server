@@ -3679,7 +3679,7 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
     return product.images?.slice(0, 1) || [];
   }
 
-  const variants = [];
+  let variants = [];
 
   // Check if we have extra dims beyond primary+secondary (3-dim listings like mattresses)
   // If so, iterate comboAsin directly — each unique combo key becomes its own variant.
@@ -3865,7 +3865,40 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
     _renamed++;
   }
   if (_renamed > 0) console.log(`[buildVariants] renamed ${_renamed} colliding SKU${_renamed>1?'s':''}`);
-  return variants.slice(0, 100);
+
+  // ── VARIANT CAP FOR NEW LISTINGS (Aug 2026) ────────────────────────────────
+  // A 100+ variant listing can never be kept accurately priced: every sync must
+  // fetch every variant from Amazon, so the big ones consumed the whole budget
+  // and still went stale. Capping at push time is the structural fix — smaller
+  // listings sync completely, quickly, and correctly.
+  //
+  // Selection is NOT "the first N". Priority:
+  //   1. in stock with a real price   — the ones that can actually sell
+  //   2. priced but out of stock      — likely to come back
+  //   3. anything else
+  // Within each group the original (twister) order is preserved, which roughly
+  // tracks Amazon's own popularity ordering.
+  const _cap = Math.max(1, Math.min(100,
+    parseInt(body?.maxVariants ?? process.env.MAX_PUSH_VARIANTS ?? 25)));
+  if (variants.length > _cap) {
+    const _before = variants.length;
+    const _score = v => {
+      const price = parseFloat(v.price?.value ?? v.price ?? 0);
+      const qty = parseInt(v.availableQuantity ?? v.qty ?? 0);
+      if (price > 0 && qty > 0) return 0;
+      if (price > 0) return 1;
+      return 2;
+    };
+    variants = variants
+      .map((v, i) => ({ v, i, s: _score(v) }))
+      .sort((a, b) => a.s - b.s || a.i - b.i)
+      .slice(0, _cap)
+      .map(x => x.v);
+    const _inStock = variants.filter(v => parseInt(v.availableQuantity ?? v.qty ?? 0) > 0).length;
+    console.log(`[buildVariants] variant cap: ${_before} → ${variants.length} (${_inStock} in stock). ` +
+      `Set body.maxVariants or MAX_PUSH_VARIANTS to change.`);
+  }
+  return variants;
 }
 
 // Build the group variesBy spec — must list ALL values for each variation dimension
@@ -6959,6 +6992,34 @@ module.exports = async (req, res) => {
     // had no cache awareness at all, so when it and the extension both touched
     // a listing, every ASIN was fetched twice. This lets the browser skip what
     // the server already knows.
+    // DEAD URL MEMORY (Aug 2026)
+    // Amazon's "dogs" page is just a 404, and it looks identical to a block —
+    // which sent us hunting for IP bans when the real cause was a URL that
+    // simply doesn't exist. Rather than trusting any hardcoded list (I can't
+    // verify Amazon URLs from the build environment), the system now learns:
+    // a URL that returns the dogs page is recorded and skipped from then on.
+    if (action === 'url_dead') {
+      if (!_cachePool) return res.json({ ok: false });
+      const url = String(body.url || '').slice(0, 500);
+      if (!/^https:\/\/www\.amazon\./.test(url)) return res.status(400).json({ error: 'bad url' });
+      try {
+        await _cachePool.query(`
+          CREATE TABLE IF NOT EXISTS dead_urls (
+            url TEXT PRIMARY KEY,
+            reason TEXT,
+            hits INTEGER NOT NULL DEFAULT 1,
+            last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+          );`).catch(() => {});
+        await _cachePool.query(
+          `INSERT INTO dead_urls(url, reason) VALUES($1,$2)
+           ON CONFLICT(url) DO UPDATE SET hits = dead_urls.hits + 1, last_seen = NOW(),
+                                          reason = EXCLUDED.reason`,
+          [url, String(body.reason || 'dogs_of_amazon').slice(0, 60)]);
+        console.log(`[deals] marked dead: ${url} (${body.reason || 'dogs_of_amazon'})`);
+        return res.json({ ok: true });
+      } catch(e) { return res.json({ ok: false, error: e.message }); }
+    }
+
     if (action === 'cache_fresh') {
       if (!_cacheReady) return res.json({ fresh: [] });
       const asins = Array.isArray(body.asins) ? body.asins.filter(a => /^[A-Z0-9]{10}$/.test(String(a))) : [];
@@ -8585,6 +8646,10 @@ module.exports = async (req, res) => {
       // PINNED SET (Aug 2026): a parent with 250+ variants used to cost
       // hundreds of Amazon fetches for one listing. The client pins at most 25
       // variants once; only those are priced and updated from then on.
+      // LOCKED SET: a listing syncs exactly these ASINs, forever. Never grown,
+      // never extended when the Amazon parent gains variants. An ASIN going out
+      // of stock KEEPS its place — it syncs as qty 0 and restores itself when
+      // Amazon restocks — so the fetch cost per listing is constant.
       const MAX_TRACKED = parseInt(process.env.MAX_TRACKED_ASINS) || 25;
       let _pinned = Array.isArray(body.pinnedAsins)
         ? body.pinnedAsins.filter(a => /^[A-Z0-9]{10}$/.test(String(a))) : [];
@@ -8609,6 +8674,14 @@ module.exports = async (req, res) => {
         _autoPinned = true;
         console.log(`[smartSync] auto-pinned ${_pinned.length} of ${allUniqueAsins.length} variants ` +
           `(${Math.min(_ownAsins.length, MAX_TRACKED)} from this listing's own SKUs)`);
+      }
+      // An existing pin is only ever REPAIRED (when it points at variants this
+      // listing doesn't sell), never enlarged. Out-of-stock ASINs are left in
+      // place deliberately — swapping them out would make the set drift and
+      // reintroduce unbounded fetching.
+      if (_pinned.length > MAX_TRACKED) {
+        console.log(`[smartSync] trimming stored pin ${_pinned.length} → ${MAX_TRACKED}`);
+        _pinned = _pinned.slice(0, MAX_TRACKED);
       }
       if (_pinned.length && !_autoPinned) {
         const _ownAsins = [...new Set(Object.values(body.skuToAsin || {}))]
@@ -8637,6 +8710,9 @@ module.exports = async (req, res) => {
       let _pinnedSet = _pinned.length ? new Set(_pinned) : null;
       if (_pinnedSet) {
         const _before = allUniqueAsins.length;
+        if (_before > _pinnedSet.size) {
+          console.log(`[smartSync] locked set: ${_pinnedSet.size} ASINs (parent has ${_before}) — the extra ${_before - _pinnedSet.size} are never fetched`);
+        }
         allUniqueAsins = allUniqueAsins.filter(a => _pinnedSet.has(a));
         if (_before !== allUniqueAsins.length) {
           console.log(`[smartSync] pinned set: tracking ${allUniqueAsins.length} of ${_before} variants (untracked ones stay unbuyable)`);
@@ -10928,8 +11004,8 @@ module.exports = async (req, res) => {
         ],
         fashion_women: [
           'https://www.amazon.com/b?node=7147440011',
-          'https://www.amazon.com/gp/bestsellers/fashion/2475809011',
-          'https://www.amazon.com/gp/new-releases/fashion/2475809011',
+          'https://www.amazon.com/gp/bestsellers/fashion',
+          'https://www.amazon.com/gp/new-releases/fashion',
           'https://www.amazon.com/s?k=women+dresses&i=fashion-womens',
           'https://www.amazon.com/s?k=women+tops+blouses&i=fashion-womens',
           'https://www.amazon.com/s?k=women+leggings&i=fashion-womens',
@@ -10937,8 +11013,8 @@ module.exports = async (req, res) => {
           'https://www.amazon.com/s?k=women+pajamas&i=fashion-womens',
         ],
         fashion_men: [
-          'https://www.amazon.com/gp/bestsellers/fashion/2475817011',
-          'https://www.amazon.com/gp/new-releases/fashion/2475817011',
+          'https://www.amazon.com/gp/movers-and-shakers/fashion',
+          'https://www.amazon.com/gp/bestsellers/shoes',
           'https://www.amazon.com/s?k=men+shirts&i=fashion-mens',
           'https://www.amazon.com/s?k=men+shorts&i=fashion-mens',
           'https://www.amazon.com/s?k=men+hoodies&i=fashion-mens',
@@ -11016,7 +11092,20 @@ module.exports = async (req, res) => {
         return 3;
       };
       urls.sort((a, b) => _rank(a.url) - _rank(b.url));
-      return res.json({ success: true, urls });
+      // Drop URLs already proven dead (2+ sightings, so one odd response
+      // doesn't retire a good page).
+      if (_cachePool) {
+        try {
+          const dr = await _cachePool.query(`SELECT url FROM dead_urls WHERE hits >= 2`);
+          if (dr.rows.length) {
+            const dead = new Set(dr.rows.map(r => r.url));
+            const before = urls.length;
+            urls = urls.filter(u => !dead.has(u.url));
+            if (before !== urls.length) console.log(`[deals] skipped ${before - urls.length} known-dead URL(s)`);
+          }
+        } catch(e) { /* table may not exist yet */ }
+      }
+      return res.json({ success: true, urls, deadFiltered: true });
     }
 
     if (action === 'dealsScrape') {
@@ -11128,7 +11217,7 @@ module.exports = async (req, res) => {
         ],
         fashion_women: [
           'https://www.amazon.com/b?node=7147440011',
-          'https://www.amazon.com/gp/bestsellers/fashion/2475809011',
+          'https://www.amazon.com/gp/bestsellers/fashion',
           'https://www.amazon.com/s?k=women+tops+blouses&i=fashion-womens',
           'https://www.amazon.com/s?k=women+leggings+activewear&i=fashion-womens',
           'https://www.amazon.com/s?k=women+dresses&i=fashion-womens',
@@ -11140,7 +11229,7 @@ module.exports = async (req, res) => {
         ],
         fashion_men: [
           'https://www.amazon.com/s?ref=nb_sb_noss_2&url=search-alias%3Dfashion-mens&field-keywords=',
-          'https://www.amazon.com/gp/bestsellers/fashion/2475817011',
+          'https://www.amazon.com/gp/movers-and-shakers/fashion',
           'https://www.amazon.com/s?k=mens+shirts&i=fashion',
           'https://www.amazon.com/s?k=mens+shorts&i=fashion',
           'https://www.amazon.com/s?k=mens+joggers+sweatpants&i=fashion',
