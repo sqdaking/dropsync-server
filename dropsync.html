@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-26.3 (price probe)');
+console.log('[dropsync] build 2026-08-26.4 (fetch accounting)');
 
 // ── PRICE PROBE ──────────────────────────────────────────────────────────────
 // probeAsin('B0DQ2GCMRP') — fetches ONE ASIN and shows exactly what the page
@@ -1518,22 +1518,42 @@ function _browserExtractAsinData(html, expectedAsin) {
       return null;
     }
   }
-  // Price: look for buy-box price patterns
+  // ── PRICE: BUY BOX ONLY (fixed Aug 2026) ──────────────────────────────────
+  // The old pattern list tried "$X with N percent savings" FIRST. That badge is
+  // the Subscribe & Save / coupon price — a price your buyer cannot get on a
+  // one-time purchase. Probing B0DQ2GCMRP showed the damage clearly:
+  //     buy box / a-price-whole : 21.99   ← what you actually pay
+  //     percent savings         : 19.79   ← what DropSync used
+  // Every product carrying an S&S or coupon badge was costed 10-35% low and
+  // therefore listed under water. So: read the buy box, and never the badge.
   let price = 0;
-  const pats = [
-    /\$([\d.]+)\s+with\s+\d+\s*percent\s+savings/,
-    /"priceToPay"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
-    /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
-    /"priceAmount"\s*:\s*([\d.]+)/,
-    /class="a-offscreen"[^>]*>\$(\d[\d,]*\.?\d*)/,
-  ];
-  for (const p of pats) {
-    const m = html.match(p);
-    if (m) {
-      const v = m[2] ? parseFloat(m[1].replace(/,/g,'') + '.' + m[2]) : parseFloat(m[1].replace(/,/g,''));
-      if (v > 0 && v < 10000) { price = v; break; }
+  const _priceFrom = (scope) => {
+    if (!scope) return 0;
+    const pats = [
+      /class="a-price-whole"[^>]*>\s*(\d[\d,]*)<\/span><span[^>]*class="a-price-fraction"[^>]*>\s*(\d+)/,
+      /"priceToPay"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
+      /"priceAmount"\s*:\s*([\d.]+)/,
+      /class="a-offscreen"[^>]*>\s*\$(\d[\d,]*\.?\d*)/,
+    ];
+    for (const p of pats) {
+      const m = scope.match(p);
+      if (m) {
+        const v = m[2] ? parseFloat(m[1].replace(/,/g,'') + '.' + m[2]) : parseFloat(m[1].replace(/,/g,''));
+        if (v > 0 && v < 10000) return v;
+      }
     }
-  }
+    return 0;
+  };
+  // Buy-box region first, with Subscribe & Save rows stripped out — those
+  // carry their own (lower) price and would otherwise win.
+  let _box = (html.match(/id="corePrice_feature_div"[\s\S]{0,4000}/) ||
+              html.match(/id="corePriceDisplay_desktop_feature_div"[\s\S]{0,4000}/) ||
+              html.match(/id="apex_desktop"[\s\S]{0,6000}/) || [])[0] || '';
+  if (_box) _box = _box.replace(/id="snsAccordionRow[\s\S]*/i, '')
+                       .replace(/Subscribe\s*&\s*Save[\s\S]*/i, '');
+  price = _priceFrom(_box);
+  // Only if the buy box yielded nothing, fall back to the whole page.
+  if (!price) price = _priceFrom(html);
   // Shipping: extract Amazon's delivery fee (free = 0, paid = actual amount).
   // Server applies markup to price + shipping so the final eBay price covers it.
   // Strategy: locate the buy-box delivery section first to avoid matching
@@ -1777,11 +1797,13 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     }
   }
   // Drop ASINs the server already has fresh — it fills them from cache.
+  let _skippedFresh = 0;
   if (Array.isArray(_opts.skipFresh) && _opts.skipFresh.length) {
     const skip = new Set(_opts.skipFresh);
     const before = toFetch.length;
     toFetch = toFetch.filter(a => !skip.has(a));
-    if (before !== toFetch.length) console.log(`[prefetchAsin] skipped ${before - toFetch.length} server-cached ASINs`);
+    _skippedFresh = before - toFetch.length;
+    if (_skippedFresh) console.log(`[prefetchAsin] skipped ${_skippedFresh} ASINs the server already has fresh`);
   }
   // HARD CEILING for every caller — six call sites passed no cap at all, which
   // is how one listing ended up firing 257 individual fetches.
@@ -1805,6 +1827,7 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
       .concat(toFetch.slice(0, Math.max(0, _opts.maxFetch - (toFetch.length - off))));
     console.log(`[prefetchAsin] rotation: fetching ${toFetch.length} of ${uniqueAsins.length - Object.keys(result).length} uncovered ASINs (offset ${off})`);
   }
+  const _fetchedCount = toFetch.length;
   if (toFetch.length > 0) {
     console.log(`[prefetchAsin] ${toFetch.length} ASINs need individual fetch`);
     const isBlocked = html => !html || html.length < 5000 || /validateCaptcha|robot check/i.test(html);
@@ -1841,7 +1864,24 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     }
   }
 
-  console.log(`[prefetchAsin] done: ${Object.keys(result).length}/${uniqueAsins.length} ASINs priced`);
+  // FULL ACCOUNTING. "prefetched 4 ASIN prices" looked like the other variants
+  // were being ignored, when they were skipped as already-cached or already
+  // known out of stock. Every ASIN is now accounted for, so a genuinely missing
+  // variant is distinguishable from one that simply didn't need fetching.
+  const _acct = {
+    tracked: uniqueAsins.length,
+    priced: Object.keys(result).length,
+    fetchedNow: _fetchedCount,
+    freeOOS: _freeOos,
+    serverCached: _skippedFresh,
+    notCovered: uniqueAsins.filter(a => !result[a]).length,
+  };
+  console.log(`[prefetchAsin] done: ${_acct.priced}/${_acct.tracked} priced ` +
+    `(fetched ${_acct.fetchedNow} now, ${_acct.serverCached} already fresh on server, ` +
+    `${_acct.freeOOS} OOS from parent page, ${_acct.notCovered} still uncovered)`);
+  if (_acct.notCovered > 0) {
+    console.log(`[prefetchAsin] uncovered: ${uniqueAsins.filter(a => !result[a]).slice(0, 10).join(', ')}`);
+  }
   // Cache for future revises — avoids re-fetching from Amazon
   _cacheAsinPrices(result);
   return result; // { asin: { price, inStock } }
