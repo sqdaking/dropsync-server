@@ -657,7 +657,130 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-25.7 (locked 25-ASIN sync)');
+console.log('[dropsync] build 2026-08-26.3 (price probe)');
+
+// ── PRICE PROBE ──────────────────────────────────────────────────────────────
+// probeAsin('B0DQ2GCMRP') — fetches ONE ASIN and shows exactly what the page
+// contains versus what DropSync extracts from it. Use when a price looks wrong
+// and you need to know whether the page is being misread or the data is stale.
+async function probeAsin(asin) {
+  asin = String(asin || '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{10}$/.test(asin)) { console.error('probeAsin: need a 10-char ASIN'); return; }
+  const url = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
+  console.log('[probe] fetching', url);
+  let html = null;
+  try { html = await _fetchAmazonViaExtension(url); }
+  catch (e) { console.error('[probe] fetch failed:', e.message); return; }
+  if (!html) { console.error('[probe] no HTML returned'); return; }
+  console.log(`[probe] ${Math.round(html.length / 1024)}KB received`);
+
+  // 1) Is this even the right page? Amazon often serves the parent instead.
+  const canon = _pageCanonicalAsin(html);
+  console.log(`[probe] page canonical ASIN: ${canon || '(none found)'} ${canon && canon !== asin ? '← MISMATCH: this is a different variant!' : ''}`);
+
+  // 2) What DropSync extracts
+  const data = _browserExtractAsinData(html, asin);
+  console.log('[probe] DropSync extracted:', data);
+
+  // 3) Every price-shaped value on the page, with context, so a wrong pick is visible
+  const seen = [];
+  const patterns = {
+    'a-price-whole':      /class="a-price-whole"[^>]*>\s*([\d,]+)[\s\S]{0,120}?a-price-fraction"[^>]*>\s*(\d+)/g,
+    'a-offscreen':        /class="a-offscreen"[^>]*>\s*\$([\d,]+\.?\d*)/g,
+    '"priceAmount"':      /"priceAmount"\s*:\s*([\d.]+)/g,
+    '"displayPrice"':     /"displayPrice"\s*:\s*"\$?([\d,.]+)"/g,
+    'basisPrice/list':    /"(?:basisPrice|listPrice|strikePrice)"[^}]{0,80}?([\d.]+)/g,
+    'percent savings':    /\$([\d.]+)\s+with\s+\d+\s*percent\s+savings/g,
+  };
+  for (const [name, re] of Object.entries(patterns)) {
+    const hits = [...html.matchAll(re)].slice(0, 5).map(m => m[2] ? `${m[1]}.${m[2]}` : m[1]);
+    if (hits.length) { seen.push({ pattern: name, values: hits.join(', ') }); }
+  }
+  console.table(seen);
+
+  // 4) The buy box specifically — this is the price that should win
+  const box = html.match(/id="(?:corePrice_feature_div|corePriceDisplay_desktop_feature_div|apex_desktop)"[\s\S]{0,1200}/);
+  console.log('[probe] buy-box region:',
+    box ? box[0].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 300) : '(not found)');
+
+  // 5) Availability text
+  const avail = html.match(/id="availability"[\s\S]{0,400}/);
+  console.log('[probe] availability:',
+    avail ? avail[0].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160) : '(not found)');
+
+  return { asin, canonical: canon, extracted: data };
+}
+window.probeAsin = probeAsin;
+
+// ── PASTE IMPORT — DropSync never touches Amazon's search ────────────────────
+// Every automated way of reading Amazon's search/browse pages eventually gets
+// gated: proxies, extension fetches, even real tab loads once the profile's
+// cookies are flagged. Product pages (/dp/) have never been a problem.
+//
+// So stop fetching browse pages entirely. YOU open the search or bestsellers
+// page in your normal browser — an ordinary page view Amazon has no reason to
+// block — and hand DropSync the ASINs. It then imports each product through the
+// /dp/ path that already works.
+//
+// Accepts anything: a list of ASINs, product URLs, or the whole page copied
+// with Ctrl+A / Ctrl+C.
+function extractAsinsFromText(text) {
+  const found = new Map();
+  const add = (a) => { if (/^[A-Z0-9]{10}$/.test(a) && !found.has(a)) found.set(a, true); };
+  for (const m of String(text || '').matchAll(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/g)) add(m[1]);
+  for (const m of String(text || '').matchAll(/\basin[=:\s"']+([A-Z0-9]{10})\b/gi)) add(m[1]);
+  // Bare ASINs: require a B0-style prefix so ordinary words aren't swept up.
+  for (const m of String(text || '').matchAll(/\b(B0[A-Z0-9]{8})\b/g)) add(m[1]);
+  return [...found.keys()];
+}
+
+// Import pasted ASINs as drafts, using the per-product path that works.
+async function importPastedAsins(text, opts) {
+  const asins = extractAsinsFromText(text);
+  if (!asins.length) { toast('No ASINs found in that text', 'error', 4000); return; }
+  const owned = new Set((S.products || []).map(p => p.asin).filter(Boolean));
+  const fresh = asins.filter(a => !owned.has(a));
+  console.log(`[paste-import] found ${asins.length} ASINs, ${asins.length - fresh.length} already owned, importing ${fresh.length}`);
+  if (!fresh.length) { toast(`All ${asins.length} products are already in your catalogue`, 'info', 5000); return; }
+
+  await beginImportPriority('paste import', fresh.length * 12000);
+  let ok = 0, failed = 0;
+  try {
+    for (let i = 0; i < fresh.length; i++) {
+      const asin = fresh[i];
+      toast(`Importing ${i + 1}/${fresh.length} — ${asin}`, 'info', 1500);
+      try {
+        const el = $('imp-url');
+        if (el) el.value = `https://www.amazon.com/dp/${asin}`;
+        await doScrape();
+        // doScrape leaves the result in IMP; save it as a draft.
+        if (IMP && IMP.title) { await saveDraft?.(); ok++; } else failed++;
+      } catch (e) { failed++; console.warn(`[paste-import] ${asin}:`, e.message); }
+      // Product pages tolerate this pace; it's the browse pages that don't.
+      if (i < fresh.length - 1) await new Promise(r => setTimeout(r, 2500 + Math.random() * 2500));
+    }
+  } finally {
+    await endImportPriority('paste import');
+  }
+  toast(`Imported ${ok} product(s)${failed ? `, ${failed} failed` : ''}`, ok ? 'success' : 'error', 6000);
+  render?.();
+}
+window.extractAsinsFromText = extractAsinsFromText;
+window.importPastedAsins = importPastedAsins;
+
+// Bookmarklet: runs on the Amazon page YOU are viewing, reads ASINs straight
+// from the DOM (no network request at all, so nothing to block) and copies
+// them to the clipboard.
+function dropsyncBookmarklet() {
+  return "javascript:(function(){var s=new Set();" +
+    "document.querySelectorAll('[data-asin]').forEach(function(e){var a=e.getAttribute('data-asin');if(/^[A-Z0-9]{10}$/.test(a))s.add(a)});" +
+    "document.querySelectorAll('a[href*=\"/dp/\"]').forEach(function(e){var m=e.getAttribute('href').match(/\\/dp\\/([A-Z0-9]{10})/);if(m)s.add(m[1])});" +
+    "var t=[].concat(Array.from(s)).join('\\n');" +
+    "if(!t){alert('No ASINs found on this page');return}" +
+    "navigator.clipboard.writeText(t).then(function(){alert(s.size+' ASINs copied. Paste them into DropSync.')})" +
+    ".catch(function(){prompt('Copy these ASINs:',t)});})();";
+}
+window.dropsyncBookmarklet = dropsyncBookmarklet;
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -724,10 +847,18 @@ window.withImportPriority = withImportPriority;
 // Going out of stock does NOT eject an ASIN from the set — it stays pinned and
 // simply syncs as qty 0, so it comes back automatically when Amazon restocks.
 // That makes cost per listing constant and predictable: 1 parent + up to 25.
-const MAX_TRACKED_ASINS = 25;
-// One pass covers the whole locked set, so no chunking is needed.
+// Ceiling on how many variants a listing tracks. It must never be SMALLER than
+// the number of variants the eBay listing actually sells: a 40-SKU listing
+// capped at 25 had 15 live variants forced unbuyable — lost sales, not a
+// saving. The cap exists to ignore the long tail of a huge Amazon parent
+// (93 variants where the listing sells 40), not to shrink the listing.
+// New listings are capped at 25 AT PUSH TIME, so this only affects existing
+// listings until you repush them.
+const MAX_TRACKED_ASINS = 50;
+// Refresh 25 per pass, so a 50-variant listing takes two passes — run
+// back-to-back automatically.
 const CHUNK_ASINS = 25;
-const MAX_CHUNKS_PER_VISIT = 1;
+const MAX_CHUNKS_PER_VISIT = 2;
 
 // Choose which variants to pin. Preference order:
 //   1. ones already priced from the parent page (free — no fetch needed)
@@ -2368,6 +2499,25 @@ function showAddCustomDept() {
         <input id="custom-dept-name" placeholder="Name (e.g. Women Leggings)" class="input" style="font-size:13px" />
         <textarea id="custom-dept-urls" placeholder="Amazon URLs — one per line&#10;e.g. https://www.amazon.com/s?k=women+leggings&#10;https://www.amazon.com/gp/bestsellers/fashion" class="input" style="font-size:12px;height:110px;resize:vertical;font-family:monospace"></textarea>
         <div style="font-size:11px;color:var(--text3)">Paste any Amazon search, bestsellers, or category URL. Multiple URLs = more variety.</div>
+        <div style="margin-top:14px;padding:12px;border:1px solid var(--border);border-radius:10px;background:rgba(59,130,246,.06)">
+          <div style="font-weight:600;font-size:13px;margin-bottom:4px">Paste import — never gets blocked</div>
+          <div style="font-size:11px;color:var(--text3);line-height:1.5;margin-bottom:8px">
+            Open any Amazon search or bestsellers page in your browser, select all (Ctrl+A) and copy (Ctrl+C),
+            then paste below. DropSync reads the ASINs from your text and imports each product directly —
+            it never requests Amazon's search pages, so there is nothing for Amazon to block.
+          </div>
+          <textarea id="paste-import-box" placeholder="Paste ASINs, product URLs, or a whole copied Amazon page…"
+            class="input" style="font-size:12px;height:90px;resize:vertical;font-family:monospace"></textarea>
+          <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+            <button class="btn btn-sm" onclick="importPastedAsins(document.getElementById('paste-import-box').value)">Import pasted products</button>
+            <button class="btn btn-sm" style="background:transparent;border:1px solid var(--border)"
+              onclick="const n=extractAsinsFromText(document.getElementById('paste-import-box').value).length; toast(n+' ASIN(s) found in that text','info',3500)">Count ASINs</button>
+            <a id="ds-bookmarklet" href="#" onclick="return false" draggable="true"
+               style="font-size:11px;padding:4px 10px;border:1px dashed var(--border);border-radius:6px;color:var(--text2);text-decoration:none;cursor:grab"
+               title="Drag this to your bookmarks bar. Click it on any Amazon page to copy every ASIN.">⭐ DropSync: grab ASINs</a>
+            <span style="font-size:10px;color:var(--text3)">← drag to bookmarks bar, then click it on an Amazon page</span>
+          </div>
+        </div>
         <div style="display:flex;gap:8px;justify-content:flex-end">
           <button onclick="this.closest('.modal-overlay').remove()" class="btn btn-ghost btn-sm">Cancel</button>
           <button onclick="saveCustomBulkDept()" class="btn btn-primary btn-sm">Add Source</button>
@@ -2476,6 +2626,12 @@ function deleteCustomAeDept(index) {
   toast(`Removed "${name}"`, 'info', 2000);
   renderAeImport();
 }
+
+function _wireBookmarklet() {
+  const el = document.getElementById('ds-bookmarklet');
+  if (el && !el.dataset.wired) { el.href = dropsyncBookmarklet(); el.dataset.wired = '1'; }
+}
+setInterval(_wireBookmarklet, 1500);
 
 function renderBulk() {
   bulkLoadState();
