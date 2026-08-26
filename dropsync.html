@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-25.4 (auto full coverage, one click)');
+console.log('[dropsync] build 2026-08-25.7 (locked 25-ASIN sync)');
 
 // ── IMPORT PRIORITY (Aug 2026) ───────────────────────────────────────────────
 // Import and background sync both hit Amazon through one residential IP and
@@ -718,15 +718,16 @@ window.withImportPriority = withImportPriority;
 // Variants outside the pinned set are set unbuyable (qty 0) once and then left
 // alone: never fetched, never repriced. They can't sell at a stale price, and
 // they cost nothing.
-// How many variants a listing may keep BUYABLE. Beyond this they're set
-// unbuyable, so this is a sales decision, not a performance one.
-const MAX_TRACKED_ASINS = 100;
-// How many variants we refresh per pass. Bounded by the Amazon fetch budget,
-// not by eBay: one bulk call covers 25 SKUs, so a 100-variant listing costs
-// ~8 calls against a 250/day allowance.
+// LOCKED VARIANT SET. A listing tracks exactly this many ASINs, chosen once and
+// then never changed or extended. Every sync fetches THE SAME set: no growth,
+// no discovery, no chasing variants that appear on the Amazon parent later.
+// Going out of stock does NOT eject an ASIN from the set — it stays pinned and
+// simply syncs as qty 0, so it comes back automatically when Amazon restocks.
+// That makes cost per listing constant and predictable: 1 parent + up to 25.
+const MAX_TRACKED_ASINS = 25;
+// One pass covers the whole locked set, so no chunking is needed.
 const CHUNK_ASINS = 25;
-// Safety stop so one enormous listing can't monopolise a whole session.
-const MAX_CHUNKS_PER_VISIT = 4;
+const MAX_CHUNKS_PER_VISIT = 1;
 
 // Choose which variants to pin. Preference order:
 //   1. ones already priced from the parent page (free — no fetch needed)
@@ -836,6 +837,11 @@ async function _schedNextInterval(listingCount) {
   return next;
 }
 window.SCHED = SCHED;
+
+// Maximum variants a NEW listing may be created with. Existing listings are
+// untouched — repush one to bring it under the cap.
+const MAX_PUSH_VARIANTS = 25;
+window.MAX_PUSH_VARIANTS = MAX_PUSH_VARIANTS;
 
 // ── AMAZON PRICING RESOLUTION (Aug 2026) ─────────────────────────────────────
 // Previously every sync used `p.markup != null ? p.markup : S.markup`, so the
@@ -2175,6 +2181,7 @@ async function doPush() {
     const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        maxVariants: MAX_PUSH_VARIANTS,
         access_token: token, product: prod,
         fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
         paymentPolicyId:     _isAli ? (S.ae_paymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
@@ -2821,6 +2828,16 @@ async function fetchDealsAsins(dept) {
         // This only went to the UI log before, so a run where every page was
         // refused looked in the console like the import simply stopped.
         console.warn(`[bulk] page ${i+1}/${urlsData.urls.length} REFUSED: ${r.reason} — ${url}`);
+        // The dogs page means the URL is a 404, not that we're blocked. Report
+        // it so the server stops handing it out — otherwise every future import
+        // wastes a slot on a page that will never exist.
+        if (/dogs_of_amazon/.test(r.reason || '')) {
+          console.warn(`[bulk] ${url} returns Amazon's "page not found" — marking it dead`);
+          fetch(`${S.serverUrl}/api/ebay?action=url_dead`, {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ url, reason: 'dogs_of_amazon' }),
+          }).catch(()=>{});
+        }
         bulkLog(`⚠ Page ${i+1}/${urlsData.urls.length} blocked (${r.reason}) — continuing`, 'warn');
         blockedPages++;
         continue;
@@ -3246,6 +3263,7 @@ async function bulkPushAll() {
       const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
+          maxVariants: MAX_PUSH_VARIANTS,
           access_token: token, product: p,
           fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
           paymentPolicyId:     _isAli ? (S.ae_paymentPolicyId     || S.paymentPolicyId)     : S.paymentPolicyId,
@@ -5450,6 +5468,7 @@ async function pushExisting(pid, _overrides = {}) {
     const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
+        maxVariants: MAX_PUSH_VARIANTS,
         access_token: token,
         product: productToPost,
         fulfillmentPolicyId: _isAli ? (S.ae_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
@@ -6208,6 +6227,7 @@ async function pushAll() {
       const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          maxVariants: MAX_PUSH_VARIANTS,
           access_token: token,
           product: productToPost,
           fulfillmentPolicyId: productToPost._source === 'webstaurant' ? (S.ws_fulfillmentPolicyId || S.fulfillmentPolicyId) : S.fulfillmentPolicyId,
@@ -10932,6 +10952,7 @@ async function aePushAll() {
       const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({
+          maxVariants: MAX_PUSH_VARIANTS,
           access_token: token,
           product: p,
           markup: p.markup || S.ae_markup,
@@ -11252,6 +11273,7 @@ async function wsPushAll() {
       const r = await fetch(`${S.serverUrl}/api/ebay?action=push`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          maxVariants: MAX_PUSH_VARIANTS,
           access_token:        token,
           product:             productToPost,
           fulfillmentPolicyId: S.ws_fulfillmentPolicyId || S.fulfillmentPolicyId,
