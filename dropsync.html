@@ -657,7 +657,17 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-27.4 (always fetch from Amazon)');
+console.log('[dropsync] build 2026-08-27.7 (push cap consistency + error detail)');
+
+// eBay allows a default 5,000 API calls per DAY per application — app-wide,
+// not per seller account. Removing the delay between listings makes Amazon
+// fetching the only brake, which would push ~21,000 calls/day and exhaust the
+// quota by mid-morning, stopping ALL syncing. So the gap is not removed, it is
+// re-derived: pace from the remaining eBay quota instead of a fixed number.
+// Raise this if your app has been approved for a higher limit via eBay's
+// Application Growth Check (check Developer Analytics for your real figure).
+const EBAY_DAILY_CALL_CAP = 5000;
+const EBAY_CALLS_PER_LISTING = 3;   // ~1 group read + 2 bulk updates
 
 // ALWAYS FETCH. Every sync reads every tracked variant from Amazon directly —
 // no server-cache shortcut. The cache made a sync look complete while some
@@ -974,7 +984,8 @@ window.pickPinnedAsins = pickPinnedAsins;
 // measured budget allows — the budget always wins over the target.
 const SCHED = {
   enabled: true,
-  minMs: 15000,           // never hammer faster than this
+  minMs: 2000,            // effectively no artificial gap; real pacing comes
+                          // from fetch time and the eBay quota
   maxMs: 300000,          // never crawl slower than this
   utilisation: 0.75,      // leave 25% headroom for extension background ticks
   coverageDays: 1,        // aim for one full pass per day
@@ -1028,12 +1039,19 @@ async function _schedNextInterval(listingCount) {
 
   const costPerListing = SCHED.ema || 30;               // assume cold cache until measured
   const budgetPerMin   = Math.max(3, st.budget || 8);
-  // Interval the budget can sustain
+  // How long this listing's OWN fetches take at the current rate. With no
+  // artificial gap this is the true floor — the next listing starts the moment
+  // the previous one's fetches are done.
   const budgetMs = (costPerListing / (budgetPerMin * SCHED.utilisation)) * 60000;
-  // Interval needed to cover the catalogue in the target window
-  const targetMs = (SCHED.coverageDays * 86400000) / Math.max(1, listingCount);
-  // Budget wins — going faster than it allows just buys cooldowns.
-  let next = Math.max(budgetMs, Math.min(targetMs, SCHED.maxMs));
+  // eBay quota pacing: spread the daily call allowance across 24h so syncing
+  // doesn't stop dead once it's spent.
+  const cap = (S.ebayDailyCallCap || EBAY_DAILY_CALL_CAP);
+  const perListing = (S.ebayCallsPerListing || EBAY_CALLS_PER_LISTING);
+  const quotaMs = 86400000 / Math.max(1, cap / perListing);
+  let next = Math.max(budgetMs, quotaMs);
+  if (quotaMs > budgetMs) {
+    SCHED._quotaBound = true;
+  } else SCHED._quotaBound = false;
 
   // Ease back toward normal only once a block is well behind us.
   if (SCHED.lastBlocked && Date.now() - SCHED.lastBlocked < 10 * 60000) {
@@ -1043,7 +1061,10 @@ async function _schedNextInterval(listingCount) {
   SCHED.current = next;
   const passDays = (next * listingCount) / 86400000;
   console.log(`[sched] cost≈${costPerListing.toFixed(1)} fetches/listing · budget ${budgetPerMin}/min · ` +
-    `interval ${Math.round(next/1000)}s → full pass in ${passDays.toFixed(1)}d`);
+    `interval ${Math.round(next/1000)}s → full pass in ${passDays.toFixed(1)}d` +
+    (SCHED._quotaBound
+      ? `  [paced by eBay quota ${cap}/day — Amazon could go faster; raise S.ebayDailyCallCap if your app is approved for more]`
+      : `  [paced by Amazon fetch rate]`));
   return next;
 }
 window.SCHED = SCHED;
@@ -1940,7 +1961,20 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     // concurrency LOW — each fetch returns 2-3MB of HTML which Chrome buffers
     // in memory. 2 concurrent with pacing between batches gives Chrome time
     // to release sockets and keeps the request rate human-shaped.
-    const _conc = 2;
+    // CONCURRENCY (Aug 2026). Fetches were sequential at 2 at a time, so the
+    // real ceiling was round-trip time, not the budget — raising the budget
+    // above ~150/min changed nothing because requests never overlapped.
+    // Scale with the configured rate, bounded by two hard limits:
+    //   • Chrome allows 6 connections per host, so >6 buys nothing
+    //   • each page is 1-3MB, and too many in flight exhausted Chrome's
+    //     sockets (ERR_INSUFFICIENT_RESOURCES), which silently broke fetching
+    let _conc = 2;
+    try {
+      const _st = await window.dsExt?.getStatus?.();
+      const _budget = _st?.budget || 8;
+      _conc = Math.max(2, Math.min(6, Math.ceil(_budget / 40)));
+    } catch(e) {}
+    if (_conc > 2) console.log(`[prefetchAsin] fetching ${_conc} at a time`);
     for (let i = 0; i < toFetch.length; i += _conc) {
       const batch = toFetch.slice(i, i + _conc);
       await Promise.all(batch.map(async asin => {
@@ -3568,10 +3602,15 @@ async function bulkPushAll() {
           returnPolicyId:      _isAli ? (S.ae_returnPolicyId      || S.returnPolicyId)      : S.returnPolicyId,
           markup: p.markup != null ? p.markup : (_isAli ? (S.ae_markup || 60) : (S.markup || 23)),
           handlingCost: _isAli ? (S.ae_handlingCost || 2) : (S.handlingCost || 2),
+          maxVariants: MAX_PUSH_VARIANTS,
         })
       });
       const d = await safeJson(r);
       if (!d.success) {
+        // Log the FULL reason to the console. The UI line truncates at 70
+        // chars, so a bare "400 Bad Request" told us nothing about which eBay
+        // rule was violated.
+        console.error(`[push] ${p.asin} failed (HTTP ${r.status}):`, d.error || d, d.details || '');
         bulkLog(`${p.asin} failed: ${(d.error||'push failed').slice(0,70)}`, 'error');
         failed++;
         await new Promise(res=>setTimeout(res, 800));
