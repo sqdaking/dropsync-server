@@ -8654,7 +8654,12 @@ module.exports = async (req, res) => {
       // variants this listing actually sells — capping a 40-SKU listing at 25
       // forced 15 live variants unbuyable. The cap is here to skip the long
       // tail of a huge Amazon parent, not to shrink the listing itself.
-      const _MAX_TRACKED_CFG = parseInt(process.env.MAX_TRACKED_ASINS) || 50;
+      // Track every variant the listing sells. The ceiling only guards against a
+      // pathological parent; it is not meant to trim real listings. New listings
+      // are capped at 25 variants at PUSH time instead (MAX_PUSH_VARIANTS), so
+      // the costly legacy ones shrink as they're repushed rather than having
+      // variants silently switched off.
+      const _MAX_TRACKED_CFG = parseInt(process.env.MAX_TRACKED_ASINS) || 250;
       const _ownCount = [...new Set(Object.values(body.skuToAsin || {}))]
         .filter(a => /^[A-Z0-9]{10}$/.test(String(a))).length;
       const MAX_TRACKED = Math.max(_MAX_TRACKED_CFG, Math.min(_ownCount || 0, 100));
