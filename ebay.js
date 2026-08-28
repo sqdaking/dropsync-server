@@ -8513,6 +8513,53 @@ module.exports = async (req, res) => {
         }
       } catch(e) { /* vero module optional */ }
 
+      // FORCE OOS: the browser fetched the page successfully but could not read
+      // a price — the product is unavailable. Zero every variant rather than
+      // leaving the listing buyable on an unverifiable old price. Prices are
+      // left untouched; only quantity changes, so it restores itself as soon as
+      // a real price appears.
+      if (body.forceOOS === true) {
+        try {
+          const _fsku = ebaySku.trim().replace(/\s+/g, '');
+          // EBAY_API is declared later in this handler, so resolve it directly.
+          const _API = getEbayUrls().EBAY_API;
+          const _auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json',
+                          'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
+          const _gr = await fetch(`${_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(_fsku)}&limit=200`, { headers: _auth });
+          let _offers = [];
+          if (_gr.ok) { const _d = await _gr.json().catch(() => ({})); _offers = _d.offers || []; }
+          if (!_offers.length) {
+            const _gg = await fetch(`${_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(_fsku)}`, { headers: _auth });
+            if (_gg.ok) {
+              const _grp = await _gg.json().catch(() => ({}));
+              for (const _s of (_grp.variantSKUs || [])) {
+                const _o = await fetch(`${_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(_s)}`, { headers: _auth });
+                if (_o.ok) { const _od = await _o.json().catch(() => ({})); _offers.push(...(_od.offers || [])); }
+              }
+            }
+          }
+          const _entries = _offers
+            .filter(o => o.offerId && parseInt(o.availableQuantity) !== 0)
+            .map(o => ({
+              sku: o.sku,
+              shipToLocationAvailability: { quantity: 0 },
+              offers: [{ offerId: o.offerId, availableQuantity: 0,
+                         price: o.pricingSummary?.price || { value: '9.99', currency: 'USD' } }],
+            }));
+          let _z = 0;
+          for (let i = 0; i < _entries.length; i += 25) {
+            const _r = await fetch(`${_API}/sell/inventory/v1/bulk_update_price_quantity`, {
+              method: 'POST', headers: _auth, body: JSON.stringify({ requests: _entries.slice(i, i + 25) }) });
+            if (_r.ok) _z += _entries.slice(i, i + 25).length;
+          }
+          console.log(`[smartSync] ${_fsku}: forceOOS — zeroed ${_z}/${_offers.length} variant(s) (no price available from Amazon)`);
+          return res.json({ success: true, forcedOOS: true, zeroed: _z, offers: _offers.length });
+        } catch(e) {
+          console.error('[smartSync] forceOOS failed:', e.message);
+          return res.status(500).json({ error: e.message });
+        }
+      }
+
       // BROWSER-ONLY POLICY: smartSync for Amazon requires browser-prefetched
       // ASIN data (clientAsinData). Server NEVER fetches Amazon directly —
       // proxy is disabled, no Railway-IP fallback. If browser didn't provide
