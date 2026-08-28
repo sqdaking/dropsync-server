@@ -8275,8 +8275,10 @@ module.exports = async (req, res) => {
         const _allAsins = [...new Set(r.rows.flatMap(row =>
           Object.values(row.comboasin || {}).filter(a => /^[A-Z0-9]{10}$/.test(String(a)))
         ))];
+        // In live-only mode the extension must not skip anything as "fresh".
+        const _liveOnly = String(process.env.ALWAYS_FETCH || '').toLowerCase() === 'on';
         let freshAsins = [];
-        if (_allAsins.length) {
+        if (_allAsins.length && !_liveOnly) {
           const fr = await _cachePool.query(
             `SELECT asin FROM asin_cache WHERE fetched_at > NOW() - INTERVAL '20 hours' AND asin = ANY($1)`,
             [_allAsins]
@@ -8854,7 +8856,17 @@ module.exports = async (req, res) => {
         // but never WHERE the Amazon number came from or how old it was, so a
         // "wrong price" could be a stale cache hit, a mis-mapped ASIN or a bad
         // markup and there was no way to tell them apart from the log.
-        const _uncoveredAsins = uniqueAsins.filter(a => !(a in asinPrice));
+        // NO CACHE FILL when the caller asked for live data only. Filling gaps
+        // from cache made a sync look complete while some variants carried
+        // prices hours or days old — and a stale price that still sells is
+        // worse than a variant that briefly shows out of stock.
+        const _noCacheFill = body.noCacheFill === true ||
+                             String(process.env.ALWAYS_FETCH || '').toLowerCase() === 'on';
+        const _uncoveredAsins = _noCacheFill ? [] : uniqueAsins.filter(a => !(a in asinPrice));
+        if (_noCacheFill) {
+          const _gap = uniqueAsins.filter(a => !(a in asinPrice)).length;
+          if (_gap > 0) console.log(`[smartSync] live-only mode: ${_gap} variant(s) had no fresh fetch — they go qty 0 rather than using cached prices`);
+        }
         if (_uncoveredAsins.length > 0) {
           let _filled = 0;
           await Promise.all(_uncoveredAsins.map(async asin => {
