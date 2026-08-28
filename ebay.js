@@ -1861,11 +1861,24 @@ async function ensureLocation(auth, isAliExpress = false) {
     if (cr.ok || cr.status === 204 || cr.status === 409) { _locationCache[_locKey] = cnKey; return cnKey; }
     // Fallback to US warehouse if China creation fails
   }
-  if (locations.length) {
-    const key = locations[0].merchantLocationKey;
-    console.log(`[location] found existing: ${key}`);
+  // Pick a location that MATCHES the source country. Taking locations[0] blindly
+  // handed Amazon (US) pushes the China warehouse left over from AliExpress —
+  // "[location] found existing: CN_518000" — and eBay rejected every publish
+  // with 25012 "Invalid inventory location".
+  const _wantCountry = isAliExpress ? 'CN' : 'US';
+  const _enabled = locations.filter(l =>
+    !l.merchantLocationStatus || l.merchantLocationStatus === 'ENABLED');
+  const _match = _enabled.find(l => l.location?.address?.country === _wantCountry);
+  if (_match) {
+    const key = _match.merchantLocationKey;
+    console.log(`[location] using ${_wantCountry} location: ${key}`);
     _locationCache[_locKey] = key;
     return key;
+  }
+  if (_enabled.length) {
+    // No country match — say so rather than silently shipping from the wrong
+    // country, then fall through to create the correct one below.
+    console.warn(`[location] no ${_wantCountry} location among [${_enabled.map(l => `${l.merchantLocationKey}:${l.location?.address?.country || '?'}`).join(', ')}] — creating one`);
   }
   const key = 'MainWarehouse';
   const cr = await fetch(`${EBAY_API}/sell/inventory/v1/location/${key}`, {
@@ -5621,8 +5634,12 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     );
     if (_catAspR.ok) {
       const _catAspD = await _catAspR.json();
+      // MULTI-cardinality aspects were EXCLUDED here, but MULTI only means
+      // several values are ALLOWED — one is still valid. Department and Style
+      // are MULTI in apparel categories, so they were never prefilled and every
+      // publish failed with 25002 "The item specific Department is missing".
       const _reqAspects = (_catAspD.aspects || []).filter(a =>
-        a.aspectConstraint?.aspectRequired === true && !a.aspectConstraint?.itemToAspectCardinality?.includes('MULTI')
+        a.aspectConstraint?.aspectRequired === true
       );
       const _title = (product.title || '').toLowerCase();
       let _preFilled = 0;
@@ -5646,6 +5663,19 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         } else if (/^Case Size$/i.test(_name)) {
           const _mm = (product.title||'').match(/(\d{2})\s*mm/i);
           aspects[_name] = [_mm ? _mm[1]+' mm' : '40 mm']; _preFilled++;
+        } else if (/^Department$/i.test(_name)) {
+          // Derive from the title; eBay only accepts its own enum here.
+          const _dep = /\b(women|womens|women's|ladies|female)\b/i.test(_title) ? 'Women'
+                     : /\b(men|mens|men's|male)\b/i.test(_title) ? 'Men'
+                     : /\b(girls?)\b/i.test(_title) ? 'Girls'
+                     : /\b(boys?)\b/i.test(_title) ? 'Boys'
+                     : /\b(baby|infant|newborn|toddler)\b/i.test(_title) ? 'Baby'
+                     : /\b(kids?|children|youth)\b/i.test(_title) ? 'Unisex Kids'
+                     : 'Unisex Adults';
+          aspects[_name] = [_allowed.includes(_dep) ? _dep : (_allowed[0] || _dep)]; _preFilled++;
+        } else if (/^Style$/i.test(_name)) {
+          const _sty = _allowed.find(v => _title.includes(String(v).toLowerCase()));
+          aspects[_name] = [_sty || _allowed[0] || 'Casual']; _preFilled++;
         } else if (/^MPN$/i.test(_name)) {
           aspects[_name] = ['Does Not Apply']; _preFilled++;
         } else if (/^(Type|Watch Style)$/i.test(_name)) {
