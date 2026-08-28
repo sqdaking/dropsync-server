@@ -9741,8 +9741,36 @@ module.exports = async (req, res) => {
           price:             { value: putPrice.toFixed(2), currency: 'USD' },
         });
       }
+      // ── NO PRICE ⇒ NOT BUYABLE (Aug 2026) ─────────────────────────────────
+      // These variants had no price this cycle, and were previously PRESERVED —
+      // left live on eBay at whatever price they already carried, unverified.
+      // That is how a variant keeps selling after Amazon has raised its price
+      // or dropped it entirely. If we could not confirm a price, the variant
+      // must not be buyable.
+      //
+      // Guard: only do this when the sync actually worked for OTHER variants.
+      // If nothing at all was priced, that is a fetch failure, not a product
+      // change, and the earlier abort already handles it.
       if (_skippedNoBatch.length > 0) {
-        console.log(`[smartSync] preserved ${_skippedNoBatch.length} variants whose ASIN is outside this batch (will be touched on a later cycle when asinOffset advances)`);
+        const _anyPriced = updates.some(u => u.availableQuantity > 0);
+        if (_anyPriced) {
+          let _z = 0;
+          for (const sku of _skippedNoBatch) {
+            const offer = offerMap[sku];
+            if (!offer?.offerId) continue;
+            const cur = parseFloat(offer.currentPrice) || 0;
+            const q = parseInt(offer.currentQty);
+            if (Number.isFinite(q) && q === 0) continue;      // already unbuyable
+            const price = cur > 0 ? cur : (_highestSiblingPrice || 0);
+            if (!(price > 0)) continue;                        // eBay rejects price<=0
+            updates.push({ offerId: offer.offerId, sku, availableQuantity: 0,
+                           price: { value: price.toFixed(2), currency: 'USD' } });
+            _z++;
+          }
+          console.log(`[smartSync] ${_z} variant(s) had no price this cycle → set qty 0 (not left buyable on unverified data)`);
+        } else {
+          console.warn(`[smartSync] ${_skippedNoBatch.length} variants unpriced AND nothing else priced — leaving untouched (looks like a fetch failure, not a product change)`);
+        }
       }
       if (_orphanedSkus.length > 0) {
         console.log(`[smartSync] forced OOS on ${_orphanedSkus.length} orphan variants: ${_orphanedSkus.slice(0,5).map(s => s.slice(-24)).join(', ')}${_orphanedSkus.length > 5 ? '…' : ''}`);
@@ -9861,7 +9889,11 @@ module.exports = async (req, res) => {
       // zeroing variants we simply haven't looked at destroys live inventory.
       const _coverageRatio = Object.keys(offerMap).length
         ? _dataCoverage / Object.keys(offerMap).length : 0;
-      const _MIN_COVERAGE = parseFloat(process.env.ZERO_MIN_COVERAGE || '0.5');
+      // Default 0: a variant without fresh data is never left buyable. The
+      // "no data at all" case is already caught by the abort above, so this no
+      // longer needs to hedge. Set ZERO_MIN_COVERAGE=0.5 to restore the old
+      // behaviour of leaving un-fetched variants alone on thin coverage.
+      const _MIN_COVERAGE = parseFloat(process.env.ZERO_MIN_COVERAGE || '0');
       if (_twoPhase && _coverageRatio < _MIN_COVERAGE) {
         console.warn(`[smartSync] ${normSku}: coverage ${(_coverageRatio*100).toFixed(0)}% ` +
           `(${_dataCoverage}/${Object.keys(offerMap).length}) below ${(_MIN_COVERAGE*100)}% — ` +
@@ -9891,9 +9923,12 @@ module.exports = async (req, res) => {
             const _a = skuToAsin[sku];
             if (!_a || asinPrice[_a] === undefined) { _leftAlone.push(sku); continue; }
           }
-          // Skip if phase 2 will set this exact SKU to 0 anyway (avoids a
-          // duplicate write while keeping the same end state).
-          if (want && want.availableQuantity === 0) continue;
+          // Do NOT skip qty-0 entries here. Phase 2 only restores variants with
+          // qty > 0, so anything explicitly marked 0 was skipped by phase 1 as
+          // "phase 2 will handle it" and then filtered out of phase 2 — it was
+          // never zeroed at all. Confirmed-OOS variants and unpriced variants
+          // both fell through this gap and stayed buyable.
+          // Phase 1 is where zeroing belongs, so let it run.
           const price = parseFloat(offer.currentPrice) > 0
             ? parseFloat(offer.currentPrice)
             : (want ? parseFloat(want.price.value) : (_highestSiblingPrice || 0));
