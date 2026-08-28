@@ -4825,9 +4825,6 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       if (product.comboPrices && typeof product.comboPrices === 'object') {
         if (!product.comboInStock || typeof product.comboInStock !== 'object') product.comboInStock = {};
         let _zeroed = 0;
-      // Variants phase 1 deliberately did NOT zero because coverage was thin.
-      // Previously invisible, which read as "it isn't zeroing unsynced variants".
-      const _leftAlone = [];
         for (const [key, rawPrice] of Object.entries(product.comboPrices)) {
           const p = parseFloat(rawPrice) || 0;
           if (p <= 0) {
@@ -9856,6 +9853,9 @@ module.exports = async (req, res) => {
       // eBay requires price > 0 on every entry, so we resend each offer's
       // CURRENT price — phase 1 changes quantity only, never price.
       let _zeroed = 0;
+      // Variants phase 1 deliberately did NOT zero because coverage was thin.
+      // Previously invisible, which read as "it isn't zeroing unsynced variants".
+      const _leftAlone = [];
       // Coverage ratio decides how aggressive zeroing may be. With full
       // coverage, zero-then-restore is safe and correct. With thin coverage,
       // zeroing variants we simply haven't looked at destroys live inventory.
