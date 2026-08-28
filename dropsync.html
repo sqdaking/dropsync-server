@@ -657,7 +657,14 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-27.3 (single-variant + force OOS)');
+console.log('[dropsync] build 2026-08-27.4 (always fetch from Amazon)');
+
+// ALWAYS FETCH. Every sync reads every tracked variant from Amazon directly —
+// no server-cache shortcut. The cache made a sync look complete while some
+// variants were priced from data hours or days old, and a stale price that
+// still sells is worse than a variant that briefly shows out of stock.
+// Set S.allowCache = true in the console to restore cache reuse.
+const ALWAYS_FETCH = true;
 
 // ── VARIANT MAPPING PROBE ────────────────────────────────────────────────────
 // probeVariants('DS-...-SKU')  or  probeVariants('B0DFMT3BB6')
@@ -8611,16 +8618,18 @@ async function smartSyncProduct(p, _opts) {
         // this the tab relay refetches ASINs the extension pulled minutes ago —
         // pure duplicated cost across the two engines.
         let _skipFresh = [];
-        try {
-          if (p.pinnedAsins && p.pinnedAsins.length) {
-            const cr = await fetch(`${S.serverUrl}/api/ebay?action=cache_fresh`, {
-              method: 'POST', headers: {'Content-Type':'application/json'},
-              body: JSON.stringify({ asins: p.pinnedAsins, maxAgeHours: S.asinFreshHours ?? 20 }),
-            }).then(r => r.json());
-            _skipFresh = cr.fresh || [];
-            if (_skipFresh.length) console.log(`[smartSync] ${_skipFresh.length}/${p.pinnedAsins.length} ASINs already fresh on the server — not refetching`);
-          }
-        } catch(e) {}
+        if (!ALWAYS_FETCH || S.allowCache === true) {
+          try {
+            if (p.pinnedAsins && p.pinnedAsins.length) {
+              const cr = await fetch(`${S.serverUrl}/api/ebay?action=cache_fresh`, {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({ asins: p.pinnedAsins, maxAgeHours: S.asinFreshHours ?? 20 }),
+              }).then(r => r.json());
+              _skipFresh = cr.fresh || [];
+              if (_skipFresh.length) console.log(`[smartSync] ${_skipFresh.length}/${p.pinnedAsins.length} ASINs already fresh on the server — not refetching`);
+            }
+          } catch(e) {}
+        }
         // Rotate a CHUNK_ASINS-sized window through the tracked set. Priority
         // ASINs (corrected mappings sitting at qty=0) jump to the front.
         const _tracked = (p.pinnedAsins && p.pinnedAsins.length) ? p.pinnedAsins : null;
@@ -8696,6 +8705,9 @@ async function smartSyncProduct(p, _opts) {
         clientAsinData:           _clientAsinData,
         // Only these variants are tracked; everything else is left unbuyable.
         pinnedAsins:              (p.pinnedAsins && p.pinnedAsins.length) ? p.pinnedAsins : undefined,
+        // Tell the server not to fill gaps from its cache either — a variant we
+        // failed to fetch should go qty 0, not inherit an old price.
+        noCacheFill:              (ALWAYS_FETCH && S.allowCache !== true) ? true : undefined,
         chunkAsins:               (_chunkForSync && _chunkForSync.length) ? _chunkForSync : undefined,
         // Fresh variant maps from the parent page — enables exact per-SKU ASIN matching
         freshDta:                 _freshDta   || undefined,
