@@ -5439,8 +5439,11 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     delete groupAspects[_dvn];
     delete groupAspects[_dvn.toLowerCase()];
   }
-  // Pass capped variants so specs only include values that actually exist in kept variants
-  const _cappedVars = variants.slice(0, 100);
+  // Pass the ACTUAL variants, not a re-slice. This used to slice to 100 while
+  // buildVariants had already trimmed to MAX_PUSH_VARIANTS (25), so variesBy
+  // advertised values that no longer had a matching variant — and eBay rejects
+  // that mismatch with a 400. `variants` is already capped, so use it as-is.
+  const _cappedVars = variants;
   const _capVariants = _cappedVars.map(v => ({
     primaryVal:   colorGroup  ? v.dims?.[colorGroup.name]  : null,
     secondaryVal: otherGroup  ? v.dims?.[otherGroup.name]  : null,
@@ -8646,9 +8649,17 @@ module.exports = async (req, res) => {
             if (a && !allUniqueAsins.includes(a)) allUniqueAsins.push(a);
           }
         }
-      } else if (body.comboAsin && typeof body.comboAsin === 'object') {
+      } else if (body.comboAsin && typeof body.comboAsin === 'object' && Object.keys(body.comboAsin).length) {
         allUniqueAsins = [...new Set(Object.values(body.comboAsin))].filter(Boolean);
         console.log(`[smartSync] using stored comboAsin (${allUniqueAsins.length} ASINs) — no fresh dta provided`);
+      } else if (body.skuToAsin && Object.keys(body.skuToAsin).length) {
+        // LAST-RESORT SOURCE: with no fresh dta and no comboAsin, the only known
+        // variant ASINs are the ones the eBay SKUs already map to. Without this
+        // the ASIN universe collapsed to the parent alone, and every other
+        // variant — including in-stock ones — was zeroed for having "no price".
+        allUniqueAsins = [...new Set(Object.values(body.skuToAsin))]
+          .filter(a => /^[A-Z0-9]{10}$/.test(String(a)));
+        console.log(`[smartSync] no dta or comboAsin — falling back to ${allUniqueAsins.length} ASINs from the listing's own SKU map`);
       } else {
         // Fallback: fetch parent page to extract ASIN map. Costs ~1.5MB via proxy.
         console.log(`[smartSync] no comboAsin in body — fetching parent page as fallback`);
