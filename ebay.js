@@ -4825,6 +4825,9 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       if (product.comboPrices && typeof product.comboPrices === 'object') {
         if (!product.comboInStock || typeof product.comboInStock !== 'object') product.comboInStock = {};
         let _zeroed = 0;
+      // Variants phase 1 deliberately did NOT zero because coverage was thin.
+      // Previously invisible, which read as "it isn't zeroing unsynced variants".
+      const _leftAlone = [];
         for (const [key, rawPrice] of Object.entries(product.comboPrices)) {
           const p = parseFloat(rawPrice) || 0;
           if (p <= 0) {
@@ -9839,7 +9842,7 @@ module.exports = async (req, res) => {
           // Thin coverage: only touch variants we actually have data for.
           if (_coverageRatio < _MIN_COVERAGE && !want) {
             const _a = skuToAsin[sku];
-            if (!_a || asinPrice[_a] === undefined) continue;   // no data → leave alone
+            if (!_a || asinPrice[_a] === undefined) { _leftAlone.push(sku); continue; }
           }
           // Skip if phase 2 will set this exact SKU to 0 anyway (avoids a
           // duplicate write while keeping the same end state).
@@ -9860,6 +9863,12 @@ module.exports = async (req, res) => {
           if (r1.failed.length) console.warn(`[smartSync] PHASE 1: ${r1.failed.length} zeroing calls failed — those variants may still be buyable`);
         } else {
           console.log(`[smartSync] PHASE 1 — nothing to zero (all variants already 0 or being set to 0)`);
+        }
+        if (_leftAlone.length > 0) {
+          console.warn(`[smartSync] PHASE 1 left ${_leftAlone.length} variant(s) UNTOUCHED (still buyable) because ` +
+            `coverage was ${(_coverageRatio*100).toFixed(0)}% — below ZERO_MIN_COVERAGE=${_MIN_COVERAGE}. ` +
+            `Set ZERO_MIN_COVERAGE=0 to zero every variant without fresh data. ` +
+            `Examples: ${_leftAlone.slice(0,5).map(x => x.slice(-20)).join(', ')}`);
         }
       }
 
@@ -10223,6 +10232,7 @@ module.exports = async (req, res) => {
       return res.json({
         success: true, synced: okCount, failed: failCount,
         zeroedFirst: _zeroed,
+        leftBuyableNoData: _leftAlone.length,
         untrackedCount: _untrackedSkus.length,
         trackedAsins: allUniqueAsins.length,
         deferredCount: _deferredSkus.length,
