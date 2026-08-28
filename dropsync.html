@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-27.1 (sync every variant, no chunks)');
+console.log('[dropsync] build 2026-08-27.3 (single-variant + force OOS)');
 
 // ── VARIANT MAPPING PROBE ────────────────────────────────────────────────────
 // probeVariants('DS-...-SKU')  or  probeVariants('B0DFMT3BB6')
@@ -1734,12 +1734,21 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   } catch(e) {}
   const uniqueAsins = [...new Set(Object.values(dtaMap))].filter(a => a && /^[A-Z0-9]{10}$/.test(a));
   if (!uniqueAsins.length) {
-    // Say so rather than returning silently — an empty result here looks
-    // identical to "everything was already cached" from the caller's side.
+    // No variant map usually means a SINGLE-VARIANT product — and its price is
+    // in the parent page we already have. Returning {} meant those listings
+    // were skipped every cycle and never priced at all.
     const hasMap = /"dimensionToAsinMap"\s*:\s*\{/.test(mainHtml || '');
+    const selfAsin = _pageCanonicalAsin(mainHtml);
+    if (!hasMap && selfAsin) {
+      const own = _browserExtractAsinData(mainHtml, selfAsin);
+      if (own && own.price > 0) {
+        console.log(`[prefetchAsin] single-variant product ${selfAsin} — priced $${own.price} from the parent page (no extra fetch)`);
+        return { [selfAsin]: own };
+      }
+    }
     console.warn(`[prefetchAsin] no variant ASINs parsed from parent page` +
-      (hasMap ? ' — dimensionToAsinMap IS present but could not be parsed (too large or unexpected shape)'
-              : ' — page has no dimensionToAsinMap (single-variant product, or a different variant encoding)'));
+      (hasMap ? ' — dimensionToAsinMap present but unparseable'
+              : ' — no variant map and no usable price on the page'));
     return {};
   }
 
@@ -6368,6 +6377,13 @@ async function _relayTick() {
 
   try {
     console.log(`[relay] Revising [${_relayCursor}/${listed.length}]: "${(p.title||'').slice(0,45)}"`);
+    // Feed the extension popup so progress is visible without the console.
+    try {
+      window.dsExt?.reportProgress?.({
+        done: _relayCursor, total: listed.length,
+        label: (p.title || p.ebaySku || '').slice(0, 60),
+      });
+    } catch(e) {}
     await smartSyncProduct(p);
     // SLOW MODE for Amazon: longer base interval + random jitter so the
     // request pattern doesn't look like a bot. Default 2-3 minutes between
@@ -8555,6 +8571,7 @@ async function smartSyncProduct(p, _opts) {
     // listing skips THIS sync cycle and retries on the next rotation.
     // Server never fetches Amazon directly (no DataImpulse, no Railway IP).
     let _clientAsinData = null;
+    let _parentLoaded = false;   // did Amazon actually serve us the page?
     let _chunkForSync = null;
     let _freshDta = null, _freshVV = null, _freshDims = null;
     try {
@@ -8623,6 +8640,7 @@ async function smartSyncProduct(p, _opts) {
           priority: p._priorityAsins,
           skipFresh: _skipFresh,
         });
+        _parentLoaded = true;   // the page itself came back fine
         const _n = Object.keys(_clientAsinData || {}).length;
         if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
         else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices extracted`);
@@ -8638,7 +8656,28 @@ async function smartSyncProduct(p, _opts) {
     // BROWSER-ONLY: if no client data, skip this cycle. Server is configured to
     // refuse Amazon fetches without browser data anyway, so don't waste a request.
     if (!_clientAsinData || Object.keys(_clientAsinData).length === 0) {
-      console.log(`[smartSync] ${p.ebaySku}: no browser data → skipping sync (will retry next cycle)`);
+      // Distinguish the two cases. A FAILED fetch says nothing about the
+      // product, so skipping and retrying is right. But a page that LOADED and
+      // yielded no price is a real answer — the product is unavailable — and
+      // leaving the listing buyable on an old price is how you sell something
+      // you cannot source. Mark it out of stock instead.
+      if (_parentLoaded) {
+        console.warn(`[smartSync] ${p.ebaySku}: page loaded but no price extractable → marking listing out of stock`);
+        try {
+          const rr = await fetch(`${S.serverUrl}/api/ebay?action=smartSync`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              access_token: token, accountId: S.accountId || undefined,
+              ebaySku: normaliseGroupSku(p.ebaySku), sourceUrl: p.sourceUrl,
+              forceOOS: true,
+            }),
+          });
+          const rd = await rr.json().catch(() => ({}));
+          console.log(`[smartSync] ${p.ebaySku}: forced OOS →`, rd.zeroed ?? rd.error ?? 'no response');
+          return { skipped: true, forcedOOS: true, zeroed: rd.zeroed };
+        } catch (e) { console.warn('[smartSync] forceOOS call failed:', e.message); }
+      }
+      console.log(`[smartSync] ${p.ebaySku}: fetch failed → skipping (will retry next cycle)`);
       return { skipped: true, reason: 'browser fetch failed' };
     }
 
@@ -8764,6 +8803,8 @@ async function smartSyncProduct(p, _opts) {
                chunksRun: _depth + 2 };
     }
     if (_depth > 0) console.log(`[smartSync] ${p.ebaySku}: covered in ${_depth + 1} chunks`);
+    // Count a completed listing toward the popup's daily total.
+    try { window.dsExt?.reportProgress?.({ completedOne: true }); } catch(e) {}
     return d;
   } catch(e) {
     return { error: e.message };
