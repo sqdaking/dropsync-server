@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-26.7 (accounting vs tracked set)');
+console.log('[dropsync] build 2026-08-27.1 (sync every variant, no chunks)');
 
 // ── VARIANT MAPPING PROBE ────────────────────────────────────────────────────
 // probeVariants('DS-...-SKU')  or  probeVariants('B0DFMT3BB6')
@@ -921,11 +921,16 @@ window.withImportPriority = withImportPriority;
 // (93 variants where the listing sells 40), not to shrink the listing.
 // New listings are capped at 25 AT PUSH TIME, so this only affects existing
 // listings until you repush them.
-const MAX_TRACKED_ASINS = 50;
-// Refresh 25 per pass, so a 50-variant listing takes two passes — run
-// back-to-back automatically.
-const CHUNK_ASINS = 25;
-const MAX_CHUNKS_PER_VISIT = 2;
+// SYNC EVERYTHING, ONE PASS (Aug 2026)
+// Every variant a listing sells is refreshed in a single sync — no pinned
+// subset, no chunking, nothing left unbuyable because it fell outside a window.
+// Cost scales with variant count (a 92-variant listing costs ~93 fetches), and
+// that is accepted deliberately: NEW listings are capped at 25 variants at push
+// time, so the expensive legacy listings shrink as they get repushed.
+// 250 is a safety ceiling against a pathological parent, not a working limit.
+const MAX_TRACKED_ASINS = 250;
+const CHUNK_ASINS = 250;          // one pass covers everything
+const MAX_CHUNKS_PER_VISIT = 1;   // …so no continuation is needed
 
 // Choose which variants to pin. Preference order:
 //   1. ones already priced from the parent page (free — no fetch needed)
