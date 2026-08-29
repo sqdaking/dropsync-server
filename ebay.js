@@ -9423,7 +9423,13 @@ module.exports = async (req, res) => {
       // Reconstruction path 2: use body.comboAsin directly (fallback when parent blocked)
       const _canReconFromDta = Object.keys(dta).length > 0 && _authDimKeys.length > 0;
       const _canReconFromCombo = body.comboAsin && typeof body.comboAsin === 'object' && Object.keys(body.comboAsin).length > 0;
-      if (_needsRecon.size > 0 && (_canReconFromDta || _canReconFromCombo)) {
+      // Run whenever we have variant data — NOT only when some SKU is missing a
+      // mapping. Gating on _needsRecon meant that a listing where every SKU had
+      // a mapping skipped the block entirely, so WRONG mappings were never
+      // re-checked. That is exactly the case that keeps repricing a 10-inch
+      // variant from the 30-inch ASIN, sync after sync.
+      if ((_needsRecon.size > 0 || Object.keys(skuToAsin).length > 0) &&
+          (_canReconFromDta || _canReconFromCombo)) {
         const _slug = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
         // Use the authoritative dim key order parsed from Amazon's "dimensions" array,
         // NOT Object.keys(vv2). See the big comment above — getting this wrong silently
@@ -9557,6 +9563,81 @@ module.exports = async (req, res) => {
         const _primaryOnlySlugs = Object.entries(_singleMap).sort((a, b) => b[0].length - a[0].length);
         const _pfxUpper = normSku.toUpperCase() + '-';
         let _reconHits = 0, _reconAmbiguous = 0;
+        // ── VALIDATE EVERY STORED MAPPING, NOT JUST THE MISSING ONES ─────────
+        // The exact-SKU regeneration below only ran for SKUs with NO mapping,
+        // so a stored mapping that was WRONG was never re-checked — it simply
+        // persisted, repricing that variant from another variant's ASIN on
+        // every sync. On a 267-variant listing where price scales with size,
+        // that is how a 10-inch item ends up priced from a 30-inch one.
+        //
+        // A regenerated SKU is deterministic: if the SKU a combo WOULD produce
+        // equals this SKU exactly, that combo's ASIN is authoritative. Anything
+        // disagreeing with it is wrong by definition, so correct it.
+        {
+          let _fixed = 0;
+          const _wrong = [];
+          for (const sku of Object.keys(offerMap)) {
+            const truth = _exactSkuMap[sku];
+            if (!truth) continue;                       // no exact evidence
+            if (skuToAsin[sku] && skuToAsin[sku] !== truth) {
+              _wrong.push(`${sku.slice(-22)} ${skuToAsin[sku]}→${truth}`);
+              skuToAsin[sku] = truth;
+              _fixed++;
+            } else if (!skuToAsin[sku]) {
+              skuToAsin[sku] = truth;
+            }
+          }
+          if (_fixed > 0) {
+            console.warn(`[smartSync] MIS-MAPPED VARIANTS AUTO-FIXED: ${_fixed} SKU(s) pointed at the wrong ASIN — ` +
+              _wrong.slice(0, 6).join(', ') + (_wrong.length > 6 ? '…' : ''));
+            // Their prices came from another variant, so don't trust the
+            // current eBay price for them this cycle.
+            for (const w of _wrong) _correctedSkus.add(w.split(' ')[0]);
+          }
+        }
+
+        // ── SANITY-CHECK MAPPINGS THE EXACT MAP CANNOT COVER ────────────────
+        // For hashed/truncated SKUs there is no exact match, so verify instead
+        // that the mapped ASIN's own dimension values actually appear in the
+        // SKU. A "10 Inch" SKU mapped to the "30 Inch" ASIN fails this and is
+        // dropped for re-derivation rather than left quietly wrong.
+        if (_canReconFromDta && Object.keys(vv2).length) {
+          const _asinCombo = {};                 // asin → slugified dim values
+          for (const [idx, asin] of Object.entries(dta)) {
+            const parts = String(idx).split('_');
+            const vals = _dimKeys.map((k, ki) => (vv2[k] || [])[parseInt(parts[ki] ?? parts[0]) || 0] || '').filter(Boolean);
+            if (vals.length) _asinCombo[asin] = vals.map(_slug);
+          }
+          let _dropped = 0;
+          const _bad = [];
+          for (const sku of Object.keys(offerMap)) {
+            const a = skuToAsin[sku];
+            if (!a || _exactSkuMap[sku]) continue;      // exact map already ruled on it
+            const combo = _asinCombo[a];
+            if (!combo || !combo.length) continue;      // nothing to check against
+            const sfx = (sku.toUpperCase().startsWith(_pfxUpper)
+              ? sku.slice(normSku.length + 1) : sku).toUpperCase();
+            // A hashed tail means the readable part is truncated, so absence
+            // proves nothing — only the exact map can rule on those.
+            if (/_[0-9A-F]{8}$/.test(sfx)) continue;
+            // EVERY dimension must be recognisable. Requiring only one match
+            // let "10 Inch / Jet Black" keep a mapping to the 30-inch ASIN
+            // because the colour matched — which is precisely the error that
+            // prices a short wig from a long one.
+            const missing = combo.filter(v => v && !sfx.includes(v.slice(0, Math.min(v.length, 10))));
+            if (missing.length > 0) {
+              _bad.push(`${sku.slice(-22)}≠${combo.join('|').slice(0, 24)}`);
+              delete skuToAsin[sku];
+              _needsRecon.add(sku);
+              _dropped++;
+            }
+          }
+          if (_dropped > 0) {
+            console.warn(`[smartSync] ${_dropped} mapping(s) failed the dimension check and were dropped for re-derivation: ` +
+              _bad.slice(0, 5).join(', ') + (_bad.length > 5 ? '…' : ''));
+          }
+        }
+
         for (const sku of _needsRecon) {
           // 1) EXACT: does this SKU equal the SKU some combo would generate?
           // Handles hashed/truncated SKUs with zero ambiguity.
