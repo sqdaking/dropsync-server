@@ -515,6 +515,29 @@ function mountVero(app, db) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // Explain a verdict. "It still blocks" is unactionable without knowing WHICH
+  // rule fired — brand (allowed), restricted category, prior removal, or dupe
+  // wording all look identical from the outside.
+  app.post('/api/vero/test', async (req, res) => {
+    try {
+      const { title, brand, byline, asin, description, images } = req.body || {};
+      if (!title) return res.status(400).json({ error: 'title required' });
+      const hit = await screenImport({ title, brand, byline, asin, description, images });
+      const score = scoreProduct({ title, brand, description, images });
+      res.json({
+        title,
+        verdict: !hit ? 'ALLOWED' : (hit.soft ? 'ALLOWED (warning only)' : 'BLOCKED'),
+        blocked: !!(hit && !hit.soft),
+        why: hit ? hit.reasons : ['no risk signals'],
+        risk: hit ? hit.risk : 'none',
+        soft: hit ? !!hit.soft : undefined,
+        restrictedCategories: restrictedCheck(`${title} ${description || ''}`).map(r => `${r.risk}: ${r.label}`),
+        brandsSeen: score.brands,
+        screenMode: process.env.VERO_SCREEN || 'block',
+      });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // Is this product (or a near-duplicate) permanently blocked? Batch-capable so
   // an import can check a whole page of candidates in one call.
   app.post('/api/vero/check-blocked', async (req, res) => {
