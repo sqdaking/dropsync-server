@@ -9,6 +9,7 @@ const db = require('./db');
 const vero = require('./vero');
 const veroInbox = require('./vero-inbox');
 const descRefresh = require('./descrefresh');
+const veroEnforce = require('./vero-enforce');
 const { startWorker, runForever, getValidToken } = require('./worker');
 
 const app = express();
@@ -592,6 +593,24 @@ async function start() {
       descRefresh.initDescRefresh(db.pool);
       descRefresh.mountDescRefresh(app, require('./ebay').getEbayUrls);
     } catch(e) { console.warn('[desc] init failed:', e.message); }
+    // Authoritative policy-violation scanner (GetSellerList AdminEnded /
+    // ItemPolicyViolation) — the source of truth for what eBay removed.
+    try {
+      await veroEnforce.initEnforce(db.pool, require('./ebay').getEbayUrls);
+      veroEnforce.mountEnforce(app);
+      // Sweep every 4h using each account's stored token.
+      setInterval(async () => {
+        try {
+          const r = await db.pool.query(`SELECT account_id, value FROM settings WHERE key='access_token'`);
+          for (const row of r.rows) {
+            let tok = row.value; try { tok = JSON.parse(tok); } catch(e) {}
+            if (!tok || typeof tok !== 'string') continue;
+            await veroEnforce.scanPolicyViolations({ token: tok, accountId: row.account_id, days: 7, autoFlag: true })
+              .catch(e => console.warn('[enforce] sweep', row.account_id, e.message));
+          }
+        } catch(e) { console.warn('[enforce] sweep cycle:', e.message); }
+      }, 4 * 3600 * 1000);
+    } catch(e) { console.warn('[enforce] init failed:', e.message); }
     // ── WORKER DISABLED ──────────────────────────────────────────────────────
     // Hard kill switch — worker does not start. To re-enable, uncomment the
     // startWorker() line below. Manual sync from the modal still works (calls

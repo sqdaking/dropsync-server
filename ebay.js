@@ -5256,7 +5256,25 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       body: JSON.stringify({
         availability: { shipToLocationAvailability: { quantity: simpleQty } },
         condition: 'NEW',
-        product: { title: listingTitle, description: ebayDescription, imageUrls: product.images.slice(0, 12), aspects },
+        product: await (async () => {
+          const _p = { title: listingTitle, description: ebayDescription,
+                       imageUrls: product.images.slice(0, 12), aspects };
+          // Prefer eBay's catalogue: its images are licensed, Amazon's are not.
+          const _gtin = gtinOf(product);
+          if (_gtin && String(process.env.EBAY_CATALOG_IMAGES || 'on').toLowerCase() !== 'off') {
+            const _cat = await findCatalogProduct(access_token, _gtin);
+            if (_cat) {
+              _p.epid = _cat.epid;
+              if (_cat.imageUrls.length) {
+                _p.imageUrls = _cat.imageUrls;
+                console.log(`[catalog] using ${_cat.imageUrls.length} eBay catalogue image(s) instead of Amazon's for ${_gtin}`);
+              }
+            } else {
+              _p.upc = [_gtin];   // let eBay try to match on its side too
+            }
+          }
+          return _p;
+        })(),
       }),
     });
     if (ir.status === 401) return res.status(401).json({ error: 'eBay token missing inventory permission. Go to Settings → Force Reconnect.', code: 'INVENTORY_401' });
@@ -5516,7 +5534,22 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   let groupOk = false;
   // Group gallery = product.images (12 photos of default/main color)
   // eBay shows these in the main listing; color-switching images come from per-variant imageUrls
-  const groupImageUrls = [...new Set((product.images || []).filter(u => u && typeof u === 'string' && u.startsWith('http')))].slice(0, 12);
+  let groupImageUrls = [...new Set((product.images || []).filter(u => u && typeof u === 'string' && u.startsWith('http')))].slice(0, 12);
+  // Swap in eBay's licensed catalogue images when the product has a GTIN match.
+  // Variation listings show the group image most prominently, so this is where
+  // Amazon photography is most visible — and most reported.
+  {
+    const _gtin = gtinOf(product);
+    if (_gtin && String(process.env.EBAY_CATALOG_IMAGES || 'on').toLowerCase() !== 'off') {
+      try {
+        const _cat = await findCatalogProduct(access_token, _gtin);
+        if (_cat?.imageUrls?.length) {
+          groupImageUrls = _cat.imageUrls;
+          console.log(`[catalog] group images from eBay catalogue (ePID ${_cat.epid}) — no Amazon imagery used`);
+        }
+      } catch (e) {}
+    }
+  }
   if (!groupImageUrls.length) {
     // fallback: first available color image
     const anyImg = Object.values(product.variationImages || {}).flatMap(m => Object.values(m)).find(Boolean) || '';
@@ -6344,6 +6377,59 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
 // ─── REVISE action ─────────────────────────────────────────────────────────────
 
 
+// ── EBAY CATALOGUE MATCHING (Aug 2026) ───────────────────────────────────────
+// Amazon's product photography belongs to the rights owner, and reusing it is
+// the most-reported form of VeRO infringement — provable, and detected by
+// perceptual hashing that survives cropping or mirroring, so "editing" it is
+// both infringing and futile.
+//
+// eBay's own catalogue solves it properly: supply a GTIN (UPC/EAN) or ePID and
+// eBay populates the listing from ITS catalogue, including licensed images.
+// Nothing of Amazon's is copied, and the listing gains catalogue placement.
+//
+// Returns { epid, imageUrls, title } or null when there is no match.
+const _catalogCache = new Map();
+async function findCatalogProduct(token, gtin) {
+  const g = String(gtin || '').replace(/\D/g, '');
+  if (g.length < 8 || g.length > 14) return null;
+  if (_catalogCache.has(g)) return _catalogCache.get(g);
+  try {
+    const r = await fetch(
+      `${getEbayUrls().EBAY_API}/commerce/catalog/v1_beta/product_summary/search?gtin=${g}&limit=3`,
+      { headers: { Authorization: `Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' } });
+    if (!r.ok) {
+      // 403 here means the app lacks the Catalog API scope — worth saying once
+      // rather than silently falling back to Amazon images forever.
+      if (r.status === 403) console.warn('[catalog] not authorised for the Catalog API (needs sell.inventory scope + catalog access)');
+      _catalogCache.set(g, null);
+      return null;
+    }
+    const d = await r.json().catch(() => ({}));
+    const p = (d.productSummaries || [])[0];
+    if (!p?.epid) { _catalogCache.set(g, null); return null; }
+    const imgs = [p.image?.imageUrl, ...(p.additionalImages || []).map(i => i.imageUrl)]
+      .filter(Boolean).slice(0, 12);
+    const out = { epid: p.epid, imageUrls: imgs, title: p.title || '' };
+    _catalogCache.set(g, out);
+    if (_catalogCache.size > 500) _catalogCache.delete(_catalogCache.keys().next().value);
+    console.log(`[catalog] GTIN ${g} → ePID ${p.epid}${imgs.length ? ` (${imgs.length} eBay image(s))` : ' (no images)'}`);
+    return out;
+  } catch (e) {
+    console.warn('[catalog] lookup failed:', e.message);
+    return null;
+  }
+}
+
+// Pull a GTIN out of whatever the scraper captured.
+function gtinOf(product) {
+  const a = product?.aspects || {};
+  const cand = product?.upc || product?.ean || product?.gtin ||
+    a.UPC?.[0] || a.EAN?.[0] || a.GTIN?.[0] ||
+    (product?.details && (product.details.UPC || product.details.EAN));
+  const g = String(cand || '').replace(/\D/g, '');
+  return (g.length >= 8 && g.length <= 14) ? g : null;
+}
+
 // ── handlePromote: add published listing to 2% Promoted Listings Standard campaign ──────
 async function handlePromote(body, res) {
   const { access_token, listingId } = body;
@@ -6351,7 +6437,11 @@ async function handlePromote(body, res) {
 
   const EBAY_API = getEbayUrls().EBAY_API;
   const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
-  const AD_RATE = '2.0';
+  // Ad rate is configurable now — it was hardcoded at 2%, so changing it meant
+  // editing the server. Per-request value wins, then the env default.
+  const _rateRaw = body?.adRate ?? process.env.PROMOTED_AD_RATE ?? '5.0';
+  const _rateNum = Math.max(2, Math.min(100, parseFloat(_rateRaw) || 5));
+  const AD_RATE = _rateNum.toFixed(1);
   const CAMPAIGN_NAME = 'DropSync Auto Promote';
 
   try {
@@ -6404,6 +6494,27 @@ async function handlePromote(body, res) {
         console.log(`[promote] listing ${listingId} → campaign ${campaignId} @ ${AD_RATE}%`);
         return res.json({ success: true, campaignId, listingId, adRate: AD_RATE });
       }
+    }
+    // ALREADY ADVERTISED: creating an ad for a listing that already has one
+    // fails. That is the normal case for an existing catalogue, and it used to
+    // be reported as an error while leaving the OLD rate in place — so raising
+    // the rate never actually applied to listings already promoted. Update the
+    // existing ad's bid instead.
+    const _dup = (adD.errors || []).some(e =>
+      /already/i.test(e.message || '') || [35035, 35059, 35061].includes(e.errorId));
+    if (_dup) {
+      const _upd = await fetch(
+        `${EBAY_API}/sell/marketing/v1/ad_campaign/${campaignId}/bulk_update_ads_bid_by_listing_id`, {
+        method: 'POST', headers: auth,
+        body: JSON.stringify({ requests: [{ listingId, bidPercentage: AD_RATE }] }),
+      });
+      const _ud = await _upd.json().catch(() => ({}));
+      const _ok = _upd.ok && !(_ud.responses || []).some(r => (r.errors || []).length);
+      if (_ok) {
+        console.log(`[promote] listing ${listingId} already advertised — bid updated to ${AD_RATE}%`);
+        return res.json({ success: true, campaignId, listingId, adRate: AD_RATE, updated: true });
+      }
+      console.warn(`[promote] bid update failed for ${listingId}:`, JSON.stringify(_ud).slice(0, 200));
     }
     console.warn(`[promote] HTTP ${adR.status}:`, JSON.stringify(adD).slice(0,200));
     return res.json({ success: false, error: (errors[0] || adD.errors?.[0])?.message || `HTTP ${adR.status}` });
@@ -7497,7 +7608,10 @@ module.exports = async (req, res) => {
           const _vero = require('./vero');
           const _p = body.product || body;
           const _hit = await _vero.screenImport({
-            title: _p.title, brand: _p.brand,
+            title: _p.title,
+            // Pass EVERY brand signal Amazon gives us, not just the title.
+            brand: _p.brand || _p.manufacturer || _p.aspects?.Brand?.[0],
+            byline: _p.byline || _p.brandStore || _p.bylineInfo,
             description: _p.description,
             image_url: _p.imageUrl || _p.image_url,
             images: _p.images,
@@ -7668,6 +7782,63 @@ module.exports = async (req, res) => {
     }
 
     // ── PROMOTE: add listing to 2% Promoted Listings Standard campaign ──────────
+    // Change the ad rate across the WHOLE campaign in one operation.
+    // Doing it per listing would cost ~8,700 eBay calls — more than the entire
+    // daily quota — whereas bulk_update_ads_bid_by_listing_id takes 500 at a
+    // time, so the catalogue costs about 18 calls.
+    if (action === 'promote_set_rate') {
+      const { access_token, adRate, listingIds } = body;
+      if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
+      const rate = Math.max(2, Math.min(100, parseFloat(adRate) || 5)).toFixed(1);
+      const auth = { Authorization: `Bearer ${access_token}`, 'Content-Type': 'application/json' };
+      const API = getEbayUrls().EBAY_API;
+      try {
+        // Find the campaign DropSync promotes into.
+        const cr = await fetch(`${API}/sell/marketing/v1/ad_campaign?limit=50`, { headers: auth });
+        const cd = await cr.json().catch(() => ({}));
+        const camp = (cd.campaigns || []).find(c =>
+          c.campaignName === 'DropSync Auto Promote' && c.campaignStatus !== 'ENDED')
+          || (cd.campaigns || []).find(c => c.campaignStatus === 'RUNNING');
+        if (!camp) return res.json({ success: false, error: 'No running Promoted Listings campaign found' });
+
+        // Which listings? Explicit list, or every ad already in the campaign.
+        let ids = Array.isArray(listingIds) ? listingIds.filter(Boolean) : [];
+        if (!ids.length) {
+          let offset = 0;
+          for (;;) {
+            const ar = await fetch(`${API}/sell/marketing/v1/ad_campaign/${camp.campaignId}/ad?limit=500&offset=${offset}`, { headers: auth });
+            const ad = await ar.json().catch(() => ({}));
+            const batch = (ad.ads || []).map(a => a.listingId).filter(Boolean);
+            ids.push(...batch);
+            if (batch.length < 500) break;
+            offset += 500;
+            if (offset > 20000) break;   // safety stop
+          }
+        }
+        if (!ids.length) return res.json({ success: false, error: 'No ads found in the campaign' });
+
+        let ok = 0, failed = 0;
+        for (let i = 0; i < ids.length; i += 500) {
+          const chunk = ids.slice(i, i + 500);
+          const ur = await fetch(`${API}/sell/marketing/v1/ad_campaign/${camp.campaignId}/bulk_update_ads_bid_by_listing_id`, {
+            method: 'POST', headers: auth,
+            body: JSON.stringify({ requests: chunk.map(listingId => ({ listingId, bidPercentage: rate })) }),
+          });
+          const ud = await ur.json().catch(() => ({}));
+          for (const r of (ud.responses || [])) {
+            if ((r.errors || []).length) failed++; else ok++;
+          }
+          if (!ur.ok && !(ud.responses || []).length) failed += chunk.length;
+          await sleep(400);
+        }
+        console.log(`[promote] campaign ${camp.campaignId}: set ${ok} ad(s) to ${rate}%${failed ? `, ${failed} failed` : ''}`);
+        return res.json({ success: true, campaignId: camp.campaignId, adRate: rate, updated: ok, failed, total: ids.length });
+      } catch(e) {
+        console.error('[promote_set_rate] error:', e.message);
+        return res.status(500).json({ error: e.message });
+      }
+    }
+
     if (action === 'promote') {
       return handlePromote(body, res);
     }

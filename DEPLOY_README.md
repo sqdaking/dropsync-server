@@ -76,6 +76,10 @@ Developer mode → **Load unpacked** → select the folder containing
 | `VERO_SCREEN` | `block` | `block` \| `warn` \| `off` — push-time IP screening |
 | `TWO_PHASE_SYNC` | `on` | `off` = single-pass (no zero-first phase) |
 | `AUTO_DELETE_VARIANTS` | `off` | `on` = allow variant deletion after repeated strikes. Off = zero only (reversible) |
+| `MAX_PUSH_VARIANTS` | `25` | max variants a NEW listing is created with (existing listings unaffected; repush to shrink one) |
+| `ALWAYS_FETCH` | `off` | `on` = server never fills gaps from cache and never tells the extension to skip "fresh" ASINs (the browser already forces this per-request) |
+| `STALE_PRICE_HOURS` | `72` | cached prices older than this are held at qty 0 instead of selling; `0` disables |
+| `ZERO_MIN_COVERAGE` | `0.5` | below this data coverage, only variants with fresh data are zeroed |
 | `DELETE_STRIKES` | `3` | failed syncs (1h apart, 24h+ span) required before a variant may be deleted |
 | `LOG_LEVEL` | `info` | `debug` = everything to Railway; `warn` = warnings only. Never affects `/logs-live` |
 | `LOG_STDOUT_PER_SEC` | `200` | stdout cap, kept under Railway's 500/sec limit |

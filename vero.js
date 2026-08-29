@@ -89,6 +89,50 @@ const AGGRAVATORS = [
   'inspired by', 'style of', 'like new in box',
 ];
 
+// ── RESTRICTED / PROHIBITED CATEGORIES ───────────────────────────────────────
+// Brand matching alone misses a whole class of risk. eBay's prohibited and
+// restricted items policies apply on top of VeRO, and some categories draw
+// rights-owner reports even with no brand name present at all.
+//
+// The clearest example in this catalogue: "inspired by" dupe fragrances
+// ("No.1005 Skyfall", "Our version of ..."). They carry no trademark in the
+// title, so brand screening passes them — while fragrance houses treat them as
+// trademark infringement and report them on sight.
+const RESTRICTED_PATTERNS = [
+  { risk: 'critical', label: 'dupe/inspired-by fragrance or product',
+    re: /\b(inspired\s+by|our\s+version\s+of|compare\s+to|dupe|smells?\s+like|type\s+of\s+perfume|impression\s+of|similar\s+to\s+designer)\b/i },
+  { risk: 'critical', label: 'replica / knockoff wording',
+    re: /\b(replica|knock[\s-]?off|clone|counterfeit|unauthorized|unauthorised|fake|1:1|aaa\+?\s*quality|mirror\s+quality)\b/i },
+  { risk: 'high', label: 'perfume / cosmetics (restricted category)',
+    re: /\b(perfume|cologne|eau\s+de\s+(parfum|toilette)|fragrance|body\s+mist|aftershave)\b/i },
+  { risk: 'high', label: 'supplement / ingestible (restricted category)',
+    re: /\b(supplement|vitamin|gummies|capsules|probiotic|weight\s+loss|detox\s+tea|melatonin)\b/i },
+  { risk: 'high', label: 'medical device / health claim (restricted category)',
+    re: /\b(medical\s+device|blood\s+pressure\s+monitor|thermometer|nebulizer|cpap|hearing\s+aid|pulse\s+oximeter)\b/i },
+  { risk: 'medium', label: 'lithium battery / hazmat shipping rules',
+    re: /\b(lithium|li[\s-]?ion\s+battery|power\s+bank|butane|lighter\s+fluid|aerosol)\b/i },
+  // PRODUCT SAFETY — 20% of this account's flagged listings, and none of them
+  // involved a brand. These are recall-prone or regulated categories where
+  // eBay pulls listings on the category alone: infant carriers, children's
+  // water products, anything contacting drinking water.
+  { risk: 'critical', label: 'infant carrier / sling (recall-prone, eBay product safety)',
+    re: /\b(baby\s+sling|sling\s+carrier|baby\s+carrier|infant\s+carrier|toddler\s+carrier|baby\s+wrap)\b/i },
+  { risk: 'critical', label: 'children/pet pool (eBay product safety)',
+    re: /\b(kiddie\s+pool|swimming\s+pool|paddling\s+pool|dog\s+pool|inflatable\s+pool)\b/i },
+  { risk: 'high', label: 'drinking-water contact (lead/NSF rules)',
+    re: /\b(faucet|tap\s+water|water\s+filter|drinking\s+water|sink\s+faucet)\b/i },
+  { risk: 'high', label: 'child safety equipment (regulated)',
+    re: /\b(car\s+seat|booster\s+seat|crib|bassinet|walker|helmet|life\s+jacket)\b/i },
+  { risk: 'medium', label: 'used/worn clothing (restricted category)',
+    re: /\b(used|pre[\s-]?owned|worn|second[\s-]?hand)\b.{0,20}\b(clothing|shoes|underwear|socks)\b/i },
+];
+
+function restrictedCheck(text) {
+  const hay = String(text || '');
+  const hits = RESTRICTED_PATTERNS.filter(p => p.re.test(hay));
+  return hits;
+}
+
 // Phrases where a "brand" word is actually a generic English word. Without
 // these, "Apple Cider Vinegar Gummies" scores as an Apple trademark violation
 // and a clean listing gets pulled from your catalogue for no reason.
@@ -161,13 +205,23 @@ function scoreProduct(p, extraBrands = []) {
     .concat(p.data?.images || p.images || []);
   if (imgs.some(u => /media-amazon|images-amazon|ssl-images-amazon/i.test(String(u)))) {
     score += 30;
-    reasons.push('uses Amazon-hosted product images (copyright exposure)');
+    reasons.push('uses Amazon-hosted product images (copyright exposure) — an eBay catalogue match would replace these with licensed images');
+  } else if (imgs.some(u => /i\.ebayimg\.com|ebaystatic/i.test(String(u)))) {
+    // Already on eBay's own imagery: no copyright exposure from photos.
+    reasons.push('images are eBay catalogue images (no copyright exposure)');
   }
 
   // Copy lifted from Amazon
   if (/visit the .{2,40} store|about this item|amazon\.com/i.test(desc)) {
     score += 20;
     reasons.push('description appears copied from Amazon');
+  }
+
+  // Restricted/prohibited categories count toward the audit score as well, so
+  // the report shows perfume and dupe listings alongside branded ones.
+  for (const r of restrictedCheck(`${title} ${desc}`)) {
+    score += r.risk === 'critical' ? 100 : r.risk === 'high' ? 40 : 15;
+    reasons.push(`restricted category: ${r.label}`);
   }
 
   for (const a of AGGRAVATORS) {
@@ -185,6 +239,43 @@ function scoreProduct(p, extraBrands = []) {
   else if (score > 0) risk = 'low';
 
   return { risk, score, brands: [...new Set(brands)], reasons };
+}
+
+// ── DEPARTMENT CLASSIFICATION ────────────────────────────────────────────────
+// Group listings the way a seller thinks about their catalogue, so the risk
+// report answers "which departments should I stop sourcing from?" rather than
+// listing 8,000 individual items. Ordered: the first match wins, so the more
+// specific categories are checked before the general ones.
+const DEPARTMENTS = [
+  // Product-type rules come FIRST. Gender words appear across every
+  // department — "Travel Backpack for Women", "Bracelets Set for Women",
+  // "Toys for Girls" — so checking clothing first mis-binned bags, jewellery
+  // and toys as apparel and would have skewed the whole report.
+  ['Fragrance / perfume',   /\b(perfume|cologne|eau\s+de|fragrance|body\s+mist|aftershave)\b/i],
+  ['Beauty / cosmetics',    /\b(makeup|lipstick|foundation|serum|moisturizer|skincare|shampoo|conditioner|nail\s+polish|mascara)\b/i],
+  ['Supplements / health',  /\b(supplement|vitamin|gummies|probiotic|collagen|protein\s+powder|melatonin)\b/i],
+  // Plurals matter: \bbracelet\b does NOT match "Bracelets", so a jewellery
+  // listing fell through to the clothing rule via "for Women".
+  ['Jewelry / watches',     /\b(necklaces?|bracelets?|earrings?|pendants?|watch(es)?|jewelry|jewellery|anklets?|charms?|rings?)\b/i],
+  ['Bags / luggage',        /\b(backpack|handbag|purse|tote|luggage|suitcase|wallet|duffel|crossbody)\b/i],
+  ['Toys / games',          /\b(toys?|puzzle|doll|figurine|board\s+game|plush|building\s+block|ride[\s-]on)\b/i],
+  ['Electronics / tech',    /\b(charger|cable|earbuds|headphones?|speaker|adapter|power\s+bank|phone\s+case|usb|bluetooth|monitor)\b/i],
+  ['Kitchen / dining',      /\b(kitchen|cookware|utensil|tumbler|mug|cutting\s+board|tablecloth|table\s+cloth|dinnerware|storage\s+container|cups?|plates?)\b/i],
+  ['Home / decor',          /\b(curtain|rug|pillow|blanket|comforter|bedding|lamp|decor|organizer|shelf|hanger|candle)\b/i],
+  ['Pet supplies',          /\b(dog|cat|pet|puppy|kitten|leash)\b/i],
+  ['Auto / tools',          /\b(car|auto|vehicle|wiper|drill|wrench|screwdriver|tool\s+set)\b/i],
+  ['Sports / outdoors',     /\b(yoga|fitness|dumbbell|camping|hiking|bicycle|fishing|golf)\b/i],
+  ['Shoes / footwear',      /\b(shoes?|sneakers?|sandals?|boots?|slippers?|flip[\s-]?flops?|loafers?|heels?)\b/i],
+  // Apparel last — only reached when nothing more specific matched.
+  ['Clothing - kids/baby',  /\b(girls?|boys?|kids?|toddler|baby|infant|children|youth)\b/i],
+  ['Clothing - womens',     /\b(women|womens|women's|ladies|dress|blouse|leggings)\b/i],
+  ['Clothing - mens',       /\b(men|mens|men's|polo|shirt|hoodie|jacket)\b/i],
+];
+
+function departmentOf(title, category) {
+  const hay = `${title || ''} ${category || ''}`;
+  for (const [name, re] of DEPARTMENTS) if (re.test(hay)) return name;
+  return 'Other / uncategorised';
 }
 
 // ── DB wiring ────────────────────────────────────────────────────────────────
@@ -225,7 +316,61 @@ async function isBlocked(ebaySku) {
 async function screenImport(product) {
   const extra = await customBrands();
   const res = scoreProduct(product, extra);
+
+  // Hardened after a second suspension. The old version scored the TITLE only,
+  // so a product whose brand appeared just in Amazon's brand field or byline
+  // passed straight through — and it ignored the strongest signal available:
+  // a brand that has ALREADY had a listing removed on this account.
+
+  // 1. Any brand that already cost a removal is refused outright.
+  if (_pool) {
+    const hay = `${product.title || ''} ${product.brand || ''} ${product.byline || ''}`.toLowerCase();
+    try {
+      const pv = await _pool.query(`SELECT DISTINCT brand FROM policy_violations WHERE brand IS NOT NULL`);
+      for (const row of pv.rows) {
+        const b = String(row.brand).toLowerCase();
+        if (b.length > 1 && hay.includes(b)) {
+          return { risk: 'critical', score: 999, brands: [b],
+                   reasons: [`"${b}" already had a listing removed by eBay on this account`] };
+        }
+      }
+    } catch (e) { /* table may not exist yet */ }
+  }
+
+  // 2. Amazon's declared brand / byline — a product is branded even when the
+  //    title does not repeat the brand.
+  const declared = String(product.brand || product.byline || '').trim().toLowerCase()
+    .replace(/^(visit the|brand:)\s*/i, '').replace(/\s+store$/i, '').trim();
+  if (declared && declared.length > 1) {
+    const known = [...TIER_CRITICAL, ...TIER_HIGH, ...TIER_MEDIUM, ...extra];
+    const hit = known.find(b => declared === b || declared.includes(b) || b.includes(declared));
+    if (hit) {
+      return { risk: 'critical', score: 200, brands: [hit],
+               reasons: [`Amazon declares the brand as "${product.brand || product.byline}" — known VeRO participant`] };
+    }
+  }
+
+  // 3. Restricted / prohibited CATEGORY check — independent of brand names.
+  const _hay = `${product.title || ''} ${product.description || ''}`.slice(0, 4000);
+  const _restricted = restrictedCheck(_hay);
+  const _worst = _restricted.find(r => r.risk === 'critical') || _restricted.find(r => r.risk === 'high');
+  if (_worst && _worst.risk === 'critical') {
+    return { risk: 'critical', score: 300, brands: [],
+             reasons: [`Restricted category: ${_worst.label}`],
+             restricted: _restricted.map(r => r.label) };
+  }
+  if (_worst && res.risk !== 'none') {
+    // A restricted category ON TOP of any brand signal is the combination that
+    // gets reported — treat it as critical rather than letting it through.
+    return { ...res, risk: 'critical', score: res.score + 100,
+             reasons: [...res.reasons, `Restricted category: ${_worst.label}`],
+             restricted: _restricted.map(r => r.label) };
+  }
+
   if (res.risk === 'critical' || res.risk === 'high') return res;
+  if (_worst) return { risk: 'high', score: 60, brands: [],
+                       reasons: [`Restricted category: ${_worst.label}`],
+                       restricted: _restricted.map(r => r.label) };
   return null;
 }
 
@@ -235,6 +380,46 @@ function mountVero(app, db) {
     const a = String(req.query.account || '').trim();
     return /^[\w.\-]{1,64}$/.test(a) ? a : 'default';
   };
+
+  // Risk broken down by department — answers "which departments are safe to
+  // keep sourcing?" instead of listing thousands of individual items.
+  app.get('/api/vero/risk-by-department', async (req, res) => {
+    try {
+      const extra = await customBrands();
+      const r = await _pool.query(
+        `SELECT title, category, image_url, data, do_not_relist
+           FROM products WHERE account_id = $1`, [acct(req)]);
+      const dept = {};
+      for (const row of r.rows) {
+        const d = departmentOf(row.title, row.category);
+        const s = scoreProduct({ ...row, imageUrl: row.image_url, data: row.data || {} }, extra);
+        const b = dept[d] || (dept[d] = { department: d, total: 0, critical: 0, high: 0,
+                                          medium: 0, low: 0, clean: 0, flagged: 0,
+                                          amazonImages: 0, brands: {} });
+        b.total++;
+        if (row.do_not_relist) b.flagged++;
+        if (s.risk === 'none') b.clean++; else b[s.risk]++;
+        if (s.reasons.some(x => /Amazon-hosted/.test(x))) b.amazonImages++;
+        for (const br of s.brands) b.brands[br] = (b.brands[br] || 0) + 1;
+      }
+      const rows = Object.values(dept).map(b => {
+        const risky = b.critical + b.high;
+        return {
+          ...b,
+          riskyPct: b.total ? +((risky / b.total) * 100).toFixed(1) : 0,
+          criticalPct: b.total ? +((b.critical / b.total) * 100).toFixed(1) : 0,
+          amazonImagePct: b.total ? +((b.amazonImages / b.total) * 100).toFixed(1) : 0,
+          topBrands: Object.entries(b.brands).sort((a, c) => c[1] - a[1]).slice(0, 5)
+            .map(([n, c]) => `${n} (${c})`),
+        };
+      }).sort((a, b) => b.riskyPct - a.riskyPct || b.total - a.total);
+      const totals = rows.reduce((a, b) => ({
+        total: a.total + b.total, critical: a.critical + b.critical,
+        high: a.high + b.high, flagged: a.flagged + b.flagged,
+      }), { total: 0, critical: 0, high: 0, flagged: 0 });
+      res.json({ departments: rows, totals });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
 
   // Full audit — JSON
   app.get('/api/vero/audit', async (req, res) => {
@@ -352,6 +537,9 @@ a{color:#8ab4ff}
 <div class="sub">Scores every listing for intellectual-property risk. Flagging as <b>do-not-relist</b> permanently stops sync and publish for that listing.</div>
 <div id="status">Loading…</div>
 <div class="cards" id="cards"></div>
+<h3 style="margin-top:6px">Risk by department</h3>
+<div style="opacity:.6;font-size:12px;margin-bottom:6px">Which departments are worth continuing to source. "Risky %" is CRITICAL + HIGH as a share of that department.</div>
+<div id="deptTable"></div>
 <div>
   <button onclick="selectRisk('critical')">Select all CRITICAL</button>
   <button onclick="selectRisk('high')">+ HIGH</button>
@@ -372,6 +560,23 @@ async function load(){
   document.getElementById('status').textContent = 'Scanned ' + DATA.scanned + ' listings' + (S.accountId ? ' for account ' + S.accountId : '');
   document.getElementById('cards').innerHTML = ['critical','high','medium','low'].map(k =>
     '<div class="card"><b class="'+({critical:'crit',high:'high',medium:'med',low:'low'})[k]+'">'+(DATA.counts[k]||0)+'</b>'+k.toUpperCase()+'</div>').join('');
+  // Department breakdown first — it answers the sourcing question.
+  try {
+    const dr = await fetch('/api/vero/risk-by-department' + acctQ()).then(r => r.json());
+    if (dr.departments) {
+      document.getElementById('deptTable').innerHTML =
+        '<table><tr><th>Department</th><th>Listings</th><th>Risky %</th><th>Critical</th><th>High</th><th>Amazon images %</th><th>Top brands</th></tr>' +
+        dr.departments.map(d => {
+          const col = d.riskyPct >= 40 ? 'crit' : d.riskyPct >= 15 ? 'high' : d.riskyPct >= 5 ? 'med' : 'low';
+          return '<tr><td>' + d.department + '</td><td>' + d.total.toLocaleString() + '</td>' +
+            '<td class="' + col + '"><b>' + d.riskyPct + '%</b></td>' +
+            '<td>' + d.critical + '</td><td>' + d.high + '</td>' +
+            '<td>' + d.amazonImagePct + '%</td>' +
+            '<td class="reasons">' + (d.topBrands.join(', ') || '—') + '</td></tr>';
+        }).join('') + '</table>';
+    }
+  } catch(e) {}
+
   document.getElementById('tables').innerHTML = ['critical','high','medium'].map(k => {
     const rows = DATA[k]||[]; if(!rows.length) return '';
     return '<h3 style="margin-top:22px">'+k.toUpperCase()+' ('+rows.length+')</h3><table><tr>'+
@@ -419,4 +624,5 @@ load();
 </script></body></html>`;
 
 module.exports = { initVero, mountVero, scoreProduct, isBlocked, screenImport,
+                   restrictedCheck, RESTRICTED_PATTERNS,
                    TIER_CRITICAL, TIER_HIGH, TIER_MEDIUM };

@@ -657,7 +657,38 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-28.2 (show effective rate)');
+console.log('[dropsync] build 2026-08-28.3 (promoted listings 5%)');
+
+// Promoted Listings ad rate for NEW listings. Was hardcoded at 2% server-side.
+// Change here (or S.promotedAdRate in the console) and it applies to everything
+// pushed from then on; use setPromotedRate() to change EXISTING listings.
+const PROMOTED_AD_RATE = 5.0;
+window.PROMOTED_AD_RATE = PROMOTED_AD_RATE;
+
+// Change the ad rate on listings ALREADY in the campaign. One bulk call per
+// 500 listings, so the whole catalogue costs ~18 eBay calls rather than one
+// per listing (which would exceed the entire daily quota).
+async function setPromotedRate(rate) {
+  const r = parseFloat(rate);
+  if (!(r >= 2 && r <= 100)) { console.error('setPromotedRate: use a percentage between 2 and 100'); return; }
+  const token = await ensureToken();
+  if (!token) { console.error('not connected to eBay'); return; }
+  console.log(`[promote] setting every advertised listing to ${r}% …`);
+  const resp = await fetch(`${S.serverUrl}/api/ebay?action=promote_set_rate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ access_token: token, adRate: r }),
+  });
+  const d = await resp.json().catch(() => ({}));
+  if (d.success) {
+    console.log(`[promote] ${d.updated}/${d.total} listing(s) now at ${d.adRate}%${d.failed ? ` (${d.failed} failed)` : ''}`);
+    toast(`Promoted listings set to ${d.adRate}% (${d.updated} listings)`, 'success', 6000);
+  } else {
+    console.error('[promote] failed:', d.error);
+    toast(`Ad rate change failed: ${d.error || 'unknown'}`, 'error', 6000);
+  }
+  return d;
+}
+window.setPromotedRate = setPromotedRate;
 
 // eBay allows a default 5,000 API calls per DAY per application — app-wide,
 // not per seller account. Removing the delay between listings makes Amazon
@@ -6504,7 +6535,8 @@ async function promoteListingAtRate(token, listingId) {
   if (!token || !listingId) return;
   const r = await fetch(`${S.serverUrl}/api/ebay?action=promote`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ access_token: token, listingId }),
+    body: JSON.stringify({ access_token: token, listingId,
+                           adRate: S.promotedAdRate ?? PROMOTED_AD_RATE }),
   });
   const d = await r.json().catch(() => ({}));
   if (d.success) {
