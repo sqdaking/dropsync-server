@@ -7801,7 +7801,11 @@ module.exports = async (req, res) => {
           || (cd.campaigns || []).find(c => c.campaignStatus === 'RUNNING');
         if (!camp) return res.json({ success: false, error: 'No running Promoted Listings campaign found' });
 
-        // Which listings? Explicit list, or every ad already in the campaign.
+        // Existing ads in the campaign — these get their BID updated.
+        // Listings NOT yet advertised get an ad CREATED. Without the second
+        // step, anything listed before promotion was enabled (or pushed while
+        // the campaign was missing) would never be promoted at all — and
+        // smartSync does not touch ads, so nothing else would ever fix it.
         let ids = Array.isArray(listingIds) ? listingIds.filter(Boolean) : [];
         if (!ids.length) {
           let offset = 0;
@@ -7831,8 +7835,39 @@ module.exports = async (req, res) => {
           if (!ur.ok && !(ud.responses || []).length) failed += chunk.length;
           await sleep(400);
         }
-        console.log(`[promote] campaign ${camp.campaignId}: set ${ok} ad(s) to ${rate}%${failed ? `, ${failed} failed` : ''}`);
-        return res.json({ success: true, campaignId: camp.campaignId, adRate: rate, updated: ok, failed, total: ids.length });
+        // ── ADD LISTINGS THAT ARE NOT ADVERTISED YET ────────────────────────
+        let created = 0, createFailed = 0;
+        if (_cachePool && body.addMissing !== false) {
+          try {
+            const acctId = await _resolveEbayAccountId(access_token, body.accountId);
+            const pr = await _cachePool.query(
+              `SELECT ebay_item_id FROM products
+                WHERE account_id=$1 AND status='listed' AND ebay_item_id IS NOT NULL
+                  AND COALESCE(do_not_relist,FALSE)=FALSE`, [acctId]);
+            const have = new Set(ids);
+            const missing = pr.rows.map(r => String(r.ebay_item_id)).filter(x => x && !have.has(x));
+            for (let i = 0; i < missing.length; i += 500) {
+              const chunk = missing.slice(i, i + 500);
+              const cr2 = await fetch(`${API}/sell/marketing/v1/ad_campaign/${camp.campaignId}/bulk_create_ads_by_listing_id`, {
+                method: 'POST', headers: auth,
+                body: JSON.stringify({ requests: chunk.map(listingId => ({ listingId, bidPercentage: rate })) }),
+              });
+              const cd2 = await cr2.json().catch(() => ({}));
+              for (const r2 of (cd2.responses || [])) {
+                if ((r2.errors || []).length) createFailed++; else created++;
+              }
+              if (!cr2.ok && !(cd2.responses || []).length) createFailed += chunk.length;
+              await sleep(400);
+            }
+            if (missing.length) {
+              console.log(`[promote] ${created}/${missing.length} previously unadvertised listing(s) added at ${rate}%${createFailed ? `, ${createFailed} failed` : ''}`);
+            }
+          } catch(e) { console.warn('[promote] add-missing failed:', e.message); }
+        }
+
+        console.log(`[promote] campaign ${camp.campaignId}: ${ok} ad(s) set to ${rate}%, ${created} newly added${failed ? `, ${failed} failed` : ''}`);
+        return res.json({ success: true, campaignId: camp.campaignId, adRate: rate,
+                          updated: ok, created, failed: failed + createFailed, total: ids.length + created });
       } catch(e) {
         console.error('[promote_set_rate] error:', e.message);
         return res.status(500).json({ error: e.message });
@@ -8920,10 +8955,11 @@ module.exports = async (req, res) => {
       // are capped at 25 variants at PUSH time instead (MAX_PUSH_VARIANTS), so
       // the costly legacy ones shrink as they're repushed rather than having
       // variants silently switched off.
-      const _MAX_TRACKED_CFG = parseInt(process.env.MAX_TRACKED_ASINS) || 250;
-      const _ownCount = [...new Set(Object.values(body.skuToAsin || {}))]
-        .filter(a => /^[A-Z0-9]{10}$/.test(String(a))).length;
-      const MAX_TRACKED = Math.max(_MAX_TRACKED_CFG, Math.min(_ownCount || 0, 100));
+      // HARD CAP — no expansion to fit the listing's own SKU count. A listing
+      // with more variants than this has the excess REMOVED (AUTO_TRIM_TO_PIN),
+      // so the tracked set and the live listing stay identical instead of the
+      // extra variants lingering unbuyable.
+      const MAX_TRACKED = parseInt(process.env.MAX_TRACKED_ASINS) || 25;
       let _pinned = Array.isArray(body.pinnedAsins)
         ? body.pinnedAsins.filter(a => /^[A-Z0-9]{10}$/.test(String(a))) : [];
       // AUTO-PIN (Aug 2026): the browser establishes pins, but listings synced
@@ -9935,10 +9971,16 @@ module.exports = async (req, res) => {
         if (ebayPrice > 0) {
           putPrice = ebayPrice;
         } else {
-          // No fresh Amazon price. Use highest sibling; if no sibling, fall back
-          // to existing offer price (must be > 0 for eBay to accept). If neither
-          // is available, skip — we have no valid price to send. qty forced 0.
-          if (_highestSiblingPrice !== null) {
+          // No fresh Amazon price. KEEP THE VARIANT'S OWN EXISTING PRICE where
+          // possible: a sibling's price is a different variant's number, and
+          // writing it here silently repriced variants to something that was
+          // never theirs. eBay needs price > 0 on the call, so this is only
+          // about which number to send while the variant sits at qty 0 — the
+          // variant's own last-known price is the honest choice.
+          const _own = parseFloat(offer.currentPrice) || 0;
+          if (_own > 0) {
+            putPrice = _own;
+          } else if (_highestSiblingPrice !== null) {
             putPrice = _highestSiblingPrice;
           } else {
             const _existing = parseFloat(offer.currentPrice) || 0;
@@ -10437,6 +10479,24 @@ module.exports = async (req, res) => {
         // spanning 24h+, and is opt-in via AUTO_DELETE_VARIANTS=on.
         const _autoDelete = (process.env.AUTO_DELETE_VARIANTS || 'off').toLowerCase() === 'on';
         const _STRIKES_NEEDED = parseInt(process.env.DELETE_STRIKES) || 3;
+        // ── TRIM TO THE TRACKED SET ───────────────────────────────────────────
+        // Variants beyond the tracked 25 can never be priced, so leaving them
+        // on the listing means permanently unbuyable rows that still count
+        // toward the listing's variant count. Removing them is DETERMINISTIC —
+        // it follows from the cap, not from a transient failure — so it does
+        // not need the strike system that guards the other deletions.
+        const _trimToPin = String(process.env.AUTO_TRIM_TO_PIN || 'on').toLowerCase() !== 'off';
+        let _trimSkus = [];
+        if (_trimToPin && _pinnedSet && _pinnedSet.size) {
+          _trimSkus = _allGroupSkus.filter(sku => {
+            const a = skuToAsin[sku];
+            return a && !_pinnedSet.has(a);          // mapped, but outside the 25
+          });
+          if (_trimSkus.length) {
+            console.log(`[smartSync] trim-to-pin: ${_trimSkus.length} variant(s) beyond the tracked ${_pinnedSet.size} will be removed from the listing`);
+          }
+        }
+
         let _toDeleteFinal = [];
         if (_toDelete.length && _cachePool) {
           try {
@@ -10479,6 +10539,11 @@ module.exports = async (req, res) => {
             console.warn('[smartSync] cleanup: strike tracking failed, skipping deletion:', e.message);
             _toDeleteFinal = [];
           }
+        }
+        // Trim deletions are policy, not suspicion — add them after the strike
+        // gate rather than through it.
+        if (_trimSkus.length) {
+          _toDeleteFinal = [...new Set([..._toDeleteFinal, ..._trimSkus])];
         }
         // NEVER shrink a multi-variant listing to a single SKU — eBay rejects
         // it (error 25604) and it would wreck the listing if it succeeded.

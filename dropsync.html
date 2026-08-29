@@ -293,6 +293,20 @@ function save() {
 
 // ── saveProduct(p): upsert one product to Railway immediately ──
 async function saveProduct(p) {
+  // A product eBay has already removed must never come back as a draft. This
+  // is the one place every import path converges, so the check belongs here
+  // rather than in each importer.
+  if (p && p.status === 'draft') {
+    const hit = await isBlockedProduct(p);
+    if (hit) {
+      console.warn(`[blocked] refusing to import "${(p.title||'').slice(0,50)}" — eBay removed this product before (${hit.kind}${hit.matched ? `: ${String(hit.matched).slice(0,40)}` : ''})`);
+      try { toast(`Blocked: "${(p.title||'').slice(0,40)}" was removed by eBay before`, 'warn', 5000); } catch(e) {}
+      // Remove any draft that slipped in earlier for the same product.
+      const dupe = (S.products || []).find(x => x.id === p.id || (p.asin && x.asin === p.asin));
+      if (dupe && dupe.status === 'draft') { try { await deleteDraftSilent(dupe.id); } catch(e) {} }
+      return { blocked: true, reason: hit.reason };
+    }
+  }
   markDirty(p.id);
   // Also add/update in local S.products
   const idx = S.products.findIndex(x => x.id === p.id);
@@ -657,7 +671,62 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-28.3 (promoted listings 5%)');
+console.log('[dropsync] build 2026-08-29.3 (no buy box = no price)');
+
+// ── BLOCKED-PRODUCT GUARD AT IMPORT ──────────────────────────────────────────
+// Refusing a blocked product at PUSH time is too late: the draft is already
+// created, sits in the list, and gets pushed by a later bulk run. Checking here
+// means a product eBay has removed never becomes a draft at all — and any draft
+// that already exists for it is deleted.
+const _blockedCache = new Map();   // asin → {blocked, reason}
+async function isBlockedProduct(p) {
+  if (!S.serverUrl || !p) return null;
+  const key = p.asin || p.title;
+  if (!key) return null;
+  if (_blockedCache.has(key)) return _blockedCache.get(key);
+  try {
+    const r = await fetch(`${S.serverUrl}/api/vero/check-blocked`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ asin: p.asin, title: p.title }] }),
+    }).then(x => x.json());
+    const hit = (r.blocked || [])[0] || null;
+    _blockedCache.set(key, hit);
+    if (_blockedCache.size > 2000) _blockedCache.delete(_blockedCache.keys().next().value);
+    return hit;
+  } catch (e) { return null; }
+}
+
+// Check a whole batch in one call — used by bulk import before creating drafts.
+async function filterBlocked(list) {
+  if (!S.serverUrl || !list.length) return { keep: list, blocked: [] };
+  try {
+    const r = await fetch(`${S.serverUrl}/api/vero/check-blocked`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: list.map(p => ({ asin: p.asin, title: p.title })) }),
+    }).then(x => x.json());
+    const bad = new Set((r.blocked || []).map(b => b.asin || b.title));
+    const blocked = list.filter(p => bad.has(p.asin) || bad.has(p.title));
+    return { keep: list.filter(p => !bad.has(p.asin) && !bad.has(p.title)), blocked };
+  } catch (e) { return { keep: list, blocked: [] }; }
+}
+
+// Delete drafts for products that are now blocked — run after a violation scan
+// so anything already imported is cleared out.
+async function purgeBlockedDrafts() {
+  const drafts = (S.products || []).filter(p => p.status === 'draft');
+  if (!drafts.length) { console.log('[blocked] no drafts to check'); return; }
+  const { blocked } = await filterBlocked(drafts);
+  if (!blocked.length) { console.log(`[blocked] checked ${drafts.length} drafts — none blocked`); return; }
+  for (const p of blocked) {
+    console.warn(`[blocked] deleting draft "${(p.title||'').slice(0,50)}" — previously removed by eBay`);
+    await deleteDraftSilent(p.id);
+  }
+  toast(`Deleted ${blocked.length} draft(s) for products eBay has removed`, 'warn', 6000);
+  render?.();
+}
+window.isBlockedProduct = isBlockedProduct;
+window.filterBlocked = filterBlocked;
+window.purgeBlockedDrafts = purgeBlockedDrafts;
 
 // Promoted Listings ad rate for NEW listings. Was hardcoded at 2% server-side.
 // Change here (or S.promotedAdRate in the console) and it applies to everything
@@ -976,9 +1045,16 @@ window.withImportPriority = withImportPriority;
 // that is accepted deliberately: NEW listings are capped at 25 variants at push
 // time, so the expensive legacy listings shrink as they get repushed.
 // 250 is a safety ceiling against a pathological parent, not a working limit.
-const MAX_TRACKED_ASINS = 250;
-const CHUNK_ASINS = 250;          // one pass covers everything
-const MAX_CHUNKS_PER_VISIT = 1;   // …so no continuation is needed
+// ONE POLICY, EVERYWHERE: 25 variants per listing.
+// Tracking 250 meant a 196-variant listing cost 197 fetches per cycle and could
+// never be kept fresh, while the browser and server pinned different sets and
+// disagreed. A hard 25 makes cost constant, keeps every tracked variant
+// genuinely up to date, and matches the 25-variant cap on new listings.
+// Variants beyond the 25 are REMOVED from the eBay listing (see AUTO_TRIM_TO_PIN
+// server-side) rather than left sitting unbuyable forever.
+const MAX_TRACKED_ASINS = 25;
+const CHUNK_ASINS = 25;           // one pass covers the whole tracked set
+const MAX_CHUNKS_PER_VISIT = 1;
 
 // Choose which variants to pin. Preference order:
 //   1. ones already priced from the parent page (free — no fetch needed)
@@ -1751,6 +1827,25 @@ function _browserExtractAsinData(html, expectedAsin) {
     || /name="submit\.add-to-cart"/.test(html)
     || /id="buy-now-button"/.test(html)
     || /In Stock|Only \d+ left in stock|left in stock/i.test(availSection);
+  // NO BUY BOX ⇒ NO PRICE (Aug 2026)
+  // "See available options" and "Available from these sellers" mean this ASIN
+  // has no buy box. Any price still on the page belongs to something else —
+  // a different variant, or a third-party offer we are not buying from. We
+  // were returning that number, so a wrong price was written to eBay even
+  // while the variant was correctly marked out of stock; the moment it came
+  // back in stock it would sell at that wrong price.
+  //
+  // Report price 0 instead. The server then leaves the variant's existing
+  // price untouched and simply makes it unbuyable, which is the honest
+  // outcome: we do not know this variant's price right now.
+  const _noBuyBox = !!_searchArea && (
+       /See available options/i.test(_searchArea)
+    || /Available from these sellers/i.test(_searchArea)
+    || /id="outOfStockBuyBox"/.test(_searchArea)
+  ) && !_canBuy;
+  if (_noBuyBox) {
+    return { price: 0, shipping: 0, inStock: false, noBuyBox: true };
+  }
   // Verdict: explicit OOS wins; explicit buy path wins next; otherwise fall
   // back to the core rule — a real buy-box price means in stock.
   const inStock = _oosSignal ? false : (_canBuy ? true : price > 0);
@@ -3342,6 +3437,17 @@ async function fetchDealsAsins(dept) {
     _di++;
   }
   bulkLog(`Found ${Object.keys(productMap).length} products · ${selected.length} selected (no dupes)`);
+  // Drop anything eBay has already removed BEFORE it becomes a draft. One batch
+  // call for the whole page rather than a check per product.
+  try {
+    const { keep, blocked } = await filterBlocked(selected);
+    if (blocked.length) {
+      bulkLog(`⛔ ${blocked.length} product(s) skipped — eBay removed these before: ` +
+              blocked.slice(0, 3).map(b => (b.title || b.asin || '').slice(0, 30)).join(', '), 'warn');
+      console.warn('[bulk] blocked products skipped:', blocked.map(b => b.title || b.asin));
+      return keep;
+    }
+  } catch (e) { console.warn('[bulk] block check failed:', e.message); }
   return selected;
 }
 
@@ -9108,6 +9214,30 @@ async function endListing(pid, deleteAfter = false) {
     save(); renderProducts();
   } catch (e) { toast(e.message, 'error'); }
 }
+
+// Silent draft delete for automated cleanup. deleteProduct() prompts for
+// confirmation, which would stall a purge on every item — and clicking through
+// hundreds of dialogs is how blocked drafts survive.
+// Mirrors deleteProduct's cleanup, including removing the item from the bulk
+// push queues, which is what previously let "deleted" drafts get pushed later.
+async function deleteDraftSilent(pid) {
+  const p = (S.products || []).find(x => x.id === pid);
+  if (!p || p.status === 'listed') return false;
+  addLog('delete', `Blocked draft removed: ${(p.title||'').slice(0,50)}`,
+         'Product was previously removed by eBay', { productId: p.id });
+  S.products = S.products.filter(x => x.id !== pid);
+  if (typeof BULK !== 'undefined' && BULK.queue) {
+    BULK.queue = BULK.queue.filter(x => x.id !== pid);
+    try { bulkSaveState(); } catch(_) {}
+  }
+  if (typeof WS_BULK !== 'undefined' && WS_BULK.queue) {
+    WS_BULK.queue = WS_BULK.queue.filter(x => x.id !== pid);
+  }
+  save();
+  try { await deleteProductFromRailway(pid); } catch(e) {}
+  return true;
+}
+window.deleteDraftSilent = deleteDraftSilent;
 
 function deleteProduct(pid) {
   const p = S.products.find(x => x.id === pid);

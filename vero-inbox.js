@@ -235,13 +235,32 @@ async function scanMessages({ token, accountId = 'default', tradingUrl,
     let matched = [];
     if (parsed.itemIds.length && _pool) {
       const r = await _pool.query(
-        `SELECT id, title, ebay_item_id, ebay_sku FROM products
+        `SELECT id, title, ebay_item_id, ebay_sku, asin FROM products
           WHERE account_id = $1 AND ebay_item_id = ANY($2)`,
         [accountId, parsed.itemIds]).catch(() => ({ rows: [] }));
       matched = r.rows;
     }
 
-    // Flag matched listings — never end them, only stop future syncing/listing
+    // END the listings this notice names, and block the source products from
+    // ever being imported again. Previously this only flagged them, which left
+    // hidden listings able to return and the Amazon product free to be
+    // re-imported — four products in Seller Help were flagged twice for exactly
+    // that reason.
+    if (matched.length) {
+      try {
+        const enforce = require('./vero-enforce');
+        for (const m2 of matched) {
+          if (String(process.env.AUTO_END_ON_VIOLATION || 'on').toLowerCase() !== 'off' && m2.ebay_item_id) {
+            const e = await enforce.endListing(token, m2.ebay_item_id);
+            console.log(`[vero-inbox] ended ${m2.ebay_item_id}: ${e.ok ? (e.alreadyEnded ? 'already ended' : 'ENDED') : 'failed — ' + e.reason}`);
+          }
+          await enforce.blockProduct({ asin: m2.asin, title: m2.title,
+                                       reason: `eBay notice: ${subject.slice(0, 120)}`,
+                                       itemId: m2.ebay_item_id });
+        }
+      } catch (e) { console.warn('[vero-inbox] end/block failed:', e.message); }
+    }
+
     let flaggedNow = 0;
     if (autoFlag && matched.length && _pool) {
       const ids = matched.map(x => x.id);

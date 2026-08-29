@@ -73,9 +73,14 @@ Developer mode → **Load unpacked** → select the folder containing
 |---|---|---|
 | `MAX_VARIANTS_PER_SYNC` | `15` | variants fresh-fetched per listing per cycle (rotation slice) |
 | `CLEANUP_CHEAP_PRICE` | `15` | delete variants at/below this price; `0` disables |
+| `AUTO_END_ON_VIOLATION` | `on` | end the listing when eBay reports a violation, and permanently block the source product from re-import; `off` = flag only |
+| `EBAY_CATALOG_IMAGES` | `on` | use eBay catalogue images instead of Amazon's when a GTIN match exists |
 | `VERO_SCREEN` | `block` | `block` \| `warn` \| `off` — push-time IP screening |
 | `TWO_PHASE_SYNC` | `on` | `off` = single-pass (no zero-first phase) |
 | `AUTO_DELETE_VARIANTS` | `off` | `on` = allow variant deletion after repeated strikes. Off = zero only (reversible) |
+| `PROMOTE_RECONCILE` | `on` | every 6h, set all ads to `PROMOTED_AD_RATE` and add unadvertised listings (~144 calls/day) |
+| `AUTO_TRIM_TO_PIN` | `on` | remove variants beyond the tracked 25 from existing listings; `off` = leave them unbuyable |
+| `MAX_TRACKED_ASINS` | `25` | variants tracked and priced per listing (hard cap) |
 | `MAX_PUSH_VARIANTS` | `25` | max variants a NEW listing is created with (existing listings unaffected; repush to shrink one) |
 | `ALWAYS_FETCH` | `off` | `on` = server never fills gaps from cache and never tells the extension to skip "fresh" ASINs (the browser already forces this per-request) |
 | `STALE_PRICE_HOURS` | `72` | cached prices older than this are held at qty 0 instead of selling; `0` disables |

@@ -611,6 +611,35 @@ async function start() {
         } catch(e) { console.warn('[enforce] sweep cycle:', e.message); }
       }, 4 * 3600 * 1000);
     } catch(e) { console.warn('[enforce] init failed:', e.message); }
+
+    // ── PROMOTED LISTINGS RECONCILIATION ────────────────────────────────────
+    // smartSync deliberately does NOT touch ads: at ~2 extra eBay calls per
+    // listing it would cost ~17,000 calls/day and blow the quota on its own.
+    // Instead reconcile the whole campaign periodically — bulk endpoints take
+    // 500 listings per call, so the entire catalogue costs ~35 calls: every ad
+    // set to the configured rate, and any unadvertised listing added.
+    if (String(process.env.PROMOTE_RECONCILE || 'on').toLowerCase() !== 'off') {
+      const _promoteSweep = async () => {
+        try {
+          const r = await db.pool.query(`SELECT account_id, value FROM settings WHERE key='access_token'`);
+          for (const row of r.rows) {
+            let tok = row.value; try { tok = JSON.parse(tok); } catch(e) {}
+            if (!tok || typeof tok !== 'string') continue;
+            const rate = parseFloat(process.env.PROMOTED_AD_RATE || '5');
+            const mock = { query: { action: 'promote_set_rate', account: row.account_id },
+                           body: { access_token: tok, adRate: rate, accountId: row.account_id },
+                           headers: {}, method: 'POST' };
+            let out = null;
+            const res2 = { json: j => { out = j; return res2; }, status: () => res2,
+                           setHeader: () => res2, send: () => res2, end: () => res2 };
+            await require('./ebay')(mock, res2);
+            if (out?.success) console.log(`[promote] reconcile ${row.account_id}: ${out.updated} updated, ${out.created} added @ ${out.adRate}%`);
+          }
+        } catch(e) { console.warn('[promote] reconcile failed:', e.message); }
+      };
+      setTimeout(_promoteSweep, 5 * 60 * 1000);           // once, 5 min after boot
+      setInterval(_promoteSweep, 6 * 3600 * 1000);        // then every 6h
+    }
     // ── WORKER DISABLED ──────────────────────────────────────────────────────
     // Hard kill switch — worker does not start. To re-enable, uncomment the
     // startWorker() line below. Manual sync from the modal still works (calls

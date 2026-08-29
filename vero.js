@@ -314,6 +314,18 @@ async function isBlocked(ebaySku) {
 
 /** Screen a candidate BEFORE import. Returns null if OK, else the reason. */
 async function screenImport(product) {
+  // Hard blocklist first: a product eBay has already removed must never be
+  // re-imported, whatever else it scores. Checked by ASIN and by title
+  // fingerprint, because the same item reappears under new ASINs.
+  try {
+    const enforce = require('./vero-enforce');
+    const hit = await enforce.isProductBlocked({ asin: product.asin, title: product.title });
+    if (hit) {
+      return { risk: 'critical', score: 1000, brands: [],
+               reasons: [`This product was previously removed by eBay (${hit.kind} match) — permanently blocked. ${String(hit.reason || '').slice(0, 100)}`] };
+    }
+  } catch (e) { /* module optional */ }
+
   const extra = await customBrands();
   const res = scoreProduct(product, extra);
 
@@ -466,6 +478,24 @@ function mountVero(app, db) {
           [ids]).catch(() => {});
       }
       res.json({ success: true, updated: r.rowCount });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Is this product (or a near-duplicate) permanently blocked? Batch-capable so
+  // an import can check a whole page of candidates in one call.
+  app.post('/api/vero/check-blocked', async (req, res) => {
+    try {
+      const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 500) : [];
+      if (!items.length) return res.json({ blocked: [] });
+      const enforce = require('./vero-enforce');
+      const blocked = [];
+      for (const it of items) {
+        const hit = await enforce.isProductBlocked({ asin: it.asin, title: it.title });
+        if (hit) blocked.push({ asin: it.asin, title: it.title,
+                                kind: hit.kind, matched: hit.matched || hit.title,
+                                reason: String(hit.reason || '').slice(0, 160) });
+      }
+      res.json({ blocked, checked: items.length });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 

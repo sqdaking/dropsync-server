@@ -44,6 +44,21 @@ async function initEnforce(pool, getEbayUrls) {
       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS policy_violations_acct_idx ON policy_violations(account_id, created_at DESC);
+    -- PERMANENT IMPORT BLOCKLIST.
+    -- do_not_relist protects an existing eBay listing, but the SOURCE product
+    -- could still be re-imported from Amazon and pushed as a brand-new listing.
+    -- Four products in the Seller Help report were flagged twice for exactly
+    -- this reason. Blocking the ASIN — and a title fingerprint, since the same
+    -- product reappears under different ASINs — closes that loop.
+    CREATE TABLE IF NOT EXISTS blocked_products (
+      key         TEXT PRIMARY KEY,      -- 'asin:B0XXXX' or 'fp:<fingerprint>'
+      kind        TEXT NOT NULL,         -- asin | fingerprint
+      asin        TEXT,
+      title       TEXT,
+      reason      TEXT,
+      item_id     TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
   `).catch(e => console.warn('[enforce] schema:', e.message));
   console.log('[enforce] policy-violation scanner ready');
 }
@@ -72,6 +87,59 @@ const tag = (block, name) => {
   const m = block.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`));
   return m ? m[1].trim() : '';
 };
+
+// The same product reappears under different ASINs and slightly different
+// titles, so an exact fingerprint is too brittle — it failed to connect
+// "Tankini Swimsuits for Women, Two Piece Athletic" with "2025 Tankini
+// Swimsuits for Women, Two Piece Bathing Suits", which are the same item and
+// were both reported. Compare word SETS instead and treat a 60% overlap as the
+// same product.
+const _STOP = new Set(['for','the','and','with','two','set','pack','new','all','size','inch','inches','from','you','your','use','one']);
+function titleWords(title) {
+  return [...new Set(String(title || '').toLowerCase()
+    .replace(/[^a-z ]/g, ' ').split(/\s+/)
+    .filter(w => w.length > 2 && !_STOP.has(w)))];
+}
+function similarity(a, b) {
+  if (!a.length || !b.length) return 0;
+  const A = new Set(a), B = new Set(b);
+  let inter = 0;
+  for (const w of A) if (B.has(w)) inter++;
+  return inter / (A.size + B.size - inter);      // Jaccard
+}
+function fingerprint(title) {
+  return titleWords(title).sort().slice(0, 8).join('-');
+}
+
+// End a listing outright. eBay has usually ended it already, in which case this
+// is a harmless no-op — but for listings merely HIDDEN (not ended) it is the
+// difference between the item being gone and quietly coming back.
+async function endListing(token, itemId) {
+  if (!itemId) return { ok: false, reason: 'no itemId' };
+  try {
+    const xml = await trading('EndFixedPriceItem', token,
+      `<ItemID>${itemId}</ItemID><EndingReason>NotAvailable</EndingReason>`);
+    if (/<Ack>Success<\/Ack>|<Ack>Warning<\/Ack>/.test(xml)) return { ok: true };
+    const err = (xml.match(/<LongMessage>([\s\S]*?)<\/LongMessage>/) || [])[1] || '';
+    // "Auction already closed" / "not found" means it is already gone.
+    if (/already|ended|not found|invalid item/i.test(err)) return { ok: true, alreadyEnded: true };
+    return { ok: false, reason: stripHtml(err).slice(0, 120) };
+  } catch (e) { return { ok: false, reason: e.message }; }
+}
+
+// Never import this product again, by ASIN and by title fingerprint.
+async function blockProduct({ asin, title, reason, itemId }) {
+  if (!_pool) return;
+  const rows = [];
+  if (asin && /^[A-Z0-9]{10}$/.test(asin)) rows.push([`asin:${asin}`, 'asin', asin, title, reason, itemId]);
+  const fp = fingerprint(title);
+  if (fp && fp.length > 8) rows.push([`fp:${fp}`, 'fingerprint', asin || null, title, reason, itemId]);
+  for (const r of rows) {
+    await _pool.query(
+      `INSERT INTO blocked_products(key, kind, asin, title, reason, item_id)
+       VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(key) DO NOTHING`, r).catch(() => {});
+  }
+}
 
 function stripHtml(s) {
   return String(s || '').replace(/<[^>]+>/g, ' ').replace(/&amp;/g, '&')
@@ -150,15 +218,29 @@ async function scanPolicyViolations({ token, accountId = 'default', days = 60, a
       let rows = [];
       if (f.itemId) {
         const r = await _pool.query(
-          `SELECT id, ebay_sku FROM products WHERE account_id=$1 AND ebay_item_id=$2`,
+          `SELECT id, ebay_sku, asin FROM products WHERE account_id=$1 AND ebay_item_id=$2`,
           [accountId, f.itemId]).catch(() => ({ rows: [] }));
         rows = r.rows;
       }
       if (!rows.length && f.sku) {
         const r = await _pool.query(
-          `SELECT id, ebay_sku FROM products WHERE account_id=$1 AND ebay_sku=$2`,
+          `SELECT id, ebay_sku, asin FROM products WHERE account_id=$1 AND ebay_sku=$2`,
           [accountId, f.sku]).catch(() => ({ rows: [] }));
         rows = r.rows;
+      }
+      // END the listing outright, not just flag it. A flagged-but-live listing
+      // keeps selling, and a HIDDEN listing quietly returns when the hold
+      // lifts. Set AUTO_END_ON_VIOLATION=off to flag only.
+      if (String(process.env.AUTO_END_ON_VIOLATION || 'on').toLowerCase() !== 'off' && f.itemId) {
+        const e = await endListing(token, f.itemId);
+        console.log(`[enforce] ended listing ${f.itemId}: ${e.ok ? (e.alreadyEnded ? 'already ended' : 'ENDED') : 'failed — ' + e.reason}`);
+      }
+      // Permanently block the source product from being re-imported.
+      {
+        const asin = rows[0]?.asin || (f.sku || '').match(/[A-Z0-9]{10}/)?.[0] || null;
+        await blockProduct({ asin, title: f.title,
+                             reason: `${f.kind}: ${(f.policyText || f.policyId || '').slice(0, 120)}`,
+                             itemId: f.itemId });
       }
       if (autoFlag && rows.length) {
         const ids = rows.map(x => x.id);
@@ -234,4 +316,33 @@ function mountEnforce(app) {
   console.log('[enforce] routes mounted: /api/vero/scan-violations, /api/vero/violations');
 }
 
-module.exports = { initEnforce, mountEnforce, scanPolicyViolations, brandFrom };
+// Is this product permanently blocked from import?
+async function isProductBlocked({ asin, title }) {
+  if (!_pool) return null;
+  const keys = [];
+  if (asin && /^[A-Z0-9]{10}$/.test(asin)) keys.push(`asin:${asin}`);
+  const fp = fingerprint(title);
+  if (fp && fp.length > 8) keys.push(`fp:${fp}`);
+  if (!keys.length) return null;
+  try {
+    // Exact ASIN or fingerprint hit
+    const r = await _pool.query(
+      `SELECT key, kind, title, reason FROM blocked_products WHERE key = ANY($1) LIMIT 1`, [keys]);
+    if (r.rows[0]) return r.rows[0];
+    // Near-duplicate title: same product, different ASIN or reworded title.
+    const words = titleWords(title);
+    if (words.length >= 3) {
+      const all = await _pool.query(
+        `SELECT key, kind, title, reason FROM blocked_products WHERE title IS NOT NULL LIMIT 2000`);
+      for (const row of all.rows) {
+        if (similarity(words, titleWords(row.title)) >= 0.6) {
+          return { ...row, kind: 'similar title', matched: row.title };
+        }
+      }
+    }
+    return null;
+  } catch (e) { return null; }
+}
+
+module.exports = { initEnforce, mountEnforce, scanPolicyViolations, brandFrom,
+                   endListing, blockProduct, isProductBlocked, fingerprint };
