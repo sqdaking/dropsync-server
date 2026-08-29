@@ -7617,8 +7617,14 @@ module.exports = async (req, res) => {
             images: _p.images,
           });
           if (_hit) {
-            console.warn(`[vero] push screen ${_hit.risk.toUpperCase()} (${_hit.score}) "${String(_p.title||'').slice(0,60)}" — ${_hit.brands.join(', ')}`);
-            if (_screenMode === 'block') {
+            console.warn(`[vero] push screen ${_hit.risk.toUpperCase()} (${_hit.score}) "${String(_p.title||'').slice(0,60)}" — ${(_hit.reasons||[]).join('; ').slice(0,140)}`);
+            // SOFT findings (a brand name alone) are warnings, not refusals:
+            // reselling genuine branded goods is lawful and eBay allows it.
+            // Only hard findings — prior removals, dupes/replicas, restricted
+            // categories — stop the push. VERO_SCREEN=strict blocks both.
+            if (_hit.soft && _screenMode !== 'strict') {
+              console.log(`[vero] allowing "${String(_p.title||'').slice(0,50)}" — brand match only (genuine resale is permitted)`);
+            } else if (_screenMode === 'block' || _screenMode === 'strict') {
               return res.status(403).json({
                 error: `VeRO risk: ${_hit.risk} (${_hit.brands.join(', ')}). Listing blocked to protect your account.`,
                 veroRisk: _hit.risk, brands: _hit.brands, reasons: _hit.reasons,

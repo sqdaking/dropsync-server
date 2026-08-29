@@ -75,7 +75,7 @@ Developer mode → **Load unpacked** → select the folder containing
 | `CLEANUP_CHEAP_PRICE` | `15` | delete variants at/below this price; `0` disables |
 | `AUTO_END_ON_VIOLATION` | `on` | end the listing when eBay reports a violation, and permanently block the source product from re-import; `off` = flag only |
 | `EBAY_CATALOG_IMAGES` | `on` | use eBay catalogue images instead of Amazon's when a GTIN match exists |
-| `VERO_SCREEN` | `block` | `block` \| `warn` \| `off` — push-time IP screening |
+| `VERO_SCREEN` | `block` | `block` = stop hard risks only (prior removals, dupes/replicas, restricted categories); brand names are warnings, since reselling genuine branded goods is lawful. `strict` = also block brand matches. `warn` = log only. `off` = disabled |
 | `TWO_PHASE_SYNC` | `on` | `off` = single-pass (no zero-first phase) |
 | `AUTO_DELETE_VARIANTS` | `off` | `on` = allow variant deletion after repeated strikes. Off = zero only (reversible) |
 | `PROMOTE_RECONCILE` | `on` | every 6h, set all ads to `PROMOTED_AD_RATE` and add unadvertised listings (~144 calls/day) |

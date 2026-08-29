@@ -83,10 +83,14 @@ const TIER_MEDIUM = [
 ];
 
 // Words that make a brand match a near-certain violation regardless of tier
+// "Compatible with iPhone 14" is NOMINATIVE FAIR USE — naming the device a
+// product fits is lawful, and eBay requires compatibility information on
+// accessories, so a phone case cannot be listed without it. Those phrases were
+// pushing legitimate listings into hard blocks and are gone.
+// What remains genuinely signals a counterfeit or dupe.
 const AGGRAVATORS = [
-  'authentic', 'genuine', 'original', 'oem', 'official', 'licensed',
-  'compatible with', 'fits ', 'for apple', 'for samsung', 'replica',
-  'inspired by', 'style of', 'like new in box',
+  'replica', 'knockoff', 'knock-off', 'inspired by', 'style of', '1:1',
+  'mirror quality', 'aaa quality',
 ];
 
 // ── RESTRICTED / PROHIBITED CATEGORIES ───────────────────────────────────────
@@ -349,6 +353,23 @@ async function screenImport(product) {
     } catch (e) { /* table may not exist yet */ }
   }
 
+  // ── WHY BRAND NAMES NO LONGER BLOCK ──────────────────────────────────────
+  // Reselling genuine branded goods is lawful (first-sale doctrine) and eBay
+  // permits it — VeRO exists to remove counterfeits and IP misuse, not to stop
+  // resale. Blocking every branded product was solving the wrong problem and
+  // rejecting sellable inventory.
+  //
+  // The Seller Help data proves the point: of 30 flagged listings, ZERO had a
+  // brand in the title. The claims were about copied IMAGES and copy, which is
+  // what the eBay-catalogue image work addresses.
+  //
+  // So brand matches are now a WARNING (soft), while these still BLOCK:
+  //   • a brand that has already reported this account
+  //   • dupes, replicas and counterfeit wording
+  //   • restricted/prohibited categories
+  //   • products eBay has already removed
+  // Set VERO_SCREEN=strict to block on brand names too.
+
   // 2. Amazon's declared brand / byline — a product is branded even when the
   //    title does not repeat the brand.
   const declared = String(product.brand || product.byline || '').trim().toLowerCase()
@@ -357,8 +378,9 @@ async function screenImport(product) {
     const known = [...TIER_CRITICAL, ...TIER_HIGH, ...TIER_MEDIUM, ...extra];
     const hit = known.find(b => declared === b || declared.includes(b) || b.includes(declared));
     if (hit) {
-      return { risk: 'critical', score: 200, brands: [hit],
-               reasons: [`Amazon declares the brand as "${product.brand || product.byline}" — known VeRO participant`] };
+      // SOFT: genuine branded goods are legal to resell. Flag it, don't refuse.
+      return { risk: 'high', score: 60, brands: [hit], soft: true,
+               reasons: [`Brand "${product.brand || product.byline}" is a VeRO participant — legal to resell genuine stock, but avoid their images and keep the brand out of the title where you can`] };
     }
   }
 
@@ -379,7 +401,19 @@ async function screenImport(product) {
              restricted: _restricted.map(r => r.label) };
   }
 
-  if (res.risk === 'critical' || res.risk === 'high') return res;
+  // HARD vs SOFT is decided by WHERE the signal came from, not by matching the
+  // wording of my own messages — that was fragile and mis-classified listings:
+  // "Compatible with Apple iPhone" and "adidas + Amazon image" both became hard
+  // blocks because they carried a second, non-brand reason.
+  //
+  // HARD  = restricted/prohibited category, dupe/replica wording, a product or
+  //         brand that has already been reported on this account.
+  // SOFT  = brand name present, Amazon-hosted images, copied description.
+  //         Real signals worth surfacing, but not grounds to refuse a lawful
+  //         resale.
+  if (res.risk === 'critical' || res.risk === 'high') {
+    return { ...res, risk: res.risk === 'critical' ? 'high' : res.risk, soft: true };
+  }
   if (_worst) return { risk: 'high', score: 60, brands: [],
                        reasons: [`Restricted category: ${_worst.label}`],
                        restricted: _restricted.map(r => r.label) };
