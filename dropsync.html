@@ -657,7 +657,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-27.7 (push cap consistency + error detail)');
+console.log('[dropsync] build 2026-08-28.2 (show effective rate)');
 
 // eBay allows a default 5,000 API calls per DAY per application — app-wide,
 // not per seller account. Removing the delay between listings makes Amazon
@@ -1968,13 +1968,28 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     //   • Chrome allows 6 connections per host, so >6 buys nothing
     //   • each page is 1-3MB, and too many in flight exhausted Chrome's
     //     sockets (ERR_INSUFFICIENT_RESOURCES), which silently broke fetching
-    let _conc = 2;
+    // CONCURRENCY IS NOT FREE ON A LIMITED LINK.
+    // Scaling this with the budget made syncing SLOWER: at 50 Mbps and ~2MB per
+    // page the connection is already saturated around 150 pages/min, so four
+    // parallel downloads simply split the same bandwidth four ways. Each fetch
+    // takes ~4x longer, some approach the 30s timeout and get recorded as
+    // blocks, and the limiter then cuts the budget — a net loss.
+    // Parallelism only helps when waiting on LATENCY with spare bandwidth.
+    // Raise S.fetchConcurrency only if the link has genuine headroom.
+    const _conc = Math.max(1, Math.min(6, parseInt(S.fetchConcurrency) || 2));
+    // Say what the ACTUAL pace will be. Concurrency is capped by the token
+    // bucket, so with a throttled budget the fetches arrive one at a time no
+    // matter what the concurrency setting says — which looks like the setting
+    // being ignored.
     try {
       const _st = await window.dsExt?.getStatus?.();
-      const _budget = _st?.budget || 8;
-      _conc = Math.max(2, Math.min(6, Math.ceil(_budget / 40)));
+      if (_st) {
+        const gap = 60 / Math.max(1, _st.budget || 8);
+        console.log(`[prefetchAsin] ${toFetch.length} to fetch · concurrency ${_conc} · budget ${_st.budget}/min` +
+          (_st.maxBudget && _st.budget < _st.maxBudget ? ` (throttled from ${_st.maxBudget} — click "Reset speed limiter" in the extension popup)` : '') +
+          ` → ~${gap.toFixed(1)}s between fetches, ~${(toFetch.length * gap / 60).toFixed(1)} min for this listing`);
+      }
     } catch(e) {}
-    if (_conc > 2) console.log(`[prefetchAsin] fetching ${_conc} at a time`);
     for (let i = 0; i < toFetch.length; i += _conc) {
       const batch = toFetch.slice(i, i + _conc);
       await Promise.all(batch.map(async asin => {
