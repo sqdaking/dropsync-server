@@ -93,6 +93,35 @@ const AGGRAVATORS = [
   'mirror quality', 'aaa quality',
 ];
 
+// eBay's published VeRO participant list (1,131 rights owners). Used for
+// WARNINGS and for the optional brand purge — never to block an import, since
+// reselling genuine branded goods is lawful. Loaded lazily so a missing file
+// cannot break screening.
+let _participants = null;
+function veroParticipants() {
+  if (_participants) return _participants;
+  try { _participants = require('./vero-participants'); }
+  catch (e) { _participants = []; }
+  return _participants;
+}
+
+// Does a title mention a registered rights owner? Word-boundary matched, and
+// compatibility phrasing ("Case for Apple iPhone") is excluded because naming
+// the device an accessory fits is nominative fair use.
+function participantMatch(text) {
+  const hay = String(text || '').toLowerCase();
+  if (!hay) return null;
+  for (const b of veroParticipants()) {
+    if (b.length < 4) continue;
+    const esc = b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i').test(hay)) continue;
+    const compat = new RegExp(`(?:for|fits|compatible\\s+with|replacement\\s+for)\\s+(?:the\\s+)?${esc}\\b`, 'i');
+    if (!new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i').test(hay.replace(compat, ' '))) continue;
+    return b;
+  }
+  return null;
+}
+
 // ── RESTRICTED / PROHIBITED CATEGORIES ───────────────────────────────────────
 // Brand matching alone misses a whole class of risk. eBay's prohibited and
 // restricted items policies apply on top of VeRO, and some categories draw
@@ -712,4 +741,5 @@ load();
 
 module.exports = { initVero, mountVero, scoreProduct, isBlocked, screenImport,
                    restrictedCheck, RESTRICTED_PATTERNS,
+                   veroParticipants, participantMatch,
                    TIER_CRITICAL, TIER_HIGH, TIER_MEDIUM };

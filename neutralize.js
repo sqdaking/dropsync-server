@@ -52,8 +52,12 @@ const ARTEFACTS = [
   /\bfree (?:returns?|shipping)\b/gi,      // shipping terms are eBay's, not the copy's
   /\b(?:one[- ]day|two[- ]day|same[- ]day) (?:delivery|shipping)\b/gi,
   /\bASIN[:\s]*[A-Z0-9]{10}\b/gi,
-  /\b\d+(?:\.\d+)?\s*out of\s*5\s*stars?\b/gi,
-  /\b\d[\d,]*\s*(?:customer\s*)?(?:ratings?|reviews?)\b/gi,
+  // Consume the whole clause, not just the number — removing "4.5 out of 5
+  // stars" from "Rated 4.5 out of 5 stars by 2,341 customers" left the stub
+  // "Rated by on", which reads as broken text to a buyer.
+  /\brated\b[^.<]{0,80}\.?/gi,
+  /\b\d+(?:\.\d+)?\s*out of\s*5\s*stars?\b[^.<]{0,40}\.?/gi,
+  /\b\d[\d,]*\s*(?:customer\s*)?(?:ratings?|reviews?)\b[^.<]{0,30}\.?/gi,
   /\bbest ?seller(?:s)?(?:\s*rank)?\b/gi,
   /\b#\d[\d,]*\s*in\s+[A-Z][^.<]{2,40}/g,
 ];
@@ -151,6 +155,22 @@ function neutralizeDescription(desc, opts = {}) {
 
   // 1) Marketplace artefacts — always removed, single-variant or not
   for (const re of ARTEFACTS) d = d.replace(re, ' ');
+  // Removing phrases mid-sentence leaves debris like ": adjustable dad hat. .
+  // Rated by . on ." — which reads as broken to a buyer and can itself trip
+  // eBay's content checks. Drop sentences that no longer say anything and
+  // tidy the punctuation the removals left behind.
+  d = d
+    .replace(/\s{2,}/g, ' ')
+    .replace(/([.!?])\s*[.,;:]+/g, '$1')            // ". ." → "."
+    .replace(/(^|[>\s])[.,;:]+\s*/g, '$1')          // leading punctuation
+    .split(/(?<=[.!?])\s+/)
+    .filter(sent => {
+      const words = sent.replace(/<[^>]+>/g, ' ').match(/[A-Za-z]{2,}/g) || [];
+      return words.length >= 3;                     // keep only real sentences
+    })
+    .join(' ')
+    .replace(/\s+([.,;:])/g, '$1')
+    .trim();
 
   // Nothing varies → no variant-specific risk, just return the cleaned copy
   if (!conflicting.length && variantCount < 2) {

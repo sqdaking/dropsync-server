@@ -1044,6 +1044,15 @@ function sanitizeDescription(desc, fallback, variantCtx) {
   // variant ("100 Pack" copy on a listing that also sells the 1000 pack) —
   // which is a misleading listing and an INAD/return magnet. Strip claims that
   // conflict across variants; shared specs are preserved.
+  // Marketplace artefacts ("Visit the X Store", ASINs, star ratings, Amazon
+  // references) must be stripped from EVERY description. Previously this only
+  // ran for multi-variant listings, so single-variant listings kept Amazon
+  // references — which eBay's content filter can reject outright.
+  try {
+    const { neutralizeDescription } = require('./neutralize');
+    const _clean = neutralizeDescription(d, { variantCount: 1, addNote: false });
+    if (_clean.changed) d = _clean.description;
+  } catch(e) {}
   if (variantCtx && (variantCtx.variations || variantCtx.variantCount >= 2)) {
     try {
       const { neutralizeDescription } = require('./neutralize');
@@ -5258,7 +5267,7 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         condition: 'NEW',
         product: await (async () => {
           const _p = { title: listingTitle, description: ebayDescription,
-                       imageUrls: product.images.slice(0, 12), aspects };
+                       imageUrls: orderImages(product.images).slice(0, 12), aspects };
           // Prefer eBay's catalogue: its images are licensed, Amazon's are not.
           const _gtin = gtinOf(product);
           if (_gtin && String(process.env.EBAY_CATALOG_IMAGES || 'on').toLowerCase() !== 'off') {
@@ -5534,7 +5543,7 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   let groupOk = false;
   // Group gallery = product.images (12 photos of default/main color)
   // eBay shows these in the main listing; color-switching images come from per-variant imageUrls
-  let groupImageUrls = [...new Set((product.images || []).filter(u => u && typeof u === 'string' && u.startsWith('http')))].slice(0, 12);
+  let groupImageUrls = orderImages([...new Set(product.images || [])]).slice(0, 12);
   // Swap in eBay's licensed catalogue images when the product has a GTIN match.
   // Variation listings show the group image most prominently, so this is where
   // Amazon photography is most visible — and most reported.
@@ -5957,7 +5966,14 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       return res.status(400).json({ error: 'Variant prices differ by more than 4X — eBay requires all variants within same price range.', errorId: 25019, unrecoverable: true });
     }
     if (errId === 25019 && _isImproper) {
-      console.warn(`[push] 25019 improper words — title/desc rejected by eBay content filter. Sanitization may have missed a banned term.`);
+      // This error conflates two very different causes, and the wording sends
+      // people hunting for a banned word that often is not there:
+      //   (a) a genuinely prohibited term in the title/description, or
+      //   (b) the SELLER ACCOUNT is under an active selling restriction —
+      //       during a restriction every publish returns 25019, and no amount
+      //       of re-sanitising will change that.
+      console.warn(`[push] 25019 — eBay refused to publish. Either a prohibited term in the title/description, OR the account is under an active selling restriction.`);
+      console.warn(`[push] If your account is currently restricted, every push fails this way until it lifts — check https://www.ebay.com/sellerhelp/policy before editing the listing.`);
       return res.status(400).json({ error: 'eBay rejected listing: title or description contains banned words (VERO brand name or restricted term). Edit the listing and remove brand-specific terms.', errorId: 25019, unrecoverable: true });
     }
     // 25005: category doesn't support multi-variation — retry with fallback categories
@@ -6376,6 +6392,33 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
 
 // ─── REVISE action ─────────────────────────────────────────────────────────────
 
+
+// Which Amazon image leads the listing.
+// Amazon's FIRST image is the canonical hero shot — the one brand-protection
+// services fingerprint and the one buyers recognise from the Amazon page. The
+// second is usually a detail or lifestyle shot: less recognisable, and it often
+// makes a better standalone thumbnail anyway.
+//
+// Be clear about what this does and does not achieve: every image here still
+// belongs to the rights owner, so leading with the second one does NOT make
+// reuse lawful. It only avoids the single most-matched asset. The actual fix is
+// an eBay catalogue match (licensed images) or your own photography.
+//
+// IMAGE_START_INDEX=0 restores Amazon's original order.
+function orderImages(images) {
+  const list = (images || []).filter(u => u && typeof u === 'string' && u.startsWith('http'));
+  // Defaults to 0 — Amazon's original order. Leading with the second image was
+  // tried and reverted: it doesn't change the copyright position (the whole
+  // image set belongs to the rights owner and hashing covers all of it), and
+  // the first image is usually the better thumbnail. Set IMAGE_START_INDEX=1
+  // to lead with the second image again.
+  const start = parseInt(process.env.IMAGE_START_INDEX ?? '0');
+  if (!(start > 0) || list.length < 2) return list;
+  // Move the chosen image to the front, keep the rest in order — nothing is
+  // discarded, so the buyer still sees every photo.
+  const lead = list[Math.min(start, list.length - 1)];
+  return [lead, ...list.filter(u => u !== lead)];
+}
 
 // ── EBAY CATALOGUE MATCHING (Aug 2026) ───────────────────────────────────────
 // Amazon's product photography belongs to the rights owner, and reusing it is
@@ -7828,6 +7871,7 @@ module.exports = async (req, res) => {
         if (!ids.length) return res.json({ success: false, error: 'No ads found in the campaign' });
 
         let ok = 0, failed = 0;
+        const _errCounts = {};      // reason → count
         for (let i = 0; i < ids.length; i += 500) {
           const chunk = ids.slice(i, i + 500);
           const ur = await fetch(`${API}/sell/marketing/v1/ad_campaign/${camp.campaignId}/bulk_update_ads_bid_by_listing_id`, {
@@ -7836,9 +7880,22 @@ module.exports = async (req, res) => {
           });
           const ud = await ur.json().catch(() => ({}));
           for (const r of (ud.responses || [])) {
-            if ((r.errors || []).length) failed++; else ok++;
+            if ((r.errors || []).length) {
+              failed++;
+              // Record WHY. "1000 failed" with no reason is unactionable —
+              // ineligible listings, ended items and an account restriction all
+              // look identical without the error text.
+              for (const e of r.errors) {
+                const k = `${e.errorId}: ${(e.message || '').slice(0, 90)}`;
+                _errCounts[k] = (_errCounts[k] || 0) + 1;
+              }
+            } else ok++;
           }
-          if (!ur.ok && !(ud.responses || []).length) failed += chunk.length;
+          if (!ur.ok && !(ud.responses || []).length) {
+            failed += chunk.length;
+            const k = `HTTP ${ur.status}: ${JSON.stringify(ud).slice(0, 90)}`;
+            _errCounts[k] = (_errCounts[k] || 0) + chunk.length;
+          }
           await sleep(400);
         }
         // ── ADD LISTINGS THAT ARE NOT ADVERTISED YET ────────────────────────
@@ -7860,9 +7917,19 @@ module.exports = async (req, res) => {
               });
               const cd2 = await cr2.json().catch(() => ({}));
               for (const r2 of (cd2.responses || [])) {
-                if ((r2.errors || []).length) createFailed++; else created++;
+                if ((r2.errors || []).length) {
+                  createFailed++;
+                  for (const e of r2.errors) {
+                    const k = `${e.errorId}: ${(e.message || '').slice(0, 90)}`;
+                    _errCounts[k] = (_errCounts[k] || 0) + 1;
+                  }
+                } else created++;
               }
-              if (!cr2.ok && !(cd2.responses || []).length) createFailed += chunk.length;
+              if (!cr2.ok && !(cd2.responses || []).length) {
+                createFailed += chunk.length;
+                const k = `HTTP ${cr2.status}: ${JSON.stringify(cd2).slice(0, 90)}`;
+                _errCounts[k] = (_errCounts[k] || 0) + chunk.length;
+              }
               await sleep(400);
             }
             if (missing.length) {
@@ -7871,9 +7938,13 @@ module.exports = async (req, res) => {
           } catch(e) { console.warn('[promote] add-missing failed:', e.message); }
         }
 
-        console.log(`[promote] campaign ${camp.campaignId}: ${ok} ad(s) set to ${rate}%, ${created} newly added${failed ? `, ${failed} failed` : ''}`);
+        const _topErrors = Object.entries(_errCounts).sort((a, b) => b[1] - a[1]).slice(0, 8);
+        console.log(`[promote] campaign ${camp.campaignId}: ${ok} ad(s) set to ${rate}%, ${created} newly added${failed + createFailed ? `, ${failed + createFailed} failed` : ''}`);
+        for (const [reason, n] of _topErrors) console.log(`[promote]   ${String(n).padStart(5)} × ${reason}`);
         return res.json({ success: true, campaignId: camp.campaignId, adRate: rate,
-                          updated: ok, created, failed: failed + createFailed, total: ids.length + created });
+                          updated: ok, created, failed: failed + createFailed,
+                          total: ids.length + created,
+                          failureReasons: Object.fromEntries(_topErrors) });
       } catch(e) {
         console.error('[promote_set_rate] error:', e.message);
         return res.status(500).json({ error: e.message });

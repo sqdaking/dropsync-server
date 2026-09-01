@@ -281,6 +281,99 @@ async function scanPolicyViolations({ token, accountId = 'default', days = 60, a
   };
 }
 
+/**
+ * Scan ACTIVE listings for banned brands and end them before they renew.
+ *
+ * Why this exists: fixed-price listings on GTC (Good 'Til Cancelled) renew
+ * themselves every month. A listing for a brand you've decided never to sell
+ * again therefore comes back on its own — flagging the product is not enough,
+ * the live listing has to be ended.
+ *
+ * @param {object} o { token, accountId, brands, dryRun }
+ */
+async function purgeBrands({ token, accountId = 'default', brands = [], dryRun = true }) {
+  if (!token) throw new Error('access_token required');
+  const list = brands.map(b => String(b).trim().toLowerCase()).filter(b => b.length > 1);
+  if (!list.length) throw new Error('no brands supplied');
+
+  const now = new Date();
+  const future = new Date(Date.now() + 400 * 86400000);   // covers GTC renewals
+  const matches = [];
+
+  for (let page = 1; page <= 40; page++) {
+    const xml = await trading('GetSellerList', token,
+      `<EndTimeFrom>${now.toISOString()}</EndTimeFrom>` +
+      `<EndTimeTo>${future.toISOString()}</EndTimeTo>` +
+      `<IncludeVariations>false</IncludeVariations>` +
+      `<GranularityLevel>Medium</GranularityLevel>` +
+      `<DetailLevel>ReturnAll</DetailLevel>` +
+      `<Pagination><EntriesPerPage>200</EntriesPerPage><PageNumber>${page}</PageNumber></Pagination>`);
+    if (/<Ack>Failure<\/Ack>/.test(xml)) {
+      const err = (xml.match(/<LongMessage>([\s\S]*?)<\/LongMessage>/) || [])[1] || 'unknown';
+      throw new Error('GetSellerList failed: ' + stripHtml(err).slice(0, 200));
+    }
+    const items = xml.match(/<Item>[\s\S]*?<\/Item>/g) || [];
+    for (const it of items) {
+      const title = stripHtml(tag(it, 'Title'));
+      const hay = title.toLowerCase();
+      // Word-boundary match so "Coach" doesn't hit "coaching" and "Apple"
+      // doesn't hit "pineapple".
+      const esc = b => b.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const hit = list.find(b => {
+        if (!new RegExp(`(^|[^a-z0-9])${esc(b)}([^a-z0-9]|$)`, 'i').test(hay)) return false;
+        // NOMINATIVE FAIR USE: "Case for Apple iPhone", "Compatible with
+        // Samsung Galaxy" names the device an accessory fits. That is lawful,
+        // eBay requires the compatibility information, and ending those
+        // listings would destroy legitimate inventory. Only treat the brand as
+        // present if it appears OUTSIDE such a phrase.
+        const compatOnly = new RegExp(
+          `(?:for|fits|compatible\\s+with|replacement\\s+for)\\s+(?:the\\s+)?${esc(b)}\\b`, 'i');
+        const stripped = hay.replace(compatOnly, ' ');
+        return new RegExp(`(^|[^a-z0-9])${esc(b)}([^a-z0-9]|$)`, 'i').test(stripped);
+      });
+      if (!hit) continue;
+      matches.push({
+        itemId: tag(it, 'ItemID'),
+        sku: tag(it, 'SKU'),
+        title,
+        brand: hit,
+        duration: tag(it, 'ListingDuration'),          // GTC = renews itself
+        autoRenews: /GTC/i.test(tag(it, 'ListingDuration')),
+      });
+    }
+    const total = parseInt((xml.match(/<TotalNumberOfPages>(\d+)<\/TotalNumberOfPages>/) || [])[1] || '1');
+    if (page >= total) break;
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  let ended = 0, blocked = 0, failed = 0;
+  if (!dryRun) {
+    for (const m of matches) {
+      const e = await endListing(token, m.itemId);
+      if (e.ok) ended++; else { failed++; console.warn(`[enforce] end failed ${m.itemId}: ${e.reason}`); }
+      await blockProduct({ asin: null, title: m.title,
+                           reason: `banned brand: ${m.brand}`, itemId: m.itemId });
+      blocked++;
+      if (_pool) {
+        await _pool.query(
+          `UPDATE products SET do_not_relist=TRUE, vero_note=$2, updated_at=NOW()
+            WHERE account_id=$1 AND ebay_item_id=$3`,
+          [accountId, `banned brand: ${m.brand}`, m.itemId]).catch(() => {});
+        await _pool.query(
+          `INSERT INTO vero_brands(brand, tier) VALUES($1,'critical') ON CONFLICT(brand) DO NOTHING`,
+          [m.brand]).catch(() => {});
+      }
+      await new Promise(r => setTimeout(r, 250));
+    }
+  }
+
+  const renewing = matches.filter(m => m.autoRenews).length;
+  console.log(`[enforce] brand purge${dryRun ? ' (DRY RUN)' : ''}: ${matches.length} active listing(s) match, ` +
+    `${renewing} on GTC and would renew themselves${dryRun ? '' : ` — ${ended} ended, ${blocked} blocked`}`);
+  return { matched: matches.length, autoRenewing: renewing, ended, blocked, failed,
+           dryRun, items: matches.slice(0, 200) };
+}
+
 function mountEnforce(app) {
   const acct = req => {
     const a = String(req.query.account || '').trim();
@@ -301,6 +394,30 @@ function mountEnforce(app) {
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
+  });
+
+  // End every ACTIVE listing whose title contains a banned brand, and block
+  // those products from ever being re-imported. Dry run by default.
+  app.post('/api/vero/purge-brands', async (req, res) => {
+    try {
+      const { access_token, brands, dryRun = true, useVeroList = false } = req.body || {};
+      if (!access_token) return res.status(400).json({ error: 'access_token required' });
+      // With useVeroList, run against eBay's full published participant list
+      // rather than a hand-supplied one.
+      let brandList = brands;
+      if (useVeroList) {
+        try { brandList = require('./vero').veroParticipants(); }
+        catch (e) { return res.status(500).json({ error: 'participant list unavailable' }); }
+      }
+      let accountId = acct(req);
+      try {
+        const real = await require('./ebay').resolveAccountId(access_token);
+        if (real && real !== 'default') accountId = real;
+      } catch (e) {}
+      const out = await purgeBrands({ token: access_token, accountId,
+                                      brands: brandList || [], dryRun });
+      res.json({ success: true, accountId, ...out });
+    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   app.get('/api/vero/violations', async (req, res) => {
@@ -345,4 +462,5 @@ async function isProductBlocked({ asin, title }) {
 }
 
 module.exports = { initEnforce, mountEnforce, scanPolicyViolations, brandFrom,
-                   endListing, blockProduct, isProductBlocked, fingerprint };
+                   endListing, blockProduct, isProductBlocked, fingerprint,
+                   purgeBrands };

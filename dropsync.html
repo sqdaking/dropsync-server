@@ -671,7 +671,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-29.3 (no buy box = no price)');
+console.log('[dropsync] build 2026-08-30.1 (unfetchable variants go qty 0)');
 
 // ── BLOCKED-PRODUCT GUARD AT IMPORT ──────────────────────────────────────────
 // Refusing a blocked product at PUSH time is too late: the draft is already
@@ -2129,6 +2129,14 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
           if (html) {
             const data = _browserExtractAsinData(html, asin);
             if (data) result[asin] = data;
+            else if (html && !isBlocked(html)) {
+              // The PAGE LOADED but no price could be read — that is an answer
+              // about the product, not a fetch failure. Record it as price 0 so
+              // the variant is made unbuyable rather than left live on a stale
+              // price. A blocked or failed fetch is recorded nowhere, so it
+              // stays untouched and is retried next cycle.
+              result[asin] = { price: 0, inStock: false, noPrice: true };
+            }
           }
         } catch(e) {}
       }));
@@ -2157,7 +2165,14 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     (_scope.length !== uniqueAsins.length ? `; ${uniqueAsins.length - _scope.length} parent variants not tracked` : '') +
     `)`);
   if (_missing.length > 0) {
-    console.warn(`[prefetchAsin] ${_missing.length} tracked ASIN(s) have NO data: ${_missing.slice(0,10).join(', ')}`);
+    // These are FETCH failures (blocked, timed out, no HTML). They say nothing
+    // about the product, so they are left for the next cycle rather than
+    // zeroed — zeroing on a bad fetch cycle would wipe live inventory.
+    console.warn(`[prefetchAsin] ${_missing.length} tracked ASIN(s) could not be FETCHED (blocked/failed) — left untouched, retried next cycle: ${_missing.slice(0,10).join(', ')}`);
+  }
+  const _noPrice = _scope.filter(a => result[a]?.noPrice).length;
+  if (_noPrice > 0) {
+    console.log(`[prefetchAsin] ${_noPrice} variant(s) loaded but had no readable price → will be set qty 0`);
   }
   // Cache for future revises — avoids re-fetching from Amazon
   _cacheAsinPrices(result);
