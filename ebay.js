@@ -6125,6 +6125,83 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       // auto-fill runs, then we sleep and retry
     }
     // Auto-fill any missing required aspects and retry (only for error 25002)
+    // Set when 25129 remediation changes aspect values, so the existing
+    // re-PUT + retry path runs even though no aspect was "missing".
+    let missingAspectsForced = false;
+
+    // ── 25129: eBay refuses a CUSTOM value for a closed-set aspect ─────────
+    // "The product aspects for this category no longer support custom values
+    // for Large" — the aspect moved to a fixed value list and our scraped value
+    // ("Large", "2X") is no longer accepted. This was the largest single cause
+    // of publish failures in the logs, and it is recoverable: ask the taxonomy
+    // API what IS allowed and snap our value onto it.
+    const _custom25129 = (pd.errors || []).filter(e => e.errorId === 25129);
+    if (_custom25129.length) {
+      const named = [...new Set(_custom25129.flatMap(e =>
+        [...String(e.message || '').matchAll(/custom values for ([^.".]+)/gi)].map(m => m[1].trim())))];
+      console.warn(`[push] 25129 — custom values refused for: ${named.join(', ') || '(unnamed)'}`);
+      let snapped = 0;
+      try {
+        const catAsp = await fetch(
+          `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${categoryId}`,
+          { headers: auth }).then(r => r.ok ? r.json() : null);
+        const allowedBy = {};
+        for (const a of (catAsp?.aspects || [])) {
+          allowedBy[String(a.localizedAspectName).toLowerCase()] =
+            (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
+        }
+        const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+        const snap = (obj) => {
+          for (const [name, vals] of Object.entries(obj || {})) {
+            if (named.length && !named.some(n => n.toLowerCase() === String(name).toLowerCase())) continue;
+            const allowed = allowedBy[String(name).toLowerCase()];
+            if (!allowed || !allowed.length) continue;
+            const mapped = (Array.isArray(vals) ? vals : [vals]).map(v => {
+              if (allowed.includes(v)) return v;
+              const exact = allowed.find(a => norm(a) === norm(v));
+              if (exact) { snapped++; return exact; }
+              // Apparel abbreviations need an explicit table. Naive substring
+              // matching produced dangerous results — "L" matched "Smal(l)" and
+              // "XX-Large" matched "Large" — which would have listed the wrong
+              // size. A wrong size is worse than a dropped aspect.
+              const ALIAS = {
+                xs: 'x-small', s: 'small', m: 'medium', l: 'large', xl: 'x-large',
+                xxl: '2x large', '2x': '2x large', xxlarge: '2x large',
+                xxxl: '3x large', '3x': '3x large', xxxlarge: '3x large',
+                '4x': '4x large', '5x': '5x large',
+              };
+              const aliasTarget = ALIAS[norm(v)];
+              if (aliasTarget) {
+                const byAlias = allowed.find(a => norm(a) === norm(aliasTarget));
+                if (byAlias) { snapped++; return byAlias; }
+              }
+              // Substring matching only when both sides are long enough to be
+              // meaningful, and prefer the closest-length candidate so
+              // "X-Large" doesn't collapse into "Large".
+              if (norm(v).length >= 4) {
+                const cands = allowed.filter(a => norm(a).length >= 4 &&
+                  (norm(a).includes(norm(v)) || norm(v).includes(norm(a))));
+                if (cands.length) {
+                  cands.sort((a, b) =>
+                    Math.abs(norm(a).length - norm(v).length) - Math.abs(norm(b).length - norm(v).length));
+                  snapped++; return cands[0];
+                }
+              }
+              return null;
+            }).filter(Boolean);
+            if (mapped.length) obj[name] = [...new Set(mapped)];
+            else { delete obj[name]; snapped++; }   // drop rather than fail the publish
+          }
+        };
+        snap(aspects);
+        if (typeof groupAspects === 'object') snap(groupAspects);
+      } catch (e) { console.warn('[push] 25129 lookup failed:', e.message); }
+      if (snapped > 0) {
+        console.log(`[push] 25129 — ${snapped} value(s) snapped to eBay's standard set; group will be re-PUT and publish retried`);
+        missingAspectsForced = true;    // reuse the existing re-PUT + retry path
+      }
+    }
+
     const missingAspects = [];
     for (const err of (pd.errors || [])) {
       // Only auto-fill for 25002 missing aspect errors — skip 25009, 25019, 25005, etc.
@@ -6357,7 +6434,7 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         }
       }
     }
-    if (missingAspects.length) {
+    if (missingAspects.length || missingAspectsForced) {
       console.log(`[push] auto-filled missing aspects: ${missingAspects.join(', ')}`);
       // Must re-PUT group AND inventory items with the updated aspects — eBay checks both
       // Sync groupAspects with updated aspects
