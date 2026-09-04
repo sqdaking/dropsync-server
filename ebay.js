@@ -10383,13 +10383,50 @@ module.exports = async (req, res) => {
           for (const [canon, forms] of SIZE_CANON) if (forms.some(f => norm(f) === n)) return canon;
           return null;
         };
-        const snapValue = (v, allowed) => {
+        // Colour needs the same treatment as size. Amazon uses marketing names
+        // ("Light Coffee", "Iron Grey", "Burgundy") while eBay categories offer
+        // a fixed base palette. Reduce the value to its base colour: first by
+        // looking for an allowed colour word inside it, then via synonyms.
+        const COLOR_SYN = {
+          grey:'gray', charcoal:'gray', slate:'gray', silver:'gray', gunmetal:'gray', smoke:'gray',
+          coffee:'brown', chocolate:'brown', tan:'brown', khaki:'brown', camel:'brown',
+          espresso:'brown', mocha:'brown', caramel:'brown', bronze:'brown', taupe:'brown',
+          ivory:'white', cream:'white', offwhite:'white', pearl:'white', eggshell:'white',
+          navy:'blue', teal:'blue', turquoise:'blue', sky:'blue', denim:'blue', indigo:'blue',
+          burgundy:'red', maroon:'red', wine:'red', crimson:'red', rust:'red',
+          olive:'green', mint:'green', sage:'green', emerald:'green', lime:'green',
+          blush:'pink', rose:'pink', fuchsia:'pink', magenta:'pink', coral:'pink',
+          lavender:'purple', violet:'purple', lilac:'purple', plum:'purple',
+          mustard:'yellow', champagne:'gold', peach:'orange', apricot:'orange',
+        };
+        const baseColor = (v, allowed) => {
+          const words = String(v).toLowerCase().split(/[^a-z]+/).filter(Boolean);
+          // an allowed colour appearing in the value wins ("Light Blue" → Blue)
+          for (const a of allowed) {
+            const an = norm(a);
+            if (words.some(w => norm(w) === an)) return a;
+          }
+          // otherwise translate a descriptive word to its base colour
+          for (const w of words) {
+            const base = COLOR_SYN[norm(w)];
+            if (!base) continue;
+            const hit = allowed.find(a => norm(a) === norm(base));
+            if (hit) return hit;
+          }
+          return null;
+        };
+
+        const snapValue = (v, allowed, aspectName) => {
           if (allowed.includes(v)) return v;
           const exact = allowed.find(a => norm(a) === norm(v));
           if (exact) return exact;
           // Canonical size match — works in either direction.
           const cv = canonOf(v);
           if (cv) { const b = allowed.find(a => canonOf(a) === cv); if (b) return b; }
+          if (/colou?r/i.test(String(aspectName || ''))) {
+            const bc = baseColor(v, allowed);
+            if (bc) return bc;
+          }
           if (norm(v).length >= 4) {
             const c = allowed.filter(a => norm(a).length >= 4 &&
               (norm(a).includes(norm(v)) || norm(v).includes(norm(a))));
@@ -10414,7 +10451,7 @@ module.exports = async (req, res) => {
               const allowed = allowedBy[String(name).toLowerCase()];
               if (!allowed || !allowed.length) continue;
               const mapped = (Array.isArray(vals) ? vals : [vals])
-                .map(v => snapValue(v, allowed)).filter(Boolean);
+                .map(v => snapValue(v, allowed, name)).filter(Boolean);
               const before = JSON.stringify(Array.isArray(vals) ? vals : [vals]);
               if (mapped.length) {
                 if (JSON.stringify([...new Set(mapped)]) !== before) { asp[name] = [...new Set(mapped)]; changed = true; }
