@@ -10394,8 +10394,27 @@ module.exports = async (req, res) => {
           } catch (e) {}
           await sleep(120);
         }
-        console.log(`[smartSync] 25129 repair: ${fixed}/${skus.length} variant(s) updated` +
-          (fixed === 0 ? ' — no value could be mapped to the category\'s allowed set; the aspect may need removing manually' : ''));
+        console.log(`[smartSync] 25129 repair: ${fixed}/${skus.length} variant(s) updated`);
+        if (fixed === 0) {
+          // Nothing mapped, and the refused values ("Medium", "X-Small") are
+          // ordinary ones — so the mismatch is between the aspect we store and
+          // what this category actually defines. Print both sides rather than
+          // guessing again.
+          try {
+            const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(skus[0])}`,
+              { headers: auth });
+            if (ir.ok) {
+              const item = await ir.json();
+              const asp = item.product?.aspects || {};
+              console.log(`[smartSync] 25129 diag — category ${categoryId}`);
+              for (const [n, v] of Object.entries(asp).slice(0, 12)) {
+                const allowed = allowedBy[String(n).toLowerCase()];
+                console.log(`[smartSync]   aspect "${n}" = ${JSON.stringify(v).slice(0, 60)}` +
+                  ` | category allows: ${allowed ? (allowed.length ? allowed.slice(0, 8).join(' / ') : '(free text)') : 'ASPECT NOT IN CATEGORY'}`);
+              }
+            }
+          } catch (e) {}
+        }
         return fixed;
       };
 
