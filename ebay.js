@@ -6153,7 +6153,14 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
         const snap = (obj) => {
           for (const [name, vals] of Object.entries(obj || {})) {
-            if (named.length && !named.some(n => n.toLowerCase() === String(name).toLowerCase())) continue;
+            // eBay names the offending VALUE, not the aspect: "no longer
+            // support custom values for X-Large" — X-Large is a Size value.
+            // Matching it against aspect names found nothing, so the repair
+            // silently did nothing. Skip an aspect only when none of its values
+            // is the one eBay named.
+            const _vals = Array.isArray(vals) ? vals : [vals];
+            if (named.length && !named.some(n =>
+                _vals.some(v => String(v).toLowerCase().startsWith(String(n).toLowerCase().slice(0, 6))))) continue;
             const allowed = allowedBy[String(name).toLowerCase()];
             if (!allowed || !allowed.length) continue;
             const mapped = (Array.isArray(vals) ? vals : [vals]).map(v => {
@@ -10312,6 +10319,11 @@ module.exports = async (req, res) => {
       // updates fail forever with 25129.
       const _repairAspects = async (skus) => {
         if (!skus.length) return 0;
+        // The names collected from the error are VALUES ("X-Large", "6-12
+        // Months"), not aspect names — useful for the log, but the repair snaps
+        // every aspect with a known value set rather than trying to guess which
+        // aspect holds them.
+        console.log(`[smartSync] 25129 repair: attempting ${skus.length} variant(s) — eBay refused value(s): ${[..._aspect25129Names].join(', ') || 'unnamed'}`);
         let categoryId = null;
         try {
           const anyOffer = offerMap[skus[0]]?.offerId;
@@ -10382,7 +10394,8 @@ module.exports = async (req, res) => {
           } catch (e) {}
           await sleep(120);
         }
-        if (fixed) console.log(`[smartSync] 25129 repair: fixed aspects on ${fixed}/${skus.length} variant(s) (${[..._aspect25129Names].join(', ') || 'unnamed'})`);
+        console.log(`[smartSync] 25129 repair: ${fixed}/${skus.length} variant(s) updated` +
+          (fixed === 0 ? ' — no value could be mapped to the category\'s allowed set; the aspect may need removing manually' : ''));
         return fixed;
       };
 
@@ -10537,7 +10550,23 @@ module.exports = async (req, res) => {
         }
         if (zeroEntries.length) {
           console.log(`[smartSync] PHASE 1 — zeroing ${zeroEntries.length}/${Object.keys(offerMap).length} variants (nothing stays buyable without fresh proof)`);
-          const r1 = await _bulkApply(zeroEntries, 'phase1');
+          let r1 = await _bulkApply(zeroEntries, 'phase1');
+          // Repair as soon as phase 1 reveals the problem: phase 2 uses the same
+          // inventory items, so without this it fails for the identical reason
+          // and the listing gets two rounds of failures per sync.
+          if (_aspect25129.size > 0) {
+            const _rep1 = await _repairAspects([..._aspect25129]);
+            if (_rep1 > 0) {
+              const _retry1 = r1.failed.filter(u => _aspect25129.has(u.sku));
+              if (_retry1.length) {
+                const _r1b = await _bulkApply(_retry1, 'phase1-retry');
+                for (const s2 of _r1b.ok) r1.ok.add(s2);
+                r1 = { ok: r1.ok, failed: r1.failed.filter(u => !_r1b.ok.has(u.sku)) };
+              }
+              // Aspects are fixed now; let phase 2 judge itself afresh.
+              _aspect25129.clear();
+            }
+          }
           _zeroed = r1.ok.size;
           if (r1.failed.length) console.warn(`[smartSync] PHASE 1: ${r1.failed.length} zeroing calls failed — those variants may still be buyable`);
         } else {
