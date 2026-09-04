@@ -10301,6 +10301,91 @@ module.exports = async (req, res) => {
                              put429: 0, put4xx: 0, put5xx: 0, putNet: 0 };
 
       // Reusable bulk applier — returns { ok:Set(sku), failed:[entries] }
+      // SKUs whose stored aspects eBay now rejects, and the aspect names it
+      // named. Repaired once per sync, then the writes are retried.
+      const _aspect25129 = new Set();
+      const _aspect25129Names = new Set();
+
+      // Snap an inventory item's aspects onto the category's allowed values.
+      // Without this, a listing whose size aspect says "X-Large" (now a custom
+      // value in that category) can never be revised again — price and stock
+      // updates fail forever with 25129.
+      const _repairAspects = async (skus) => {
+        if (!skus.length) return 0;
+        let categoryId = null;
+        try {
+          const anyOffer = offerMap[skus[0]]?.offerId;
+          if (anyOffer) {
+            const or = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${anyOffer}`, { headers: auth });
+            if (or.ok) categoryId = (await or.json()).categoryId;
+          }
+        } catch (e) {}
+        if (!categoryId) { console.warn('[smartSync] 25129 repair: no categoryId, skipping'); return 0; }
+
+        let allowedBy = {};
+        try {
+          const ca = await fetch(
+            `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${categoryId}`,
+            { headers: auth }).then(r => r.ok ? r.json() : null);
+          for (const a of (ca?.aspects || [])) {
+            allowedBy[String(a.localizedAspectName).toLowerCase()] =
+              (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
+          }
+        } catch (e) { return 0; }
+        if (!Object.keys(allowedBy).length) return 0;
+
+        const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+        const ALIAS = { xs:'x-small', s:'small', m:'medium', l:'large', xl:'x-large',
+          xxl:'2x large', '2x':'2x large', xxlarge:'2x large', xxxl:'3x large',
+          '3x':'3x large', xxxlarge:'3x large', '4x':'4x large', '5x':'5x large' };
+        const snapValue = (v, allowed) => {
+          if (allowed.includes(v)) return v;
+          const exact = allowed.find(a => norm(a) === norm(v));
+          if (exact) return exact;
+          const al = ALIAS[norm(v)];
+          if (al) { const b = allowed.find(a => norm(a) === norm(al)); if (b) return b; }
+          if (norm(v).length >= 4) {
+            const c = allowed.filter(a => norm(a).length >= 4 &&
+              (norm(a).includes(norm(v)) || norm(v).includes(norm(a))));
+            if (c.length) { c.sort((a,b) =>
+              Math.abs(norm(a).length-norm(v).length) - Math.abs(norm(b).length-norm(v).length));
+              return c[0]; }
+          }
+          return null;   // drop rather than send a wrong size
+        };
+
+        let fixed = 0;
+        for (const sku of skus) {
+          try {
+            const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`,
+              { headers: auth });
+            if (!ir.ok) continue;
+            const item = await ir.json();
+            const asp = item.product?.aspects;
+            if (!asp) continue;
+            let changed = false;
+            for (const [name, vals] of Object.entries(asp)) {
+              const allowed = allowedBy[String(name).toLowerCase()];
+              if (!allowed || !allowed.length) continue;
+              const mapped = (Array.isArray(vals) ? vals : [vals])
+                .map(v => snapValue(v, allowed)).filter(Boolean);
+              const before = JSON.stringify(Array.isArray(vals) ? vals : [vals]);
+              if (mapped.length) {
+                if (JSON.stringify([...new Set(mapped)]) !== before) { asp[name] = [...new Set(mapped)]; changed = true; }
+              } else { delete asp[name]; changed = true; }
+            }
+            if (!changed) continue;
+            delete item.sku;
+            const pr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`,
+              { method: 'PUT', headers: auth, body: JSON.stringify(item) });
+            if (pr.ok || pr.status === 204) fixed++;
+          } catch (e) {}
+          await sleep(120);
+        }
+        if (fixed) console.log(`[smartSync] 25129 repair: fixed aspects on ${fixed}/${skus.length} variant(s) (${[..._aspect25129Names].join(', ') || 'unnamed'})`);
+        return fixed;
+      };
+
       const _bulkApply = async (entries, label) => {
         const okSet = new Set(); const failed = [];
         for (let bi = 0; bi < entries.length; bi += 25) {
@@ -10337,6 +10422,17 @@ module.exports = async (req, res) => {
             if (_sc >= 200 && _sc < 300) okBySku.add(_u.sku);
             else {
               const _emsg = (resp.errors || []).map(e => `${e.errorId}:${(e.message||'').slice(0,80)}`).join('; ');
+              // 25129 during a PRICE/QUANTITY update means the stored aspects on
+              // the inventory item contain values eBay no longer accepts for
+              // this category. Nothing about the price is wrong — the listing
+              // simply cannot be revised until its aspects are repaired, so
+              // every sync fails until we fix them.
+              if ((resp.errors || []).some(e => e.errorId === 25129)) {
+                _aspect25129.add(_u.sku);
+                for (const m of String(_emsg).matchAll(/custom values for ([^.".]+)/gi)) {
+                  _aspect25129Names.add(m[1].trim());
+                }
+              }
               console.warn(`[smartSync] ${label} ✗ ${(_u.sku||'').slice(-20)} ${_sc}: ${_emsg}`);
               failBySku.add(_u.sku);
             }
@@ -10460,7 +10556,24 @@ module.exports = async (req, res) => {
       console.log(`[smartSync] PHASE 2 — restoring ${_phase2.length} confirmed in-stock variants…`);
       const _bulkFailed = [];
       {
-        const r2 = await _bulkApply(_phase2, 'phase2');
+        let r2 = await _bulkApply(_phase2, 'phase2');
+        // If eBay rejected the writes because the stored aspects are no longer
+        // valid for the category, repair the aspects and try once more. Without
+        // this the listing is permanently unrevisable — price and stock updates
+        // fail on every sync, forever, for a reason that has nothing to do with
+        // price or stock.
+        if (_aspect25129.size > 0) {
+          const _repaired = await _repairAspects([..._aspect25129]);
+          if (_repaired > 0) {
+            const _retry = r2.failed.filter(u => _aspect25129.has(u.sku));
+            if (_retry.length) {
+              console.log(`[smartSync] retrying ${_retry.length} variant(s) after aspect repair`);
+              const r3 = await _bulkApply(_retry, 'phase2-retry');
+              for (const s2 of r3.ok) r2.ok.add(s2);
+              r2 = { ok: r2.ok, failed: r2.failed.filter(u => !r3.ok.has(u.sku)) };
+            }
+          }
+        }
         okCount = r2.ok.size;
         _bulkFailed.push(...r2.failed);
         console.log(`[smartSync] bulk update: ${okCount}/${_phase2.length} ok${_twoPhase ? `, ${_zeroed} zeroed in phase 1` : ''}${_bulkFailed.length ? `, ${_bulkFailed.length} → legacy fallback` : ''}`);
