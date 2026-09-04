@@ -5188,6 +5188,16 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       }
     }
 
+    // Strip Amazon's own identifiers before they reach eBay. The 25129
+    // diagnostic showed listings carrying aspect "ASIN" = ["B07N8N2V9R"] —
+    // publishing the source ASIN on the listing is both pointless and an
+    // obvious marker of where the item came from.
+    for (const k of Object.keys(aspects)) {
+      if (/^(asin|amazon|item model number|manufacturer part number \(mpn\))$/i.test(k)) {
+        delete aspects[k];
+      }
+    }
+
     // eBay hard limit: max 45 item specifics per listing. Cap at 40 for safety.
     if (Object.keys(aspects).length > 40) {
       const PRIORITY_KEEP = new Set(['Brand','Color','Size','Material','Style','Department','Type',
@@ -10347,15 +10357,39 @@ module.exports = async (req, res) => {
         if (!Object.keys(allowedBy).length) return 0;
 
         const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
-        const ALIAS = { xs:'x-small', s:'small', m:'medium', l:'large', xl:'x-large',
-          xxl:'2x large', '2x':'2x large', xxlarge:'2x large', xxxl:'3x large',
-          '3x':'3x large', xxxlarge:'3x large', '4x':'4x large', '5x':'5x large' };
+        // The diagnostic showed the real mismatch: the category allows
+        // ABBREVIATIONS (3XS / 2XS / XS / S / M / L / XL / 2XL) while we store
+        // WORDS ("Medium", "X-Large"). The old alias table mapped abbreviation →
+        // word, the wrong way round, and the substring matcher ignored anything
+        // under 4 characters, so "M" could never be reached.
+        //
+        // Map both sides onto a canonical token instead, so direction stops
+        // mattering.
+        const SIZE_CANON = [
+          ['3xs', ['3xs','xxxsmall','xxxs','triple x small']],
+          ['2xs', ['2xs','xxsmall','xxs','double x small']],
+          ['xs',  ['xs','xsmall','extra small','x small']],
+          ['s',   ['s','small']],
+          ['m',   ['m','medium','med']],
+          ['l',   ['l','large']],
+          ['xl',  ['xl','xlarge','extra large','x large','1x','1xlarge']],
+          ['2xl', ['2xl','xxl','xxlarge','2x','2xlarge','double xl']],
+          ['3xl', ['3xl','xxxl','xxxlarge','3x','3xlarge']],
+          ['4xl', ['4xl','xxxxl','4x','4xlarge']],
+          ['5xl', ['5xl','xxxxxl','5x','5xlarge']],
+        ];
+        const canonOf = (x) => {
+          const n = norm(x);
+          for (const [canon, forms] of SIZE_CANON) if (forms.some(f => norm(f) === n)) return canon;
+          return null;
+        };
         const snapValue = (v, allowed) => {
           if (allowed.includes(v)) return v;
           const exact = allowed.find(a => norm(a) === norm(v));
           if (exact) return exact;
-          const al = ALIAS[norm(v)];
-          if (al) { const b = allowed.find(a => norm(a) === norm(al)); if (b) return b; }
+          // Canonical size match — works in either direction.
+          const cv = canonOf(v);
+          if (cv) { const b = allowed.find(a => canonOf(a) === cv); if (b) return b; }
           if (norm(v).length >= 4) {
             const c = allowed.filter(a => norm(a).length >= 4 &&
               (norm(a).includes(norm(v)) || norm(v).includes(norm(a))));
@@ -10363,7 +10397,7 @@ module.exports = async (req, res) => {
               Math.abs(norm(a).length-norm(v).length) - Math.abs(norm(b).length-norm(v).length));
               return c[0]; }
           }
-          return null;   // drop rather than send a wrong size
+          return null;   // e.g. a bra size "34D" in a category that wants S/M/L
         };
 
         let fixed = 0;
@@ -10384,6 +10418,10 @@ module.exports = async (req, res) => {
               const before = JSON.stringify(Array.isArray(vals) ? vals : [vals]);
               if (mapped.length) {
                 if (JSON.stringify([...new Set(mapped)]) !== before) { asp[name] = [...new Set(mapped)]; changed = true; }
+              } else if (/^(size|color|colour)$/i.test(name)) {
+                // Never delete a variation dimension — the listing is built on
+                // it, and removing it breaks the group rather than fixing it.
+                console.warn(`[smartSync] 25129: cannot map ${name}="${(Array.isArray(vals)?vals:[vals]).join(',')}" to the category's set (${allowed.slice(0,6).join('/')}) — left as is; this listing is probably in the wrong category`);
               } else { delete asp[name]; changed = true; }
             }
             if (!changed) continue;
