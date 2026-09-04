@@ -10413,6 +10413,12 @@ module.exports = async (req, res) => {
             const hit = allowed.find(a => norm(a) === norm(base));
             if (hit) return hit;
           }
+          // Print and pattern names ("H16 Fish-shark", "Rainbow Palm Stripes",
+          // "#Hw015 Palm") name a DESIGN, not a colour — there is no base hue to
+          // extract. Multicolor is the accurate answer for a print, and every
+          // eBay colour palette offers it.
+          const multi = allowed.find(a => /multi/i.test(a));
+          if (multi) return multi;
           return null;
         };
 
