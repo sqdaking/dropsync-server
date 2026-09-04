@@ -10778,7 +10778,20 @@ module.exports = async (req, res) => {
         // Trim deletions are policy, not suspicion — add them after the strike
         // gate rather than through it.
         if (_trimSkus.length) {
-          _toDeleteFinal = [...new Set([..._toDeleteFinal, ..._trimSkus])];
+          // eBay refuses a structural change to what it considers a single-SKU
+          // listing, and it counts BUYABLE variants rather than rows. A group
+          // where 24 of 25 sit at qty 0 is "single SKU" to eBay — which is why
+          // trimming produced 141 x 25604 in the logs while a row-count guard
+          // passed happily (26 rows to 25).
+          const _buyableAfter = updates.filter(u => u.availableQuantity > 0 &&
+                                                    !_trimSkus.includes(u.sku)).length;
+          if (_allGroupSkus.length - _trimSkus.length < 2) {
+            console.log(`[smartSync] trim-to-pin skipped — would leave ${_allGroupSkus.length - _trimSkus.length} variant row(s)`);
+          } else if (_buyableAfter < 2) {
+            console.log(`[smartSync] trim-to-pin deferred — only ${_buyableAfter} variant(s) in stock; eBay treats that as a single-SKU listing and rejects the change (25604). Will trim when more are back in stock.`);
+          } else {
+            _toDeleteFinal = [...new Set([..._toDeleteFinal, ..._trimSkus])];
+          }
         }
         // NEVER shrink a multi-variant listing to a single SKU — eBay rejects
         // it (error 25604) and it would wreck the listing if it succeeded.
