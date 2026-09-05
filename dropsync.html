@@ -671,7 +671,261 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-08-30.1 (unfetchable variants go qty 0)');
+console.log('[dropsync] build 2026-09-01.2 (Shopify yields to eBay)');
+
+// ── SHOPIFY (Morocco store) ──────────────────────────────────────────────────
+// Shares the Amazon side with eBay and NOTHING else. In particular it goes
+// through the same fetch governor and the same priority system, so a Shopify
+// catalogue build pauses eBay syncing rather than racing it for the one
+// residential IP. Two jobs competing for that IP is what caused blocks before.
+//
+// Products are tagged so the store can tell them apart:
+//   digital        → codes and gift cards: no COD, no shipping promise
+//   dept:tech      → hardware, components, peripherals
+//   dept:baby      → bottles, pumps, baby gear
+
+const SHOPIFY_DIGITAL_HINTS =
+  /\b(gift\s*card|psn|playstation network|ps plus|xbox live|steam wallet|nintendo eshop|digital code|game code|top[\s-]?up)\b/i;
+
+function shopifyDeptOf(p) {
+  const t = `${p.title || ''} ${p.category || ''}`.toLowerCase();
+  if (/\b(bottle|biberon|momcozy|pump|breast|baby|infant|toddler|stroller|diaper)\b/.test(t)) return 'baby';
+  return 'tech';
+}
+
+// Is the Amazon session quoting for Morocco? Everything downstream — price,
+// availability, delivery date — is only meaningful if it is.
+const SHOPIFY_DEST_RE = /morocco|maroc|المغرب|\bMA\b/i;
+function checkDestination(asinData) {
+  const seen = Object.values(asinData || {}).filter(d => d && d.shipTo);
+  if (!seen.length) return { known: false };
+  const shipTo = seen[0].shipTo;
+  return { known: true, shipTo, isMorocco: SHOPIFY_DEST_RE.test(shipTo) };
+}
+
+// Turn a DropSync product into the payload shopify.js expects.
+function shopifyPayload(p, asinData) {
+  const digital = SHOPIFY_DIGITAL_HINTS.test(p.title || '');
+  const variants = [];
+  const combos = p.comboAsin || {};
+  const entries = Object.entries(combos);
+
+  if (entries.length) {
+    for (const [combo, asin] of entries) {
+      const d = asinData[asin];
+      if (!d || !(d.price > 0)) continue;          // never list on an unverified price
+      if (d.shipsToDestination === false) continue; // Amazon will not send it there
+      // "Black|Large" → { Color: 'Black', Size: 'Large' } using the dims we know
+      const parts = String(combo).split('|').map(x => x.trim());
+      const dims = (p.dimOrder && p.dimOrder.length) ? p.dimOrder : ['Option 1', 'Option 2'];
+      const options = {};
+      parts.forEach((val, i) => {
+        const name = String(dims[i] || `Option ${i + 1}`)
+          .replace(/_name$/, '').replace(/^\w/, c => c.toUpperCase());
+        if (val) options[name] = val;
+      });
+      variants.push({ asin, sku: `${p.asin}-${asin}`, amazonPrice: d.price,
+                      weightKg: d.weightKg ?? p.weightKg, inStock: d.inStock !== false,
+                      etaDays: d.etaDays, importFeesUsd: d.importFeesUsd || 0,
+                      options });
+    }
+  } else {
+    const d = asinData[p.asin];
+    if (d && d.price > 0) {
+      variants.push({ asin: p.asin, sku: p.asin, amazonPrice: d.price,
+                      weightKg: d.weightKg ?? p.weightKg, inStock: d.inStock !== false,
+                      etaDays: d.etaDays, importFeesUsd: d.importFeesUsd || 0, options: {} });
+    }
+  }
+
+  return {
+    product: {
+      asin: p.asin, title: p.title, description: p.description || '',
+      brand: p.brand || '', images: p.images || [], digital,
+      weightKg: p.weightKg,
+      etaDays: (variants.find(v => v.etaDays != null) || {}).etaDays ?? null,
+      importFeesUsd: (variants.find(v => v.importFeesUsd) || {}).importFeesUsd || 0,
+      tags: [digital ? 'digital' : 'physical', `dept:${shopifyDeptOf(p)}`],
+    },
+    variants,
+  };
+}
+
+// Push one product to Shopify, fetching fresh Amazon data first.
+async function pushToShopify(p) {
+  if (!S.serverUrl) { toast('Set Railway URL first', 'error'); return; }
+  if (!p?.sourceUrl || !p?.asin) { toast('Product needs an Amazon URL', 'error'); return; }
+  return withImportPriority('Shopify push', async () => {
+    const html = await fetchAmazonInBrowser(p.sourceUrl);
+    if (!html) { toast('Amazon fetch failed — try again', 'warn'); return; }
+    const asinData = await prefetchAsinPrices(html, { maxFetch: MAX_TRACKED_ASINS });
+    const single = _browserExtractAsinData(html, p.asin);
+    if (single && single.price > 0 && !asinData[p.asin]) asinData[p.asin] = single;
+
+    // Refuse to publish data gathered against the wrong destination. A US
+    // address gives US prices, US delivery dates and hides the fact that many
+    // items will not ship to Morocco at all.
+    const dest = checkDestination(asinData);
+    if (dest.known && !dest.isMorocco) {
+      console.error(`[shopify] Amazon is quoting for "${dest.shipTo}", not Morocco — not publishing. ` +
+        `Set the delivery address to Morocco on amazon.com in this Chrome profile, then retry.`);
+      toast(`Amazon is set to "${dest.shipTo}" — set it to Morocco first`, 'error', 8000);
+      return { blocked: 'wrong-destination', shipTo: dest.shipTo };
+    }
+    // Amazon says it will not ship this item to the destination at all.
+    const unshippable = Object.values(asinData).filter(d => d && d.shipsToDestination === false).length;
+    if (unshippable && unshippable === Object.keys(asinData).length) {
+      console.warn(`[shopify] ${p.asin}: Amazon will not ship this to Morocco — not publishing`);
+      toast(`"${(p.title||'').slice(0,32)}" cannot ship to Morocco`, 'warn', 6000);
+      return { blocked: 'not-shippable' };
+    }
+
+    const payload = shopifyPayload(p, asinData);
+    if (!payload.variants.length) {
+      toast(`No priced variant for "${(p.title||'').slice(0,32)}" — not pushed`, 'warn', 5000);
+      return;
+    }
+    const r = await fetch(`${S.serverUrl}/api/shopify/push`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: S.accountId, ...payload }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d.success) {
+      p.shopifyHandle = d.handle; markDirty(p.id); save();
+      console.log(`[shopify] ${p.asin} → /${d.handle} (${d.variants} variant(s), sample ${d.sample?.priceMad} MAD)`);
+      toast(`Shopify: ${d.variants} variant(s) live`, 'success', 4000);
+    } else {
+      console.error('[shopify] push failed:', d.error);
+      toast(`Shopify push failed: ${(d.error||'').slice(0,60)}`, 'error', 6000);
+    }
+    return d;
+  }, 3 * 60000);
+}
+
+// Refresh prices and stock for everything already on Shopify.
+// Runs under import priority, so eBay syncing pauses for the duration instead
+// of the two fighting over the same Amazon budget.
+async function syncShopifyAll(limit) {
+  if (!S.serverUrl) return;
+  const listed = (S.products || []).filter(p => p.shopifyHandle && p.sourceUrl && p.asin);
+  if (!listed.length) { toast('No Shopify products yet', 'info'); return; }
+  const todo = listed.slice(0, limit || listed.length);
+  console.log(`[shopify] syncing ${todo.length} product(s)`);
+  return withImportPriority('Shopify price sync', async () => {
+    let ok = 0, failed = 0;
+    for (let i = 0; i < todo.length; i++) {
+      const p = todo[i];
+      try {
+        const st = await window.dsExt?.getStatus?.();
+        if (st && st.cooldownUntil > Date.now()) {
+          console.log('[shopify] pausing — extension cooldown');
+          break;
+        }
+        const html = await fetchAmazonInBrowser(p.sourceUrl);
+        if (!html) { failed++; continue; }
+        const asinData = await prefetchAsinPrices(html, { maxFetch: MAX_TRACKED_ASINS });
+        const single = _browserExtractAsinData(html, p.asin);
+        if (single && single.price > 0 && !asinData[p.asin]) asinData[p.asin] = single;
+        const r = await fetch(`${S.serverUrl}/api/shopify/sync`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accountId: S.accountId, asin: p.asin, asinData }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (d.success) ok++; else failed++;
+      } catch (e) { failed++; }
+      if (i % 10 === 9) console.log(`[shopify] ${i + 1}/${todo.length}`);
+    }
+    console.log(`[shopify] sync done — ${ok} ok, ${failed} failed`);
+    toast(`Shopify sync: ${ok} updated${failed ? `, ${failed} failed` : ''}`, ok ? 'success' : 'warn', 5000);
+  }, todo.length * 15000);
+}
+
+// ── SHOPIFY ROTATION ─────────────────────────────────────────────────────────
+// eBay is the primary job and Shopify is the passenger. Shopify has a few
+// hundred products against eBay's nine thousand, so it does not need priority —
+// it needs to be invisible.
+//
+// So this is the INVERSE of the import-priority mechanism: instead of pausing
+// eBay, it YIELDS to it. It only fetches while the eBay relay is between
+// listings, checks again before every single product, and stops the moment eBay
+// or the extension needs the budget. Worst case it makes no progress this hour
+// and catches up later — which for a catalogue this size is fine.
+let _shopTimer = null, _shopCursor = 0, _shopRunning = false;
+
+function _ebayBusy() {
+  // _relayRunning is true only while a listing is actually being synced;
+  // _relayTimer merely means the rotation is scheduled. Yielding on the timer
+  // alone would mean never running at all, so we yield on real work and on the
+  // import-priority flag (a deal import or push in progress).
+  const syncing  = (typeof _relayRunning !== 'undefined') && _relayRunning;
+  const importing = (typeof _importDepth !== 'undefined') && _importDepth > 0;
+  return !!(syncing || importing);
+}
+
+async function _shopifyTick() {
+  if (_shopRunning) return;
+  _shopRunning = true;
+  try {
+    const listed = (S.products || []).filter(p => p.shopifyHandle && p.sourceUrl && p.asin);
+    if (!listed.length) return;
+
+    // Yield to eBay: if the relay is mid-listing, do nothing this tick.
+    if (_ebayBusy()) { console.log('[shopify] yielding — eBay relay is working'); return; }
+    // Yield to the extension too: never spend budget it is trying to recover.
+    try {
+      const st = await window.dsExt?.getStatus?.();
+      if (st && (st.cooldownUntil > Date.now() || st.budget < 10)) {
+        console.log('[shopify] yielding — extension cooling down / budget low');
+        return;
+      }
+    } catch (e) {}
+
+    const p = listed[_shopCursor % listed.length];
+    _shopCursor++;
+    const age = p.shopifySyncedAt ? (Date.now() - p.shopifySyncedAt) / 3600000 : 999;
+    if (age < (S.shopifyRefreshHours ?? 12)) return;    // already fresh
+
+    const html = await fetchAmazonInBrowser(p.sourceUrl).catch(() => null);
+    if (!html) return;
+    const asinData = await prefetchAsinPrices(html, { maxFetch: MAX_TRACKED_ASINS });
+    const single = _browserExtractAsinData(html, p.asin);
+    if (single && single.price > 0 && !asinData[p.asin]) asinData[p.asin] = single;
+
+    const r = await fetch(`${S.serverUrl}/api/shopify/sync`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountId: S.accountId, asin: p.asin, asinData }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (d.success) {
+      p.shopifySyncedAt = Date.now(); markDirty(p.id); save();
+      console.log(`[shopify] ${p.asin}: ${d.repriced} repriced, ${d.stockSet} stock set` +
+        (d.unpriced ? `, ${d.unpriced} unpriced → zeroed` : ''));
+    }
+  } catch (e) {
+    console.warn('[shopify] tick failed:', e.message);
+  } finally {
+    _shopRunning = false;
+  }
+}
+
+function startShopifyRotation(everySeconds) {
+  if (_shopTimer) { console.log('[shopify] rotation already running'); return; }
+  const ms = Math.max(30, everySeconds || 90) * 1000;
+  _shopTimer = setInterval(_shopifyTick, ms);
+  S.shopifyRotation = true; save();
+  console.log(`[shopify] rotation started — one product every ${ms/1000}s, always yielding to eBay`);
+}
+function stopShopifyRotation() {
+  if (_shopTimer) { clearInterval(_shopTimer); _shopTimer = null; }
+  S.shopifyRotation = false; save();
+  console.log('[shopify] rotation stopped');
+}
+window.startShopifyRotation = startShopifyRotation;
+window.stopShopifyRotation = stopShopifyRotation;
+
+window.pushToShopify = pushToShopify;
+window.syncShopifyAll = syncShopifyAll;
+window.shopifyPayload = shopifyPayload;
 
 // ── BLOCKED-PRODUCT GUARD AT IMPORT ──────────────────────────────────────────
 // Refusing a blocked product at PUSH time is too late: the draft is already
@@ -1827,6 +2081,64 @@ function _browserExtractAsinData(html, expectedAsin) {
     || /name="submit\.add-to-cart"/.test(html)
     || /id="buy-now-button"/.test(html)
     || /In Stock|Only \d+ left in stock|left in stock/i.test(availSection);
+  // ── WHERE IS AMAZON QUOTING TO? ───────────────────────────────────────────
+  // Price, availability and the delivery date all depend on the delivery
+  // address in the Amazon session. Scraping with a US address and selling to
+  // Morocco produces three silent errors: an estimate that is wrong, products
+  // listed that Amazon will not ship there at all, and a price missing any
+  // import fees deposit.
+  //
+  // So read back what Amazon thinks the destination is, and refuse to trust the
+  // rest when it is not Morocco.
+  let shipTo = null, shipsToDestination = true, importFeesUsd = 0;
+  {
+    const glow = (html.match(/id="glow-ingress-line2"[\s\S]{0,220}/) ||
+                  html.match(/id="nav-global-location-slot"[\s\S]{0,400}/) || [])[0] || '';
+    const gtxt = glow.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    if (gtxt) shipTo = gtxt.slice(0, 60);
+    // Amazon says this plainly when the item cannot go to the selected country.
+    if (/cannot be shipped to your selected delivery location|does not ship to|not available for shipping to/i.test(html)) {
+      shipsToDestination = false;
+    }
+    // Import Fees Deposit is collected by Amazon up front on Global Store
+    // items. If it is present the item is already duty-paid, so adding your own
+    // duty on top would double-charge the customer.
+    const ifd = html.match(/Import Fees Deposit[\s\S]{0,120}?\$([\d,]+\.?\d*)/i);
+    if (ifd) importFeesUsd = parseFloat(ifd[1].replace(/,/g, '')) || 0;
+  }
+
+  // ── AMAZON'S OWN DELIVERY ESTIMATE ────────────────────────────────────────
+  // Amazon states a delivery date per product ("FREE delivery Thursday, 11
+  // September"), and it varies a lot — stocked items are days, imports weeks.
+  // Capturing it per product is far better than one blanket promise.
+  //
+  // Crucially this is delivery TO THE US FORWARDER, not to Morocco. It is
+  // stored as a number of days so the international leg can be added on top;
+  // showing it raw would promise three days for a parcel that takes twelve.
+  let etaDays = null, etaText = null;
+  {
+    const zone = (html.match(/id="mir-layout-DELIVERY_BLOCK[\s\S]{0,2500}/) ||
+                  html.match(/id="deliveryBlockMessage"[\s\S]{0,1200}/) ||
+                  html.match(/data-csa-c-delivery-time[\s\S]{0,800}/) || [])[0] || '';
+    const txt = zone.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    // "delivery Thursday, September 11" / "delivery September 11 - 15"
+    const m = txt.match(/deliver\w*\s+(?:on\s+)?(?:[A-Z][a-z]+,\s*)?([A-Z][a-z]+\s+\d{1,2}(?:\s*[-–]\s*(?:[A-Z][a-z]+\s+)?\d{1,2})?)/);
+    if (m) {
+      etaText = m[1];
+      // Take the LATER date of a range: under-promising is the safe direction
+      // when the customer is paying on delivery.
+      const parts = etaText.split(/[-–]/).map(x => x.trim());
+      const last = parts[parts.length - 1];
+      const withMonth = /[A-Za-z]/.test(last) ? last : `${parts[0].replace(/\d+/, '').trim()} ${last}`;
+      const d = new Date(`${withMonth} ${new Date().getFullYear()}`);
+      if (!isNaN(d)) {
+        let days = Math.ceil((d - Date.now()) / 86400000);
+        if (days < 0) days += 365;                 // year rollover
+        if (days >= 0 && days < 120) etaDays = days;
+      }
+    }
+  }
+
   // NO BUY BOX ⇒ NO PRICE (Aug 2026)
   // "See available options" and "Available from these sellers" mean this ASIN
   // has no buy box. Any price still on the page belongs to something else —
@@ -1844,13 +2156,15 @@ function _browserExtractAsinData(html, expectedAsin) {
     || /id="outOfStockBuyBox"/.test(_searchArea)
   ) && !_canBuy;
   if (_noBuyBox) {
-    return { price: 0, shipping: 0, inStock: false, noBuyBox: true };
+    return { price: 0, shipping: 0, inStock: false, noBuyBox: true,
+             etaDays, etaText, shipTo, shipsToDestination, importFeesUsd };
   }
   // Verdict: explicit OOS wins; explicit buy path wins next; otherwise fall
   // back to the core rule — a real buy-box price means in stock.
   const inStock = _oosSignal ? false : (_canBuy ? true : price > 0);
   // Price gate still applies — no price = OOS regardless of strings.
-  return { price, shipping, inStock: price > 0 ? inStock : false };
+  return { price, shipping, inStock: price > 0 ? inStock : false,
+           etaDays, etaText, shipTo, shipsToDestination, importFeesUsd };
 }
 
 // ── Prefetch per-ASIN price+stock from browser — sends exact data to server ──────
@@ -8857,6 +9171,21 @@ async function smartSyncProduct(p, _opts) {
           skipFresh: _skipFresh,
         });
         _parentLoaded = true;   // the page itself came back fine
+        // eBay sells to US buyers, so the Amazon session must be quoting US
+        // prices. A Morocco address here would apply Amazon Global pricing and
+        // import fees to every listing — wrong, and invisible once written.
+        {
+          const _seen = Object.values(_clientAsinData || {}).find(d => d && d.shipTo);
+          if (_seen && S.requireUsDestination !== false) {
+            const _isUs = US_DEST_RE.test(_seen.shipTo) && !SHOPIFY_DEST_RE.test(_seen.shipTo);
+            if (!_isUs) {
+              console.error(`[smartSync] ${p.ebaySku}: Amazon is quoting for "${_seen.shipTo}", not the US — ` +
+                `refusing to write prices. This looks like the Shopify/Morocco profile. ` +
+                `Use the US-address profile for eBay, or set S.requireUsDestination = false to override.`);
+              return { skipped: true, reason: 'amazon session is not set to a US address' };
+            }
+          }
+        }
         const _n = Object.keys(_clientAsinData || {}).length;
         if (_n > 0) console.log(`[smartSync] prefetched ${_n} ASIN prices for ${p.ebaySku} via browser`);
         else console.warn(`[smartSync] ${p.ebaySku}: parent HTML received but no variant prices extracted`);

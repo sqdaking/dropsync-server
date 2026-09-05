@@ -10,6 +10,7 @@ const vero = require('./vero');
 const veroInbox = require('./vero-inbox');
 const descRefresh = require('./descrefresh');
 const veroEnforce = require('./vero-enforce');
+const shopify = require('./shopify');
 const { startWorker, runForever, getValidToken } = require('./worker');
 
 const app = express();
@@ -611,6 +612,13 @@ async function start() {
         } catch(e) { console.warn('[enforce] sweep cycle:', e.message); }
       }, 4 * 3600 * 1000);
     } catch(e) { console.warn('[enforce] init failed:', e.message); }
+
+    // Shopify destination — entirely separate from the eBay path, so enabling
+    // it cannot affect eBay syncing.
+    try {
+      await shopify.initShopify(db.pool);
+      shopify.mountShopify(app);
+    } catch(e) { console.warn('[shopify] init failed:', e.message); }
 
     // ── PROMOTED LISTINGS RECONCILIATION ────────────────────────────────────
     // smartSync deliberately does NOT touch ads: at ~2 extra eBay calls per
