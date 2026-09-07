@@ -29,7 +29,19 @@
 // Every input is configurable per account and overridable per product, because
 // duty rates differ by category and freight differs by weight.
 
+const crypto = require('crypto');
+
 const API_VERSION = '2025-01';
+
+// Scopes this integration needs. Products and inventory to publish and sync,
+// locations to know where stock lives, publications to put products on the
+// Online Store rather than leaving them invisible in admin.
+const SCOPES = [
+  'read_products', 'write_products',
+  'read_inventory', 'write_inventory',
+  'read_locations',
+  'write_publications',
+].join(',');
 
 let _pool = null;
 
@@ -63,7 +75,9 @@ async function initShopify(pool) {
 // ── settings ────────────────────────────────────────────────────────────────
 const DEFAULTS = {
   shopDomain: '',            // your-store.myshopify.com
-  adminToken: '',            // custom app Admin API access token
+  adminToken: '',            // offline Admin API token (shpat_…), set by the OAuth install
+  clientId: '',              // Dev Dashboard app client ID
+  clientSecret: '',          // Dev Dashboard app client secret
   locationGid: '',           // inventory location; auto-detected on first push
   currency: 'MAD',
   fxUsdToMad: '10.0',        // review regularly; a stale rate silently erodes margin
@@ -477,7 +491,94 @@ async function endProduct({ accountId = 'default', asin }) {
 }
 
 // ── routes ──────────────────────────────────────────────────────────────────
+// ── OAUTH INSTALL ───────────────────────────────────────────────────────────
+// Shopify stopped allowing admin-created custom apps on 1 January 2026, so a
+// new integration has to be created in the Dev Dashboard and installed through
+// the authorization-code flow. The Dev Dashboard's client-credentials tokens
+// are NOT usable here — they expire after 24 hours. What we need is the offline
+// access token (shpat_…), which does not expire, and this is the only way to
+// obtain one now.
+//
+// Runs once. After that the token is stored and everything else is unchanged.
+const _oauthState = new Map();   // state → { shop, accountId, at }
+
+function mountShopifyAuth(app) {
+  const acct = req => {
+    const a = String(req.query.account || '').trim();
+    return /^[\w.\-]{1,64}$/.test(a) ? a : 'default';
+  };
+
+  // Step 1 — send the merchant to Shopify to approve the scopes.
+  app.get('/api/shopify/auth/start', async (req, res) => {
+    try {
+      const accountId = acct(req);
+      const cfg = await settings(accountId);
+      const shop = String(req.query.shop || cfg.shopDomain || '').trim().toLowerCase();
+      if (!/^[\w-]+\.myshopify\.com$/.test(shop)) {
+        return res.status(400).send('Pass ?shop=your-store.myshopify.com (the .myshopify.com domain, not a custom domain)');
+      }
+      if (!cfg.clientId) return res.status(400).send('Set clientId and clientSecret first (POST /api/shopify/settings)');
+
+      const state = crypto.randomBytes(16).toString('hex');
+      _oauthState.set(state, { shop, accountId, at: Date.now() });
+      // Drop anything older than 10 minutes so the map cannot grow unbounded.
+      for (const [k, v] of _oauthState) if (Date.now() - v.at > 600000) _oauthState.delete(k);
+
+      const redirectUri = `${req.protocol}://${req.get('host')}/api/shopify/auth/callback`;
+      const url = `https://${shop}/admin/oauth/authorize` +
+        `?client_id=${encodeURIComponent(cfg.clientId)}` +
+        `&scope=${encodeURIComponent(SCOPES)}` +
+        `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+        `&state=${state}`;
+      res.redirect(url);
+    } catch (e) { res.status(500).send(e.message); }
+  });
+
+  // Step 2 — Shopify sends the code back; exchange it for the offline token.
+  app.get('/api/shopify/auth/callback', async (req, res) => {
+    try {
+      const { code, shop, state, hmac } = req.query;
+      const pending = _oauthState.get(String(state));
+      if (!pending || pending.shop !== String(shop).toLowerCase()) {
+        return res.status(400).send('State mismatch — start the install again from /api/shopify/auth/start');
+      }
+      _oauthState.delete(String(state));
+      const cfg = await settings(pending.accountId);
+
+      // Verify Shopify actually sent this: everything except hmac, sorted,
+      // HMAC-SHA256 with the client secret.
+      const params = { ...req.query };
+      delete params.hmac; delete params.signature;
+      const message = Object.keys(params).sort()
+        .map(k => `${k}=${Array.isArray(params[k]) ? params[k].join(',') : params[k]}`).join('&');
+      const digest = crypto.createHmac('sha256', cfg.clientSecret).update(message).digest('hex');
+      const ok = digest.length === String(hmac).length &&
+                 crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(String(hmac)));
+      if (!ok) return res.status(401).send('HMAC verification failed');
+
+      const r = await fetch(`https://${shop}/admin/oauth/access_token`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ client_id: cfg.clientId, client_secret: cfg.clientSecret, code }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!d.access_token) return res.status(400).send('Token exchange failed: ' + JSON.stringify(d).slice(0, 300));
+
+      for (const [k, v] of [['shopDomain', shop], ['adminToken', d.access_token]]) {
+        await _pool.query(
+          `INSERT INTO shopify_settings(account_id,key,value) VALUES($1,$2,$3)
+           ON CONFLICT (account_id,key) DO UPDATE SET value=EXCLUDED.value`,
+          [pending.accountId, k, v]);
+      }
+      console.log(`[shopify] installed on ${shop} for account ${pending.accountId} — offline token stored (scopes: ${d.scope || SCOPES})`);
+      res.send(`<h2>Shopify connected</h2><p>${shop} is linked. You can close this tab.</p>`);
+    } catch (e) { res.status(500).send(e.message); }
+  });
+
+  console.log('[shopify] auth routes mounted: /api/shopify/auth/{start,callback}');
+}
+
 function mountShopify(app) {
+  mountShopifyAuth(app);
   const acct = req => {
     const a = String(req.query.account || req.body?.accountId || '').trim();
     return /^[\w.\-]{1,64}$/.test(a) ? a : 'default';
@@ -545,4 +646,4 @@ function mountShopify(app) {
   console.log('[shopify] routes mounted: /api/shopify/{settings,quote,push,sync,end,products}');
 }
 
-module.exports = { initShopify, mountShopify, landedPrice, deliveryWindow, pushProduct, syncProduct, endProduct, settings };
+module.exports = { initShopify, mountShopify, mountShopifyAuth, SCOPES, landedPrice, deliveryWindow, pushProduct, syncProduct, endProduct, settings };

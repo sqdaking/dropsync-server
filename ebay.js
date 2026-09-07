@@ -5741,7 +5741,17 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         } else if (_allowed.length > 0) {
           aspects[_name] = [_allowed[0]]; _preFilled++;
         } else {
-          aspects[_name] = ['See Description']; _preFilled++;
+          // "See Description" was our own invention, and eBay now rejects it as
+          // a custom value on closed-set aspects (25129). An aspect we cannot
+          // fill correctly is better left OUT: eBay accepts a missing optional
+          // aspect, but refuses a made-up value, and the refusal blocks every
+          // future revise of the listing.
+          if (_allowed && _allowed.length) {
+            // closed set and nothing matched — omit rather than invent
+            delete aspects[_name];
+          } else {
+            aspects[_name] = ['See Description']; _preFilled++;
+          }
         }
       }
       if (_preFilled > 0) {
@@ -10475,7 +10485,61 @@ module.exports = async (req, res) => {
           } catch (e) {}
           await sleep(120);
         }
-        console.log(`[smartSync] 25129 repair: ${fixed}/${skus.length} variant(s) updated`);
+        // ── GROUP-LEVEL ASPECTS ──────────────────────────────────────────────
+        // The diagnostic showed item aspects already correct ("Size":["L"])
+        // while eBay still refused "Large" and "X-Large". Those values live on
+        // the inventory item GROUP, which carries the variation specification —
+        // so repairing items alone could never fix it, and every revise stayed
+        // blocked.
+        let groupFixed = 0;
+        try {
+          const gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`,
+            { headers: auth });
+          if (gr.ok) {
+            const grp = await gr.json();
+            let gChanged = false;
+            for (const [name, vals] of Object.entries(grp.aspects || {})) {
+              const allowed = allowedBy[String(name).toLowerCase()];
+              if (!allowed || !allowed.length) continue;
+              const mapped = (Array.isArray(vals) ? vals : [vals])
+                .map(v => snapValue(v, allowed, name)).filter(Boolean);
+              const before = JSON.stringify(Array.isArray(vals) ? vals : [vals]);
+              if (mapped.length && JSON.stringify([...new Set(mapped)]) !== before) {
+                grp.aspects[name] = [...new Set(mapped)];
+                gChanged = true;
+              }
+            }
+            // variesBy carries the variation VALUES a buyer picks from — the
+            // "Large" / "X-Large" the error names. It has to match the items.
+            const vb = grp.variesBy && grp.variesBy.specifications;
+            if (Array.isArray(vb)) {
+              for (const spec of vb) {
+                const allowed = allowedBy[String(spec.name).toLowerCase()];
+                if (!allowed || !allowed.length) continue;
+                const mapped = (spec.values || []).map(v => snapValue(v, allowed, spec.name)).filter(Boolean);
+                if (mapped.length && JSON.stringify([...new Set(mapped)]) !== JSON.stringify(spec.values)) {
+                  spec.values = [...new Set(mapped)];
+                  gChanged = true;
+                }
+              }
+            }
+            if (gChanged) {
+              const gp = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`,
+                { method: 'PUT', headers: auth, body: JSON.stringify(grp) });
+              if (gp.ok || gp.status === 204) {
+                groupFixed = 1;
+                console.log(`[smartSync] 25129 repair: group aspects/variesBy snapped to the category's values`);
+              } else {
+                console.warn(`[smartSync] 25129 repair: group PUT failed ${gp.status}: ${(await gp.text()).slice(0,160)}`);
+              }
+            }
+          }
+        } catch (e) { console.warn('[smartSync] 25129 group repair failed:', e.message); }
+
+        console.log(`[smartSync] 25129 repair: ${fixed}/${skus.length} variant(s) updated${groupFixed ? ' + group' : ''}`);
+        // Count the group as a repair in its own right: the item aspects were
+        // often already correct, and the group was the thing blocking revises.
+        fixed += groupFixed;
         if (fixed === 0) {
           // Nothing mapped, and the refused values ("Medium", "X-Small") are
           // ordinary ones — so the mismatch is between the aspect we store and

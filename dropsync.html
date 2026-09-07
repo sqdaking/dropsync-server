@@ -693,6 +693,16 @@ function shopifyDeptOf(p) {
   return 'tech';
 }
 
+// ── ONE PROFILE, ONE ADDRESS ─────────────────────────────────────────────────
+// A Chrome profile holds a single Amazon delivery address, and the two
+// destinations need opposite settings:
+//   eBay    → a US address. US buyers, US prices, US availability.
+//   Shopify → Morocco, or the estimate, the shippability and any import fees
+//             deposit are all wrong.
+// Each side checks before it writes, so a mistake costs a skipped sync with a
+// clear message rather than a catalogue silently repriced for another country.
+const US_DEST_RE = /\b(united states|usa|us)\b|\b\d{5}(?:-\d{4})?\b/i;
+
 // Is the Amazon session quoting for Morocco? Everything downstream — price,
 // availability, delivery date — is only meaningful if it is.
 const SHOPIFY_DEST_RE = /morocco|maroc|المغرب|\bMA\b/i;
