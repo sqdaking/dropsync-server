@@ -10464,8 +10464,27 @@ module.exports = async (req, res) => {
             if (!asp) continue;
             let changed = false;
             for (const [name, vals] of Object.entries(asp)) {
+              const known = Object.prototype.hasOwnProperty.call(allowedBy, String(name).toLowerCase());
+              // ASPECTS THE CATEGORY DOES NOT DEFINE.
+              // Amazon supplies things like "Age Range Description",
+              // "Apparel Fabric Weight Class" and "Bodysuit Type" that simply
+              // do not exist in the eBay category. eBay treats an unknown
+              // aspect's value as a CUSTOM value — which is precisely what
+              // 25129 refuses — so these were blocking every revise while the
+              // repair kept reporting "0 updated", because it only ever looked
+              // at aspects the category recognised.
+              //
+              // They carry no value for a buyer either: eBay never displays an
+              // item specific it does not know. So drop them.
+              if (!known) {
+                if (!/^(size|colou?r)$/i.test(name)) {   // never touch a variation dimension
+                  delete asp[name];
+                  changed = true;
+                }
+                continue;
+              }
               const allowed = allowedBy[String(name).toLowerCase()];
-              if (!allowed || !allowed.length) continue;
+              if (!allowed || !allowed.length) continue;   // free-text aspect, leave as is
               const mapped = (Array.isArray(vals) ? vals : [vals])
                 .map(v => snapValue(v, allowed, name)).filter(Boolean);
               const before = JSON.stringify(Array.isArray(vals) ? vals : [vals]);
