@@ -10535,9 +10535,24 @@ module.exports = async (req, res) => {
               for (const spec of vb) {
                 const allowed = allowedBy[String(spec.name).toLowerCase()];
                 if (!allowed || !allowed.length) continue;
-                const mapped = (spec.values || []).map(v => snapValue(v, allowed, spec.name)).filter(Boolean);
-                if (mapped.length && JSON.stringify([...new Set(mapped)]) !== JSON.stringify(spec.values)) {
-                  spec.values = [...new Set(mapped)];
+                const original = spec.values || [];
+                const mapped = original.map(v => snapValue(v, allowed, spec.name)).filter(Boolean);
+                // COLLISION GUARD.
+                // Snapping can collapse two distinct values onto one — a group
+                // holding both "Large" and "L" maps both to "L", leaving
+                // duplicate variation values and eBay rejects the group with
+                // 25013 "Duplicate name". A group left unsnapped merely fails
+                // to publish; a group with duplicates is corrupt. So when the
+                // mapping is not one-to-one, leave it alone and say so.
+                const unique = [...new Set(mapped)];
+                if (mapped.length !== original.length || unique.length !== mapped.length) {
+                  console.warn(`[smartSync] 25129: not snapping ${spec.name} — ` +
+                    `${original.length} value(s) would collapse to ${unique.length} and create duplicates ` +
+                    `(${original.slice(0,4).join('/')} → ${unique.slice(0,4).join('/')})`);
+                  continue;
+                }
+                if (JSON.stringify(unique) !== JSON.stringify(original)) {
+                  spec.values = unique;
                   gChanged = true;
                 }
               }
