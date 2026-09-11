@@ -9337,6 +9337,16 @@ async function smartSyncProduct(p, _opts) {
       if (fd.price > 0)                                          p.price        = fd.price;
       if (fd.shippingCost != null)                               p.shippingCost = fd.shippingCost;
     }
+    // MARK THE LISTING AS SYNCED.
+    // The relay decides what is "due" from p.lastSyncedAt, but nothing ever
+    // wrote it — every product looked never-synced, so Sync Selected could not
+    // clear the due state and the rotation kept revisiting listings it had just
+    // done. Recording it here covers every caller: the button, the relay and
+    // bulk operations alike.
+    if (d && d.success !== false && !d.skipped) {
+      p.lastSyncedAt = new Date().toISOString();
+      p.lastSynced = p.lastSyncedAt;
+    }
     markDirty(p.id); save();
 
     // Still tracked variants left to refresh? Continue immediately — the

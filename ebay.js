@@ -10356,15 +10356,32 @@ module.exports = async (req, res) => {
 
         let allowedBy = {};
         try {
-          const ca = await fetch(
+          // Report what this call actually did. It was failing silently and
+          // returning 0, which looked identical to "nothing needed fixing" —
+          // so every log said "0/25 updated" while the real problem was that we
+          // never learned what the category allows.
+          const cr = await fetch(
             `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${categoryId}`,
-            { headers: auth }).then(r => r.ok ? r.json() : null);
+            { headers: auth });
+          if (!cr.ok) {
+            const body = (await cr.text().catch(() => '')).slice(0, 200);
+            console.warn(`[smartSync] 25129 repair: taxonomy lookup failed for category ${categoryId} — HTTP ${cr.status} ${body}`);
+            return 0;
+          }
+          const ca = await cr.json().catch(() => null);
           for (const a of (ca?.aspects || [])) {
             allowedBy[String(a.localizedAspectName).toLowerCase()] =
               (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
           }
-        } catch (e) { return 0; }
-        if (!Object.keys(allowedBy).length) return 0;
+          console.log(`[smartSync] 25129 repair: category ${categoryId} defines ${Object.keys(allowedBy).length} aspect(s)`);
+        } catch (e) {
+          console.warn('[smartSync] 25129 repair: taxonomy lookup threw:', e.message);
+          return 0;
+        }
+        if (!Object.keys(allowedBy).length) {
+          console.warn(`[smartSync] 25129 repair: category ${categoryId} returned NO aspects — cannot repair`);
+          return 0;
+        }
 
         const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
         // The diagnostic showed the real mismatch: the category allows
@@ -10483,6 +10500,14 @@ module.exports = async (req, res) => {
                 }
                 continue;
               }
+              // NEVER snap a VARIATION DIMENSION on an item.
+              // Two variants whose sizes are "Large" and "L" both snap to "L",
+              // and the group then holds two variants with identical option
+              // values — eBay rejects that with 25013 "Duplicate name", which
+              // is worse than the original error: 25129 blocks a revise, 25013
+              // corrupts the group. Dimensions are handled at group level where
+              // the whole value set is visible and collisions can be detected.
+              if (/^(size|colou?r)$/i.test(name)) continue;
               const allowed = allowedBy[String(name).toLowerCase()];
               if (!allowed || !allowed.length) continue;   // free-text aspect, leave as is
               const mapped = (Array.isArray(vals) ? vals : [vals])
