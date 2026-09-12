@@ -10558,7 +10558,7 @@ module.exports = async (req, res) => {
           console.log(`[smartSync] 25129 repair: protecting variation dimensions [${[..._dimNames].join(', ')}]`);
         }
 
-        let fixed = 0;
+        let fixed = 0, _noChange = 0, _putErrors = 0, _noAspects = 0;
         for (const sku of skus) {
           try {
             const ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`,
@@ -10566,7 +10566,10 @@ module.exports = async (req, res) => {
             if (!ir.ok) continue;
             const item = await ir.json();
             const asp = item.product?.aspects;
-            if (!asp) continue;
+            // A variation item can legitimately carry no aspects of its own —
+            // everything lives on the group. Worth counting, because "no
+            // aspects to fix" and "fix failed" are very different problems.
+            if (!asp) { _noAspects++; continue; }
             let changed = false;
             for (const [name, vals] of Object.entries(asp)) {
               const known = Object.prototype.hasOwnProperty.call(allowedBy, String(name).toLowerCase());
@@ -10637,11 +10640,18 @@ module.exports = async (req, res) => {
                 console.warn(`[smartSync] 25129: cannot map ${name}="${(Array.isArray(vals)?vals:[vals]).join(',')}" to the category's set (${allowed.slice(0,6).join('/')}) — left as is; this listing is probably in the wrong category`);
               } else { delete asp[name]; changed = true; }
             }
-            if (!changed) continue;
+            if (!changed) { _noChange++; continue; }
             delete item.sku;
             const pr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`,
               { method: 'PUT', headers: auth, body: JSON.stringify(item) });
             if (pr.ok || pr.status === 204) fixed++;
+            else {
+              // A rejected PUT looked identical to "nothing needed changing",
+              // because only successes were counted. Say which it was.
+              const body = (await pr.text().catch(() => '')).slice(0, 180);
+              if (_putErrors < 3) console.warn(`[smartSync] 25129 repair: item PUT failed for ${sku.slice(-18)} — HTTP ${pr.status} ${body}`);
+              _putErrors++;
+            }
           } catch (e) {}
           await sleep(120);
         }
@@ -10657,11 +10667,30 @@ module.exports = async (req, res) => {
         // is one-to-one, then apply it to the group and every item together.
         const _dimValueMap = {};      // aspect name → { oldValue: newValue }
         const _groupValues = {};      // aspect name → the values the GROUP lists
+        // eBay named an aspect it will not accept custom values for. If that
+        // aspect turns out to be free text in this category, or absent from the
+        // group's variesBy, no mapping can be produced — and the sync would
+        // keep failing with nothing in the log explaining why.
+        const _named = [..._aspect25129Names];
         try {
           const gr1 = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`,
             { headers: auth });
           if (gr1.ok) {
             const g1 = await gr1.json();
+            const specNames = (g1.variesBy?.specifications || []).map(x => x.name);
+            console.log(`[smartSync] 25129: group varies by [${specNames.join(', ') || 'none'}]; ` +
+              `eBay objected to [${_named.join(', ') || 'unnamed'}]`);
+            for (const n of _named) {
+              const key = String(n).toLowerCase();
+              if (!specNames.some(x => String(x).toLowerCase() === key)) continue;
+              const allowed = allowedBy[key];
+              if (!allowed) {
+                console.warn(`[smartSync] 25129: "${n}" is not an aspect of category ${categoryId} — cannot map it`);
+              } else if (!allowed.length) {
+                console.warn(`[smartSync] 25129: "${n}" is FREE TEXT in category ${categoryId}, yet eBay refused the value — ` +
+                  `this usually means the value is too long, or contains characters eBay rejects`);
+              }
+            }
             for (const spec of (g1.variesBy?.specifications || [])) {
               _groupValues[String(spec.name).toLowerCase()] = (spec.values || []).slice();
               const allowed = allowedBy[String(spec.name).toLowerCase()];
@@ -10759,7 +10788,10 @@ module.exports = async (req, res) => {
           }
         } catch (e) { console.warn('[smartSync] 25129 group repair failed:', e.message); }
 
-        console.log(`[smartSync] 25129 repair: ${fixed}/${skus.length} variant(s) updated${groupFixed ? ' + group' : ''}`);
+        console.log(`[smartSync] 25129 repair: ${fixed}/${skus.length} variant(s) updated${groupFixed ? ' + group' : ''}` +
+          `${_noChange ? `, ${_noChange} needed no change` : ''}` +
+          `${_noAspects ? `, ${_noAspects} had no item aspects` : ''}` +
+          `${_putErrors ? `, ${_putErrors} PUT(s) rejected` : ''}`);
         // Count the group as a repair in its own right: the item aspects were
         // often already correct, and the group was the thing blocking revises.
         fixed += groupFixed;
