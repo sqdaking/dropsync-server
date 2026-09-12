@@ -9604,6 +9604,22 @@ module.exports = async (req, res) => {
       // Reconstruction path 2: use body.comboAsin directly (fallback when parent blocked)
       const _canReconFromDta = Object.keys(dta).length > 0 && _authDimKeys.length > 0;
       const _canReconFromCombo = body.comboAsin && typeof body.comboAsin === 'object' && Object.keys(body.comboAsin).length > 0;
+      // Generate orderings of a value list. Capped by dimension count because
+      // the permutation count explodes: 3 dims → 6, 4 → 24, 5 → 120. Beyond the
+      // cap the sorted-key fallback handles it instead.
+      const _permutations = (arr, maxDims) => {
+        if (arr.length > maxDims) return [arr, arr.slice().reverse()];
+        const out = [];
+        const walk = (rest, acc) => {
+          if (!rest.length) { out.push(acc); return; }
+          for (let i = 0; i < rest.length; i++) {
+            walk(rest.slice(0, i).concat(rest.slice(i + 1)), acc.concat([rest[i]]));
+          }
+        };
+        walk(arr, []);
+        return out;
+      };
+
       // Run whenever we have variant data — NOT only when some SKU is missing a
       // mapping. Gating on _needsRecon meant that a listing where every SKU had
       // a mapping skipped the block entirely, so WRONG mappings were never
@@ -9638,10 +9654,23 @@ module.exports = async (req, res) => {
             const slug = vals.map(_slug).join('_');
             const _kindMap = vals.length > 1 ? _compoundMap : _singleMap;
             if (slug && !_kindMap[slug]) _kindMap[slug] = asin;
-            // Reversed-order slug — for eBay SKUs that flipped dim order at push time
+            // EVERY ORDERING, not just forward and reverse.
+            // eBay SKUs are built from the aspect order at push time, which
+            // need not match Amazon's dimension order. With two dimensions,
+            // forward + reverse covers all of it. With THREE there are six
+            // orderings and we stored two; with FOUR there are twenty-four and
+            // we stored two. Every unmatched ordering became an "ambiguous" SKU
+            // — left unpriced, and therefore set to qty 0 — on exactly the
+            // listings with the most variants.
             if (vals.length > 1) {
-              const revSlug = vals.slice().reverse().map(_slug).join('_');
-              if (revSlug && !_compoundMap[revSlug]) _compoundMap[revSlug] = asin;
+              for (const perm of _permutations(vals, 4)) {
+                const ps = perm.map(_slug).join('_');
+                if (ps && !_compoundMap[ps]) _compoundMap[ps] = asin;
+              }
+              // Order-independent fallback: the same values sorted. Catches
+              // orderings beyond the permutation cap on very wide listings.
+              const sortedSlug = vals.map(_slug).sort().join('_');
+              if (sortedSlug && !_compoundMap[sortedSlug]) _compoundMap[sortedSlug] = asin;
             }
             // Single-dim slugs — last-resort only, and only on single-dim listings
             if (vals.length > 1) {
@@ -9673,10 +9702,16 @@ module.exports = async (req, res) => {
             const fullSlug = rawParts.map(_slug).join('_');
             const _kindMap2 = rawParts.length > 1 ? _compoundMap : _singleMap;
             if (fullSlug && !_kindMap2[fullSlug]) _kindMap2[fullSlug] = asin;
-            // Reversed slug
+            // Same reasoning as the dta path: a 3- or 4-dimension SKU may have
+            // been built in any ordering, and storing only forward + reverse
+            // left most of them unmatched.
             if (rawParts.length > 1) {
-              const revSlug = rawParts.slice().reverse().map(_slug).join('_');
-              if (revSlug && !_compoundMap[revSlug]) _compoundMap[revSlug] = asin;
+              for (const perm of _permutations(rawParts, 4)) {
+                const ps = perm.map(_slug).join('_');
+                if (ps && !_compoundMap[ps]) _compoundMap[ps] = asin;
+              }
+              const sortedSlug2 = rawParts.map(_slug).sort().join('_');
+              if (sortedSlug2 && !_compoundMap[sortedSlug2]) _compoundMap[sortedSlug2] = asin;
             }
             // Single-dim (last resort)
             if (rawParts.length > 1) {
@@ -10280,8 +10315,20 @@ module.exports = async (req, res) => {
       // If nothing at all was priced, that is a fetch failure, not a product
       // change, and the earlier abort already handles it.
       if (_skippedNoBatch.length > 0) {
+        // THE RULE: no verified price ⇒ not buyable.
+        //
+        // The single exception is a cycle where NOTHING was priced. That is the
+        // signature of a fetch failure — a block, a cooldown, a dropped
+        // connection — not of every product vanishing from Amazon at once, and
+        // zeroing a whole listing on it would take real inventory offline for a
+        // problem that clears itself in minutes.
+        //
+        // STRICT_UNPRICED_ZERO=on removes even that exception: anything without
+        // a verified price goes to zero, always. Accurate, and more brittle —
+        // one bad fetch cycle empties the listing until the next good one.
+        const _strictZero = String(process.env.STRICT_UNPRICED_ZERO || 'off').toLowerCase() === 'on';
         const _anyPriced = updates.some(u => u.availableQuantity > 0);
-        if (_anyPriced) {
+        if (_anyPriced || _strictZero) {
           let _z = 0;
           for (const sku of _skippedNoBatch) {
             const offer = offerMap[sku];
@@ -10297,7 +10344,9 @@ module.exports = async (req, res) => {
           }
           console.log(`[smartSync] ${_z} variant(s) had no price this cycle → set qty 0 (not left buyable on unverified data)`);
         } else {
-          console.warn(`[smartSync] ${_skippedNoBatch.length} variants unpriced AND nothing else priced — leaving untouched (looks like a fetch failure, not a product change)`);
+          console.warn(`[smartSync] ${_skippedNoBatch.length} variants unpriced AND nothing else priced — ` +
+            `leaving untouched: this is a fetch failure, not a product change. ` +
+            `Set STRICT_UNPRICED_ZERO=on to zero them anyway.`);
         }
       }
       if (_orphanedSkus.length > 0) {
@@ -10470,6 +10519,35 @@ module.exports = async (req, res) => {
           return null;   // e.g. a bra size "34D" in a category that wants S/M/L
         };
 
+        // WHICH ASPECTS ARE VARIATION DIMENSIONS?
+        // Not just "Size" and "Color" — a group can vary by Scent Name, Style
+        // Name, Flavour, Pattern, Length, anything. Deleting one of those from
+        // an item leaves the group's variesBy pointing at a specification the
+        // variants no longer carry, and eBay rejects the whole group with
+        // 25013 "Missing name in the variation specifics". That is what 1,132
+        // of the failures in the last run were, and it was caused by this
+        // repair rather than by anything Amazon did.
+        //
+        // So ask the group what it varies by, and treat those names as
+        // untouchable.
+        const _dimNames = new Set(['size', 'color', 'colour']);
+        try {
+          const gr0 = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`,
+            { headers: auth });
+          if (gr0.ok) {
+            const g0 = await gr0.json();
+            for (const spec of (g0.variesBy?.specifications || [])) {
+              if (spec?.name) _dimNames.add(String(spec.name).toLowerCase());
+            }
+            for (const n of (g0.variesBy?.aspectsImageVariesBy || [])) {
+              if (n) _dimNames.add(String(n).toLowerCase());
+            }
+          }
+        } catch (e) {}
+        if (_dimNames.size > 3) {
+          console.log(`[smartSync] 25129 repair: protecting variation dimensions [${[..._dimNames].join(', ')}]`);
+        }
+
         let fixed = 0;
         for (const sku of skus) {
           try {
@@ -10494,7 +10572,9 @@ module.exports = async (req, res) => {
               // They carry no value for a buyer either: eBay never displays an
               // item specific it does not know. So drop them.
               if (!known) {
-                if (!/^(size|colou?r)$/i.test(name)) {   // never touch a variation dimension
+                // Never delete an aspect the group varies by, whatever it is
+                // called — removing it breaks the variation structure itself.
+                if (!_dimNames.has(String(name).toLowerCase())) {
                   delete asp[name];
                   changed = true;
                 }
@@ -10507,7 +10587,7 @@ module.exports = async (req, res) => {
               // is worse than the original error: 25129 blocks a revise, 25013
               // corrupts the group. Dimensions are handled at group level where
               // the whole value set is visible and collisions can be detected.
-              if (/^(size|colou?r)$/i.test(name)) continue;
+              if (_dimNames.has(String(name).toLowerCase())) continue;   // dimensions: group level only
               const allowed = allowedBy[String(name).toLowerCase()];
               if (!allowed || !allowed.length) continue;   // free-text aspect, leave as is
               const mapped = (Array.isArray(vals) ? vals : [vals])
@@ -10515,7 +10595,7 @@ module.exports = async (req, res) => {
               const before = JSON.stringify(Array.isArray(vals) ? vals : [vals]);
               if (mapped.length) {
                 if (JSON.stringify([...new Set(mapped)]) !== before) { asp[name] = [...new Set(mapped)]; changed = true; }
-              } else if (/^(size|color|colour)$/i.test(name)) {
+              } else if (_dimNames.has(String(name).toLowerCase())) {
                 // Never delete a variation dimension — the listing is built on
                 // it, and removing it breaks the group rather than fixing it.
                 console.warn(`[smartSync] 25129: cannot map ${name}="${(Array.isArray(vals)?vals:[vals]).join(',')}" to the category's set (${allowed.slice(0,6).join('/')}) — left as is; this listing is probably in the wrong category`);

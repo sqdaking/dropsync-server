@@ -1237,6 +1237,9 @@ window.dropsyncBookmarklet = dropsyncBookmarklet;
 // overlap risked blocks. Import now takes precedence automatically: the relay
 // pauses, the extension's background ticks pause, the import runs with the
 // whole budget, and everything resumes afterwards — including on failure.
+// One location-fix attempt per page load: retrying it on every listing would
+// hammer Amazon's address endpoint if it is failing for another reason.
+let _locationFixTried = false;
 let _importDepth = 0;
 let _relayWasRunningBeforeImport = false;
 
@@ -1454,6 +1457,26 @@ async function _schedNextInterval(listingCount) {
   return next;
 }
 window.SCHED = SCHED;
+
+// ── SINGLE-VARIANT LISTINGS ──────────────────────────────────────────────────
+// A product with no variations lists as a simple eBay listing rather than a
+// variation group. Worth knowing the pricing difference: on a variation parent
+// the page price belongs to whichever child Amazon chose to show, so each
+// variant has to be fetched separately — but a single-variant product has one
+// buy box and that price IS the product's price, read directly from the page we
+// already have. Fewer moving parts, and no mapping to get wrong.
+//
+// Toggle lives in the Import and Bulk Import tabs; default on.
+function allowSingleVariant() {
+  return S.allowSingleVariant !== false;
+}
+function isSingleVariant(p) {
+  if (p?.hasVariations && (p.variations?.length || 0) > 0) return false;
+  const combos = Object.keys(p?.comboAsin || {}).length;
+  return combos <= 1;
+}
+window.allowSingleVariant = allowSingleVariant;
+window.isSingleVariant = isSingleVariant;
 
 // Maximum variants a NEW listing may be created with. Existing listings are
 // untouched — repush one to bring it under the cap.
@@ -1805,6 +1828,12 @@ function renderImport() {
       <div class="card" style="margin-bottom:20px">
         <div class="card-header"><span class="card-title">📦 Amazon Product URL</span></div>
         <div class="card-body">
+          <label style="display:flex;align-items:center;gap:8px;margin:0 0 10px;font-size:12.5px;color:var(--text2);cursor:pointer">
+            <input type="checkbox" class="ds-single-toggle" ${allowSingleVariant() ? 'checked' : ''}
+                   onchange="S.allowSingleVariant=this.checked;save();document.querySelectorAll('.ds-single-toggle').forEach(x=>x.checked=this.checked);toast(this.checked?'Single-variant products will be imported':'Single-variant products will be skipped','info',3000)">
+            Include single-variant products
+            <span style="color:var(--text3);font-size:11px">(one price, no size/colour options)</span>
+          </label>
           <div style="display:flex;gap:10px">
             <input class="input" id="imp-url" placeholder="https://www.amazon.com/dp/B0XXXXXX" value="${IMP?.url||''}"
               style="flex:1;transition:border-color .2s"
@@ -3179,6 +3208,14 @@ function showAddCustomDept() {
         <textarea id="custom-dept-urls" placeholder="Amazon URLs — one per line&#10;e.g. https://www.amazon.com/s?k=women+leggings&#10;https://www.amazon.com/gp/bestsellers/fashion" class="input" style="font-size:12px;height:110px;resize:vertical;font-family:monospace"></textarea>
         <div style="font-size:11px;color:var(--text3)">Paste any Amazon search, bestsellers, or category URL. Multiple URLs = more variety.</div>
         <div style="margin-top:14px;padding:12px;border:1px solid var(--border);border-radius:10px;background:rgba(59,130,246,.06)">
+
+        <label style="display:flex;align-items:center;gap:8px;margin:10px 0;font-size:12.5px;color:var(--text2);cursor:pointer">
+          <input type="checkbox" id="sv-bulk" ${allowSingleVariant() ? 'checked' : ''}
+                 onchange="S.allowSingleVariant=this.checked;save();document.querySelectorAll('.ds-single-toggle').forEach(x=>x.checked=this.checked);toast(this.checked?'Single-variant products will be imported':'Single-variant products will be skipped','info',3000)"
+                 class="ds-single-toggle">
+          Include single-variant products
+          <span style="color:var(--text3);font-size:11px">(one price, no size/colour options)</span>
+        </label>
           <div style="font-weight:600;font-size:13px;margin-bottom:4px">Paste import — never gets blocked</div>
           <div style="font-size:11px;color:var(--text3);line-height:1.5;margin-bottom:8px">
             Open any Amazon search or bestsellers page in your browser, select all (Ctrl+A) and copy (Ctrl+C),
@@ -3791,7 +3828,7 @@ async function fetchDealsAsins(dept) {
     for (let i = arr.length-1; i>0; i--) { const j = Math.floor(Math.random()*(i+1)); [arr[i],arr[j]]=[arr[j],arr[i]]; }
   }
   const deptQueues = Object.values(byDept);
-  const selected = [];
+  let selected = [];
   let _di = 0;
   while (selected.length < 25 && deptQueues.some(q=>q.length>0)) {
     const q = deptQueues[_di % deptQueues.length];
@@ -3799,6 +3836,15 @@ async function fetchDealsAsins(dept) {
     _di++;
   }
   bulkLog(`Found ${Object.keys(productMap).length} products · ${selected.length} selected (no dupes)`);
+  // Honour the single-variant toggle before anything else touches these.
+  if (!allowSingleVariant()) {
+    const before = selected.length;
+    selected = selected.filter(p => !isSingleVariant(p));
+    if (before !== selected.length) {
+      bulkLog(`Skipped ${before - selected.length} single-variant product(s) — toggle is off`, 'info');
+    }
+  }
+
   // Drop anything eBay has already removed BEFORE it becomes a draft. One batch
   // call for the whole page rather than a check per product.
   try {
@@ -9263,9 +9309,26 @@ async function smartSyncProduct(p, _opts) {
           if (_seen && S.requireUsDestination !== false) {
             const _isUs = US_DEST_RE.test(_seen.shipTo) && !SHOPIFY_DEST_RE.test(_seen.shipTo);
             if (!_isUs) {
+              // Fix it rather than just complain. Amazon geolocates by IP, so a
+              // Moroccan connection keeps defaulting the session to Morocco —
+              // which would otherwise mean every sync refuses until someone
+              // notices and resets it by hand. One attempt per run: if it does
+              // not take, refuse as before rather than looping.
+              if (!_locationFixTried && window.dsExt?.setAmazonLocation) {
+                _locationFixTried = true;
+                const zip = S.amazonUsZip || '10001';
+                console.warn(`[smartSync] Amazon is quoting for "${_seen.shipTo}" — setting the session to US ${zip}…`);
+                const fix = await window.dsExt.setAmazonLocation({ zip }).catch(() => null);
+                if (fix?.ok) {
+                  console.log(`[smartSync] Amazon location now "${fix.location}" — retrying this listing next cycle`);
+                  toast(`Amazon set to US ${zip}`, 'success', 4000);
+                } else {
+                  console.error(`[smartSync] could not set the Amazon location automatically (${fix?.reason || 'unknown'}) — ` +
+                    `set it by hand on amazon.com in this Chrome profile.`);
+                }
+              }
               console.error(`[smartSync] ${p.ebaySku}: Amazon is quoting for "${_seen.shipTo}", not the US — ` +
-                `refusing to write prices. This looks like the Shopify/Morocco profile. ` +
-                `Use the US-address profile for eBay, or set S.requireUsDestination = false to override.`);
+                `refusing to write prices this cycle.`);
               return { skipped: true, reason: 'amazon session is not set to a US address' };
             }
           }
