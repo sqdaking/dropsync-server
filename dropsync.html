@@ -7786,7 +7786,25 @@ async function smartSyncSelected() {
     if (!confirm(`No products selected. Sync all ${listed.length} listed products instead?`)) return;
   }
   if (!listed.length) { toast('No listed products selected', 'warn'); return; }
-  toast(`🔄 Syncing ${listed.length} product${listed.length===1?'':'s'}…`, 'info', 4000);
+
+  // NEVER-SYNCED FIRST, THEN OLDEST.
+  // A run can be cut short by a cooldown, a block or simply closing the tab, so
+  // the order decides what actually gets done. A listing that has never synced
+  // is still showing whatever price it was pushed at — that is the one most
+  // likely to be wrong, and the one worth spending the budget on. After those,
+  // oldest first, so nothing is starved by repeatedly re-syncing fresh items.
+  const _syncAge = p => {
+    const t = p.lastSyncedAt ? new Date(p.lastSyncedAt).getTime()
+            : p.lastSynced   ? new Date(p.lastSynced).getTime() : 0;
+    return t ? Date.now() - t : Infinity;      // never synced sorts first
+  };
+  listed.sort((a, b) => _syncAge(b) - _syncAge(a));
+  const _never = listed.filter(p => _syncAge(p) === Infinity).length;
+  console.log(`[sync] ${listed.length} selected — ${_never} never synced (first), ` +
+    `then oldest first${listed.length > _never ? `, oldest is ${(_syncAge(listed[_never]) / 3600000).toFixed(1)}h` : ''}`);
+
+  toast(`🔄 Syncing ${listed.length} product${listed.length===1?'':'s'}` +
+        (_never ? ` · ${_never} never synced first` : '') + '…', 'info', 4000);
   let ok = 0, blocked = 0, failed = 0;
   for (const p of listed) {
     const r = await smartSyncProduct(p);
