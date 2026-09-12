@@ -10419,8 +10419,18 @@ module.exports = async (req, res) => {
           }
           const ca = await cr.json().catch(() => null);
           for (const a of (ca?.aspects || [])) {
+            // ONLY CLOSED SETS CONSTRAIN US.
+            // Most aspects list suggested values but accept anything
+            // (FREE_TEXT); a few are SELECTION_ONLY and reject everything else.
+            // Treating suggestions as a closed set is what made the repair try
+            // to force 20 real colour names — Apricot, Beau Blue, Oatmeal
+            // Heather — into eBay's 11 base colours, which it then had to
+            // refuse. Those aspects were never the problem.
+            const mode = a.aspectConstraint?.aspectMode;
+            const closed = mode === 'SELECTION_ONLY';
             allowedBy[String(a.localizedAspectName).toLowerCase()] =
-              (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
+              closed ? (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean)
+                     : [];     // free text: nothing to snap to
           }
           console.log(`[smartSync] 25129 repair: category ${categoryId} defines ${Object.keys(allowedBy).length} aspect(s)`);
         } catch (e) {
@@ -10590,6 +10600,21 @@ module.exports = async (req, res) => {
               // Dimensions follow the agreed mapping only — never ad-hoc
               // snapping, which is what created mismatches and duplicates.
               if (_dimNames.has(String(name).toLowerCase())) {
+                // LEGACY MISMATCH REPAIR.
+                // An earlier run may have snapped the GROUP while leaving items
+                // untouched, so the group now says "L" and the item still says
+                // "Large". The group is then already correct, no mapping is
+                // produced, and the mismatch would persist for ever. Pull the
+                // item onto whatever the group actually lists.
+                const gset = _groupValues[String(name).toLowerCase()];
+                if (gset && gset.length) {
+                  const cur = Array.isArray(vals) ? vals : [vals];
+                  const pulled = cur.map(v => gset.includes(v) ? v : (snapValue(v, gset, name) || v));
+                  if (JSON.stringify(pulled) !== JSON.stringify(cur)) {
+                    asp[name] = pulled; changed = true;
+                    console.log(`[smartSync] 25013 repair: ${sku.slice(-18)} ${name} "${cur.join(',')}" → "${pulled.join(',')}" to match the group`);
+                  }
+                }
                 const m = _dimValueMap[name] ||
                           _dimValueMap[Object.keys(_dimValueMap).find(k => k.toLowerCase() === name.toLowerCase())];
                 if (m) {
@@ -10631,12 +10656,14 @@ module.exports = async (req, res) => {
         // So decide the mapping ONCE from the group's full value set, prove it
         // is one-to-one, then apply it to the group and every item together.
         const _dimValueMap = {};      // aspect name → { oldValue: newValue }
+        const _groupValues = {};      // aspect name → the values the GROUP lists
         try {
           const gr1 = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`,
             { headers: auth });
           if (gr1.ok) {
             const g1 = await gr1.json();
             for (const spec of (g1.variesBy?.specifications || [])) {
+              _groupValues[String(spec.name).toLowerCase()] = (spec.values || []).slice();
               const allowed = allowedBy[String(spec.name).toLowerCase()];
               if (!allowed || !allowed.length) continue;
               const original = spec.values || [];
