@@ -10587,7 +10587,18 @@ module.exports = async (req, res) => {
               // is worse than the original error: 25129 blocks a revise, 25013
               // corrupts the group. Dimensions are handled at group level where
               // the whole value set is visible and collisions can be detected.
-              if (_dimNames.has(String(name).toLowerCase())) continue;   // dimensions: group level only
+              // Dimensions follow the agreed mapping only — never ad-hoc
+              // snapping, which is what created mismatches and duplicates.
+              if (_dimNames.has(String(name).toLowerCase())) {
+                const m = _dimValueMap[name] ||
+                          _dimValueMap[Object.keys(_dimValueMap).find(k => k.toLowerCase() === name.toLowerCase())];
+                if (m) {
+                  const cur = Array.isArray(vals) ? vals : [vals];
+                  const next = cur.map(v => m[v] || v);
+                  if (JSON.stringify(next) !== JSON.stringify(cur)) { asp[name] = next; changed = true; }
+                }
+                continue;
+              }
               const allowed = allowedBy[String(name).toLowerCase()];
               if (!allowed || !allowed.length) continue;   // free-text aspect, leave as is
               const mapped = (Array.isArray(vals) ? vals : [vals])
@@ -10609,6 +10620,44 @@ module.exports = async (req, res) => {
           } catch (e) {}
           await sleep(120);
         }
+        // ── DIMENSION VALUES MUST CHANGE ON BOTH SIDES AT ONCE ───────────────
+        // The group's variesBy lists the values a buyer picks from; each item
+        // repeats its own value in its aspects. Change one without the other
+        // and eBay rejects the group with 25013 "Variation Specifics provided
+        // does not match with the variation specifics of the variations on the
+        // item" — which is what happened when group snapping was added while
+        // item dimensions were (correctly) left alone to avoid duplicates.
+        //
+        // So decide the mapping ONCE from the group's full value set, prove it
+        // is one-to-one, then apply it to the group and every item together.
+        const _dimValueMap = {};      // aspect name → { oldValue: newValue }
+        try {
+          const gr1 = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(normSku)}`,
+            { headers: auth });
+          if (gr1.ok) {
+            const g1 = await gr1.json();
+            for (const spec of (g1.variesBy?.specifications || [])) {
+              const allowed = allowedBy[String(spec.name).toLowerCase()];
+              if (!allowed || !allowed.length) continue;
+              const original = spec.values || [];
+              const mapped = original.map(v => snapValue(v, allowed, spec.name));
+              // Every value must map, and map to something distinct — otherwise
+              // two variants would collapse onto one option value.
+              if (mapped.some(v => !v)) continue;
+              if (new Set(mapped).size !== original.length) {
+                console.warn(`[smartSync] 25129: ${spec.name} not remapped — ` +
+                  `${original.length} values would collapse to ${new Set(mapped).size}`);
+                continue;
+              }
+              if (JSON.stringify(mapped) === JSON.stringify(original)) continue;   // nothing to do
+              const m = {};
+              original.forEach((v, i) => { m[v] = mapped[i]; });
+              _dimValueMap[spec.name] = m;
+              console.log(`[smartSync] 25129: ${spec.name} → ${original.slice(0,4).join('/')} becomes ${mapped.slice(0,4).join('/')}`);
+            }
+          }
+        } catch (e) {}
+
         // ── GROUP-LEVEL ASPECTS ──────────────────────────────────────────────
         // The diagnostic showed item aspects already correct ("Size":["L"])
         // while eBay still refused "Large" and "X-Large". Those values live on
@@ -10638,6 +10687,14 @@ module.exports = async (req, res) => {
             const vb = grp.variesBy && grp.variesBy.specifications;
             if (Array.isArray(vb)) {
               for (const spec of vb) {
+                // Use the mapping agreed above so the group and the items stay
+                // in step; if a dimension was rejected there, it is skipped here.
+                const agreed = _dimValueMap[spec.name];
+                if (agreed) {
+                  const next = (spec.values || []).map(v => agreed[v] || v);
+                  if (JSON.stringify(next) !== JSON.stringify(spec.values)) { spec.values = next; gChanged = true; }
+                  continue;
+                }
                 const allowed = allowedBy[String(spec.name).toLowerCase()];
                 if (!allowed || !allowed.length) continue;
                 const original = spec.values || [];
