@@ -2285,32 +2285,32 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
 
   const result = {};
 
-  // ── BULK: extract all variant prices from parent page HTML ─────────────────
-  // Amazon embeds all variant prices in the parent page — no individual ASIN
-  // fetches needed. Extract using multiple patterns for maximum coverage.
+  // ── BULK PRICES: STRUCTURED SOURCES ONLY ───────────────────────────────────
+  //
+  // Everything here must come from a map where the ASIN is the KEY of the price
+  // — never from "an ASIN and a price appeared near each other in the HTML".
+  //
+  // Three proximity patterns used to live here and they were the source of the
+  // wrong prices:
+  //
+  //  • one paired data-asin with "$X with N percent savings" within 800 chars.
+  //    That is the Subscribe & Save / coupon price a buyer cannot actually get
+  //    — the same bug fixed in the per-ASIN extractor, still live here.
+  //  • one paired any ASIN with any "priceAmount" within 300 chars, in BOTH
+  //    directions, so the buy-box price of the landing variant was routinely
+  //    assigned to whichever ASIN happened to be printed next to it.
+  //  • one paired "asin" with "priceToPay" within 600 chars, which crosses JSON
+  //    object boundaries on wide listings.
+  //
+  // On a 2-dimension page the landing variant's price is often close to several
+  // swatch ASINs, so these produced confident, wrong, per-variant prices — and
+  // they got worse as dimensions increased, because more ASINs sit inside the
+  // same character window.
+  //
+  // An unpriced variant costs a fetch, or failing that goes to qty 0. A wrongly
+  // priced one sells at the wrong price. So: structured sources only.
 
-  // Pattern 1: swatch prices (discount display)
-  for (const m of mainHtml.matchAll(/data-asin="([A-Z0-9]{10})"[\s\S]{0,800}?\$([\d.]+)\s+with\s+\d+\s*percent\s+savings/g)) {
-    const p = parseFloat(m[2]); if (p > 0 && p < 10000) result[m[1]] = { price: p, inStock: true };
-  }
-  for (const m of mainHtml.matchAll(/\$([\d.]+)\s+with\s+\d+\s*percent\s+savings[\s\S]{0,500}?data-asin="([A-Z0-9]{10})"/g)) {
-    const p = parseFloat(m[1]); if (p > 0 && p < 10000 && !result[m[2]]) result[m[2]] = { price: p, inStock: true };
-  }
-
-  // Pattern 2: priceAmount JSON blobs tied to ASINs
-  for (const m of mainHtml.matchAll(/"([A-Z0-9]{10})"[\s\S]{0,300}?"priceAmount"\s*:\s*([\d.]+)/g)) {
-    const p = parseFloat(m[2]);
-    if (p > 0 && p < 10000 && !result[m[1]]) result[m[1]] = { price: p, inStock: true };
-  }
-  for (const m of mainHtml.matchAll(/"priceAmount"\s*:\s*([\d.]+)[\s\S]{0,300}?"([A-Z0-9]{10})"/g)) {
-    const p = parseFloat(m[1]);
-    if (p > 0 && p < 10000) {
-      const asin = m[2];
-      if (uniqueAsins.includes(asin) && !result[asin]) result[asin] = { price: p, inStock: true };
-    }
-  }
-
-  // Pattern 3: variationPrices JSON
+  // Structured source: variationPrices — a real ASIN → price object.
   const vpM = mainHtml.match(/"variationPrices"\s*:\s*(\{[\s\S]{0,8000}?\})/);
   if (vpM) {
     try {
@@ -2323,11 +2323,21 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     } catch(e) {}
   }
 
-  // Pattern 4: priceToPay in twister data
-  for (const m of mainHtml.matchAll(/"asin"\s*:\s*"([A-Z0-9]{10})"[\s\S]{0,600}?"priceToPay"\s*:\s*\{[^}]*?"amount"\s*:\s*([\d.]+)/g)) {
-    const p = parseFloat(m[2]);
-    if (p > 0 && p < 10000 && !result[m[1]]) result[m[1]] = { price: p, inStock: true };
-  }
+  // Structured source: twister slot JSON, where each entry is keyed by ASIN.
+  // Parsed as JSON rather than pattern-matched, so a price can only ever be
+  // attached to the ASIN that owns it.
+  try {
+    const _twIdx = mainHtml.search(/"asinVariationValues"\s*:\s*\{/);
+    const tw = _twIdx >= 0 ? [null, _sliceObject(mainHtml, mainHtml.indexOf('{', _twIdx + 21))] : null;
+    if (tw && tw[1]) {
+      const obj = JSON.parse(tw[1]);
+      for (const [asin, v] of Object.entries(obj)) {
+        if (!/^[A-Z0-9]{10}$/.test(asin) || result[asin]) continue;
+        const p = parseFloat(v?.priceAmount ?? v?.price?.amount ?? 0);
+        if (p > 0 && p < 100000) result[asin] = { price: p, inStock: true };
+      }
+    }
+  } catch (e) {}
 
   // ── FREE AVAILABILITY (Aug 2026) ──────────────────────────────────────────
   // The probe showed Amazon no longer embeds per-variant PRICES in the parent
