@@ -6834,7 +6834,7 @@ async function handleRebuildPhotos(body, res) {
         ? sku.slice(ebaySku.length + 1)
         : sku).toUpperCase();
       for (const [slug, asin] of _sortedSlugs) {
-        if (sfx.startsWith(slug) || sfx.includes(slug)) {
+        if (_hasSlug(sfx, slug)) {
           _effectiveSkuToAsin[sku] = asin;
           _derivedFromSlugs++;
           break;
@@ -8932,6 +8932,66 @@ module.exports = async (req, res) => {
       } catch(e) { return res.status(500).json({ error: e.message }); }
     }
 
+    // ── LISTING PRICE AUDIT ────────────────────────────────────────────────
+    // Answers "why do these variants share a price?" without reading logs.
+    // For one listing it shows every SKU, the ASIN it is mapped to, and the
+    // price currently live on eBay — so a shared ASIN or a shared price is
+    // visible at a glance rather than inferred.
+    if (action === 'auditListing') {
+      const auditSku = String(req.query.sku || body.ebaySku || '').trim();
+      if (!auditSku) return res.status(400).json({ error: 'pass ?sku=DS-…' });
+      const norm = auditSku.replace(/-[A-Z0-9]{5}$/i, '') || auditSku;
+      try {
+        const st = await _cachePool.query(
+          `SELECT skutoasin, comboasin FROM relay_state
+            WHERE ebay_sku = $1 OR ebay_sku = $2 LIMIT 1`, [auditSku, norm]);
+        const stored = st.rows[0] || {};
+        let map = stored.skutoasin || {};
+        if (typeof map === 'string') { try { map = JSON.parse(map); } catch (e) { map = {}; } }
+        let combos = stored.comboasin || {};
+        if (typeof combos === 'string') { try { combos = JSON.parse(combos); } catch (e) { combos = {}; } }
+
+        // Live eBay prices for the same SKUs
+        const offers = {};
+        for (const sku of Object.keys(map)) {
+          const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`,
+            { headers: auth });
+          if (!r.ok) continue;
+          const d = await r.json().catch(() => ({}));
+          const o = (d.offers || [])[0];
+          if (o) offers[sku] = { price: o.pricingSummary?.price?.value, qty: o.availableQuantity };
+          await sleep(120);
+        }
+
+        // Collisions: the two things that cause a shared price
+        const byAsin = {}, byPrice = {};
+        for (const [sku, asin] of Object.entries(map)) {
+          if (asin) (byAsin[asin] = byAsin[asin] || []).push(sku);
+          const p = offers[sku]?.price;
+          if (p) (byPrice[p] = byPrice[p] || []).push(sku);
+        }
+        const sharedAsins  = Object.entries(byAsin).filter(([, v]) => v.length > 1);
+        const sharedPrices = Object.entries(byPrice).filter(([, v]) => v.length > 1);
+
+        return res.json({
+          listing: auditSku,
+          variants: Object.entries(map).map(([sku, asin]) => ({
+            sku: sku.slice(-28), asin,
+            ebayPrice: offers[sku]?.price ?? null,
+            qty: offers[sku]?.qty ?? null,
+          })),
+          sharedAsins:  sharedAsins.map(([asin, skus])  => ({ asin,  skus: skus.map(s => s.slice(-24)) })),
+          sharedPrices: sharedPrices.map(([price, skus]) => ({ price, skus: skus.map(s => s.slice(-24)) })),
+          comboKeys: Object.keys(combos).slice(0, 12),
+          verdict: sharedAsins.length
+            ? 'MAPPING: several SKUs point at one ASIN — they can only ever share a price'
+            : (sharedPrices.length
+                ? 'PRICING: ASINs are distinct but the prices are identical — the prices came from the wrong place, not the mapping'
+                : 'each SKU has its own ASIN and its own price'),
+        });
+      } catch (e) { return res.status(500).json({ error: e.message }); }
+    }
+
     if (action === 'smartSync') {
       const { access_token, ebaySku, ebayListingId, sourceUrl,
               markup: mkRaw, handlingCost: handRaw, quantity: qtyRaw,
@@ -9648,6 +9708,21 @@ module.exports = async (req, res) => {
       if ((_needsRecon.size > 0 || Object.keys(skuToAsin).length > 0) &&
           (_canReconFromDta || _canReconFromCombo)) {
         const _slug = s => (s||'').replace(/[^A-Z0-9]/gi,'_').toUpperCase().replace(/_+/g,'_').replace(/^_|_$/g,'');
+        // BOUNDARY MATCHING.
+        // Plain includes() is wrong for values that are prefixes of each other,
+        // which is exactly what pack sizes are: "SET_OF_2" is a substring of
+        // "WHITE_SET_OF_24", so the 2-pack's ASIN was matching the 24-pack's
+        // SKU. Same for "2_PACK" inside "12_PACK", and any bare number.
+        // A value only counts when it sits on underscore or string boundaries.
+        const _hasSlug = (haystack, needle) => {
+          if (!haystack || !needle) return false;
+          const i = haystack.indexOf(needle);
+          if (i < 0) return false;
+          const before = i === 0 ? '_' : haystack[i - 1];
+          const afterIdx = i + needle.length;
+          const after = afterIdx >= haystack.length ? '_' : haystack[afterIdx];
+          return before === '_' && after === '_';
+        };
         // Use the authoritative dim key order parsed from Amazon's "dimensions" array,
         // NOT Object.keys(vv2). See the big comment above — getting this wrong silently
         // swaps color/size on every variant.
@@ -9894,7 +9969,7 @@ module.exports = async (req, res) => {
           if (_hashed) { _reconAmbiguous++; continue; }
           // Try compound (multi-dim) slugs FIRST — forward containment
           for (const [slug, asin] of _compoundSlugs) {
-            if (sfx.startsWith(slug) || sfx.includes(slug)) {
+            if (_hasSlug(sfx, slug)) {
               skuToAsin[sku] = asin;
               _reconHits++;
               matched = true;
@@ -9926,7 +10001,7 @@ module.exports = async (req, res) => {
           if (_isMultiDim) { _reconAmbiguous++; continue; }
           // Single-dim listings only: single-value slugs, ambiguity-checked.
           for (const [slug, asin] of _primaryOnlySlugs) {
-            if (sfx.startsWith(slug) || sfx.includes(slug)) {
+            if (_hasSlug(sfx, slug)) {
               const _dupCount = _primaryOnlySlugs.filter(([s]) => s === slug).length;
               if (_dupCount >= 2) {
                 _reconAmbiguous++;
@@ -10165,6 +10240,18 @@ module.exports = async (req, res) => {
         // a single value (just "Black") maps every size to one ASIN → one
         // price for all sizes. Multi-dim SKUs must match via compound slugs
         // (Method A / reconstruction) or go orphan-safe qty=0.
+        // Lower-case boundary match for the valToAsin path, which works on the
+        // raw SKU rather than the slugged suffix. Same rule: "2" must not match
+        // inside "24" or "12".
+        const _hasSlugLower = (hay, needle) => {
+          if (!hay || !needle) return false;
+          const i = hay.indexOf(needle);
+          if (i < 0) return false;
+          const before = i === 0 ? '_' : hay[i - 1];
+          const aIdx = i + needle.length;
+          const after = aIdx >= hay.length ? '_' : hay[aIdx];
+          return (before === '_' || before === '-') && (after === '_' || after === '-');
+        };
         if (!asin && _sortedValToAsin.length > 0 && !_isMultiDim) {
           const aspects = skuAspects[sku] || {};
           for (const vals of Object.values(aspects)) {
@@ -10179,7 +10266,8 @@ module.exports = async (req, res) => {
           if (!asin) {
             const _skuLower = sku.toLowerCase();
             for (const [val, a] of _sortedValToAsin) {
-              if (_skuLower.includes(val.replace(/\s+/g, '_'))) { asin = a; break; }
+              // Same boundary rule: a bare "2" must not match "24" or "12".
+              if (_hasSlugLower(_skuLower, val.replace(/\s+/g, '_'))) { asin = a; break; }
             }
           }
         }
