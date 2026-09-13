@@ -9420,6 +9420,7 @@ module.exports = async (req, res) => {
       // derived from the WRONG ASIN, so it must not stay buyable until we have
       // a real price for the corrected ASIN.
       const _correctedSkus = new Set();
+      let _singleAsinWarned = false;   // warn once per listing, not per variant
       const cachedOfferIds = body.cachedOfferIds || {};
       const offerMap       = {}; // sku → { offerId, currentPrice }
       let _listingId       = String(body.ebayListingId || '');
@@ -10144,8 +10145,27 @@ module.exports = async (req, res) => {
           }
         }
 
-        // Last resort: single ASIN product
-        if (!asin && uniqueAsins.length === 1) asin = uniqueAsins[0];
+        // Last resort: a genuinely SINGLE-VARIANT product.
+        //
+        // This is the line that made every variant share one price. When the
+        // fresh data yielded only one ASIN — which happens whenever the parent
+        // page gives us just the landing variant's price — EVERY unmapped SKU
+        // was handed that ASIN, and therefore that one price. On a 25-variant
+        // listing that means 25 variants priced from one.
+        //
+        // It is only correct when the eBay listing itself has a single variant.
+        // A multi-variant listing with one known ASIN means we are missing the
+        // rest, and the honest outcome is qty 0 for the unmapped ones — never a
+        // borrowed price.
+        if (!asin && uniqueAsins.length === 1) {
+          if (Object.keys(offerMap).length <= 1) {
+            asin = uniqueAsins[0];
+          } else if (!_singleAsinWarned) {
+            _singleAsinWarned = true;
+            console.warn(`[smartSync] only 1 ASIN known but the listing has ${Object.keys(offerMap).length} variants — ` +
+              `NOT applying it to the others (that is how every variant ends up at one price); unmapped variants go qty 0`);
+          }
+        }
 
         // If still no ASIN match — this is an ORPHAN variant: it exists on eBay but
         // no longer corresponds to any ASIN on the current Amazon parent page. This
