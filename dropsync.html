@@ -671,7 +671,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-09-02.1 (dogs page = qty 0, no hold)');
+console.log('[dropsync] build 2026-09-03.1 (every ASIN fetched individually)');
 
 // ── SHOPIFY (Morocco store) ──────────────────────────────────────────────────
 // Shares the Amazon side with eBay and NOTHING else. In particular it goes
@@ -2285,7 +2285,28 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
 
   const result = {};
 
-  // ── BULK PRICES: STRUCTURED SOURCES ONLY ───────────────────────────────────
+  // ── NO PRICES FROM THE PARENT PAGE ─────────────────────────────────────────
+  //
+  // The parent page shows ONE variant's price — whichever Amazon chose to land
+  // on — and the embedded JSON blobs are not a dependable per-variant map
+  // either: they are sometimes stale, sometimes partial, and sometimes reflect a
+  // promotion that applies to a single child. Every attempt to price variants
+  // from the parent has produced the same failure: several variants sharing one
+  // price.
+  //
+  // So each tracked ASIN is fetched on its own page, where the buy box is that
+  // ASIN's actual price. It costs one fetch per variant, which is the price of
+  // being correct. Anything that cannot be fetched has no price, and no price
+  // means qty 0.
+  //
+  // PARENT_PRICES = true re-enables the structured blobs if you ever want the
+  // speed back, but nothing in the sync depends on them.
+  const PARENT_PRICES = (typeof S !== 'undefined' && S.useParentPrices === true);
+  if (!PARENT_PRICES) {
+    console.log(`[prefetchAsin] parent-page prices disabled — fetching all ${uniqueAsins.length} ASIN(s) individually`);
+  }
+
+  // ── BULK PRICES: STRUCTURED SOURCES ONLY (only when explicitly enabled) ────
   //
   // Everything here must come from a map where the ASIN is the KEY of the price
   // — never from "an ASIN and a price appeared near each other in the HTML".
@@ -2311,6 +2332,7 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   // priced one sells at the wrong price. So: structured sources only.
 
   // Structured source: variationPrices — a real ASIN → price object.
+  if (PARENT_PRICES) {
   const vpM = mainHtml.match(/"variationPrices"\s*:\s*(\{[\s\S]{0,8000}?\})/);
   if (vpM) {
     try {
@@ -2339,6 +2361,8 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     }
   } catch (e) {}
 
+  }   // end PARENT_PRICES
+
   // ── FREE AVAILABILITY (Aug 2026) ──────────────────────────────────────────
   // The probe showed Amazon no longer embeds per-variant PRICES in the parent
   // page — but dimensionValuesDisplayData does carry per-variant
@@ -2347,9 +2371,13 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   //
   // Only used to mark OOS (never to claim in-stock): a false OOS costs a
   // missed sale, a false in-stock sells something we can't fulfil.
+  // This is availability, NOT price — it can only ever mark a variant
+  // out-of-stock, never claim a price or claim in-stock. A stale flag costs a
+  // missed sale; it cannot cause a wrong price. Set S.useParentOos = false to
+  // fetch every variant regardless.
   let _freeOos = 0;
   try {
-    const H = mainHtml || '';
+    const H = (S.useParentOos === false) ? '' : (mainHtml || '');
     for (const m of H.matchAll(/"defaultAsin"\s*:\s*"([A-Z0-9]{10})"[\s\S]{0,200}?"dimensionValueState"\s*:\s*"([A-Z_]+)"/g)) {
       const [, asin, state] = m;
       if (state !== 'AVAILABLE' && !result[asin] && uniqueAsins.includes(asin)) {

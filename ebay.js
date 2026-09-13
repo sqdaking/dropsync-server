@@ -9940,6 +9940,26 @@ module.exports = async (req, res) => {
         }
         if (_exactHits > 0) console.log(`[smartSync] exact hashed-SKU matches: ${_exactHits} (regenerated from combos — no guessing)`);
         console.log(`[smartSync] reconstruction matched ${_reconHits}/${_needsRecon.size} uncovered SKUs${_reconAmbiguous > 0 ? ` (${_reconAmbiguous} ambiguous, skipped to avoid wrong-price assignment)` : ''} (${Object.keys(offerMap).length} total, dimOrder=[${_dimKeys.join(',')}]${_canReconFromCombo?' +comboAsin fallback':''})`);
+        // ── DO NOT "CORRECT" A MAPPING WITHOUT FRESH EVIDENCE ────────────────
+        // When the parent page is blocked there is no fresh dimensionToAsinMap,
+        // so reconstruction works from slugs alone. That is guesswork, and on a
+        // colour × size listing several SKUs resolve to the same ASIN — the
+        // corrections then WRITE that smearing into the stored map, and every
+        // later sync inherits it.
+        //
+        // A stored mapping that was derived from a good page is better evidence
+        // than a slug guess made from a blocked one. So when there is no fresh
+        // data, keep what we have and wait for a cycle that can see Amazon.
+        if (!_canReconFromDta) {
+          const _reverted = Object.keys(skuToAsin).filter(
+            s => _storedSkuToAsin[s] && skuToAsin[s] !== _storedSkuToAsin[s]);
+          if (_reverted.length) {
+            for (const s3 of _reverted) skuToAsin[s3] = _storedSkuToAsin[s3];
+            console.warn(`[smartSync] parent page unavailable — keeping ${_reverted.length} stored mapping(s) ` +
+              `rather than re-deriving them from slugs (that is what smeared several SKUs onto one ASIN)`);
+          }
+        }
+
         // Show exactly what the fresh map changed vs what was stored — this is
         // how you confirm a poisoned listing has actually been repaired.
         const _corrections = Object.keys(skuToAsin).filter(
@@ -10385,22 +10405,38 @@ module.exports = async (req, res) => {
           for (const [sku, a] of Object.entries(skuToAsin)) {
             if (a && offerMap[sku]) (_useCount[a] = _useCount[a] || []).push(sku);
           }
+          const _dupZero = String(process.env.DUP_ASIN_ZERO || 'off').toLowerCase() === 'on';
           let _unverified = 0;
           for (const [asin, skus] of Object.entries(_useCount)) {
             if (skus.length < 2) continue;
             const allowed = _freshDup[asin] || 0;   // how many Amazon combos share it
             if (skus.length <= allowed) continue;   // Amazon confirms the duplicate
-            // Keep the first, refuse the rest: we cannot tell which SKU the ASIN
-            // truly belongs to, and a wrong price is worse than no sale.
-            for (const sku of skus.slice(1)) {
-              const u = updates.find(x => x.sku === sku);
-              if (u) { u.availableQuantity = 0; }
-              else updates.push({ sku, availableQuantity: 0,
-                                  price: parseFloat(offerMap[sku]?.currentPrice) || undefined });
-              _unverified++;
+            // REPORT, DO NOT SUPPRESS (default).
+            //
+            // Keeping the first SKU and zeroing the rest was wrong twice over:
+            // the survivor is arbitrary — it is simply whichever came first, and
+            // may be the mis-mapped one — and zeroing the others makes the
+            // listing look like only one combination is being synced at all,
+            // which hides the real fault instead of fixing it.
+            //
+            // A shared ASIN is a MAPPING problem. The right response is to fix
+            // the mapping (the reconstruction and permutation work above) and to
+            // make the failure visible here, not to quietly remove variants.
+            //
+            // DUP_ASIN_ZERO=on restores the suppressing behaviour if you would
+            // rather have those variants unbuyable while the mapping is wrong.
+            console.warn(`[smartSync] MAPPING PROBLEM: ${skus.length} SKUs share ASIN ${asin} but Amazon maps it to ` +
+              `${allowed} combo(s) — ${skus.map(x => x.slice(-16)).join(', ')}` +
+              `${_dupZero ? ' → zeroing all but the first' : ' (left as they are; fix is in the SKU→ASIN mapping)'}`);
+            if (_dupZero) {
+              for (const sku of skus.slice(1)) {
+                const u = updates.find(x => x.sku === sku);
+                if (u) { u.availableQuantity = 0; }
+                else updates.push({ sku, availableQuantity: 0,
+                                    price: parseFloat(offerMap[sku]?.currentPrice) || undefined });
+                _unverified++;
+              }
             }
-            console.warn(`[smartSync] ${skus.length} SKUs share ASIN ${asin} but Amazon maps it to ${allowed} combo(s) — ` +
-              `zeroing ${skus.length - 1}: ${skus.slice(1).map(x => x.slice(-16)).join(', ')}`);
           }
           if (_unverified) {
             console.warn(`[smartSync] ${_unverified} variant(s) set to qty 0 — their ASIN is shared and unverified, so no price can be trusted`);
