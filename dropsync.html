@@ -3980,6 +3980,13 @@ async function bulkFetchDeals(dept) {
             primeOnly: S.primeOnly || false,
             pageHtml: _pageHtml,
             clientAsinData: _clientAsinData,
+            // Tell the server the Amazon page ACTUALLY LOADED. Without this it
+            // cannot distinguish "we never reached Amazon" from "we read the
+            // page and none of its ASINs belong to this listing" — and it
+            // treats both as a fetch failure, leaving the listing live on old
+            // prices. The second case is a real answer and must zero the
+            // listing.
+            parentLoaded: _parentLoaded === true,
           })
         });
         const sd = await safeJson(sr);

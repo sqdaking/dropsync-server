@@ -10327,8 +10327,25 @@ module.exports = async (req, res) => {
         // a verified price goes to zero, always. Accurate, and more brittle —
         // one bad fetch cycle empties the listing until the next good one.
         const _strictZero = String(process.env.STRICT_UNPRICED_ZERO || 'off').toLowerCase() === 'on';
+        if (_zeroedUnmapped > 0) {
+          console.log(`[smartSync] ${_zeroedUnmapped} variant(s) had no resolvable ASIN or price on a page that loaded → qty 0`);
+        }
         const _anyPriced = updates.some(u => u.availableQuantity > 0);
-        if (_anyPriced || _strictZero) {
+        // THE PAGE LOADED AND NOTHING MATCHED.
+        // The browser tells us whether it actually read the Amazon page. If it
+        // did, and not one variant could be priced, that is an ANSWER — the
+        // product's variants no longer correspond to this listing, or the ASINs
+        // are gone — not a fetch failure. Leaving the listing buyable on old
+        // prices is how you sell something you cannot source, so zero it.
+        //
+        // Only a genuinely failed fetch (parentLoaded false) still gets the
+        // benefit of the doubt.
+        const _pageLoaded = body.parentLoaded === true;
+        if (_pageLoaded && !_anyPriced && _skippedNoBatch.length) {
+          console.warn(`[smartSync] page loaded but NOT ONE variant could be priced — ` +
+            `zeroing ${_skippedNoBatch.length} variant(s): the ASINs on Amazon no longer match this listing`);
+        }
+        if (_anyPriced || _strictZero || _pageLoaded) {
           let _z = 0;
           for (const sku of _skippedNoBatch) {
             const offer = offerMap[sku];
@@ -10935,6 +10952,7 @@ module.exports = async (req, res) => {
       // Variants phase 1 deliberately did NOT zero because coverage was thin.
       // Previously invisible, which read as "it isn't zeroing unsynced variants".
       const _leftAlone = [];
+      let _zeroedUnmapped = 0;   // SKUs zeroed because no ASIN or price could be resolved
       // Coverage ratio decides how aggressive zeroing may be. With full
       // coverage, zero-then-restore is safe and correct. With thin coverage,
       // zeroing variants we simply haven't looked at destroys live inventory.
@@ -10972,7 +10990,20 @@ module.exports = async (req, res) => {
           // Thin coverage: only touch variants we actually have data for.
           if (_coverageRatio < _MIN_COVERAGE && !want) {
             const _a = skuToAsin[sku];
-            if (!_a || asinPrice[_a] === undefined) { _leftAlone.push(sku); continue; }
+            if (!_a || asinPrice[_a] === undefined) {
+              // No ASIN for this SKU, or no price for that ASIN. If we read the
+              // Amazon page successfully then this variant genuinely cannot be
+              // verified — make it unbuyable rather than leaving it selling at a
+              // price nothing confirms.
+              if (body.parentLoaded === true) {
+                updates.push({ sku, availableQuantity: 0,
+                               price: parseFloat(offer.currentPrice) || undefined });
+                _zeroedUnmapped++;
+              } else {
+                _leftAlone.push(sku);
+              }
+              continue;
+            }
           }
           // Do NOT skip qty-0 entries here. Phase 2 only restores variants with
           // qty > 0, so anything explicitly marked 0 was skipped by phase 1 as
