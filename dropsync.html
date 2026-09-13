@@ -7258,6 +7258,19 @@ async function pushAll() {
   if (btn) { btn.disabled = false; btn.innerHTML = '🚀 Push All'; }
 }
 
+// Sync ONE listing by its eBay SKU and report what the mapping did — so a fix
+// can be verified on a single listing instead of waiting for the rotation.
+async function syncSku(ebaySku) {
+  const p = (S.products || []).find(x =>
+    x.ebaySku === ebaySku || normaliseGroupSku(x.ebaySku || '') === normaliseGroupSku(ebaySku));
+  if (!p) { console.error('[syncSku] no listing with that SKU in this tab'); return; }
+  console.log(`[syncSku] syncing ${p.ebaySku} — watch for "rebuilding from the fresh page" / "saved N corrected mapping(s)"`);
+  const r = await smartSyncProduct(p);
+  console.log('[syncSku] result:', r);
+  return r;
+}
+window.syncSku = syncSku;
+
 async function syncOne(pid) {
   const p = S.products.find(x => x.id === pid);
   if (!p || p.status !== 'listed') return;

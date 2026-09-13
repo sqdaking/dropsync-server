@@ -9489,6 +9489,31 @@ module.exports = async (req, res) => {
 
       // ── STEP 3: Get variant SKUs + offer IDs ─────────────────────────────────
       const skuToAsin      = body.skuToAsin     || {};
+      // ── REBUILD A PROVABLY WRONG MAP FROM SCRATCH ─────────────────────────
+      // Patching a poisoned map one correction at a time leaves the rest of the
+      // smearing in place, which is why a listing could be "CORRECTED 11
+      // mappings" on every cycle and still show four counts on one ASIN.
+      //
+      // When the stored map assigns one ASIN to more SKUs than Amazon's own map
+      // allows, it is wrong by construction — so discard it and rebuild purely
+      // from fresh data. ONLY with fresh data: without it the stored map, poor
+      // as it is, beats having nothing, and wiping it would take the listing to
+      // qty 0 on every blocked cycle.
+      const _rebuildFromScratch = (() => {
+        if (!_canReconFromDta || !Object.keys(dta || {}).length) return false;
+        const allowed = {};
+        for (const a of Object.values(dta)) if (a) allowed[a] = (allowed[a] || 0) + 1;
+        const used = {};
+        for (const a of Object.values(skuToAsin)) if (a) used[a] = (used[a] || 0) + 1;
+        return Object.entries(used).some(([a, n]) => n > (allowed[a] || 0));
+      })();
+      if (_rebuildFromScratch) {
+        const _before = Object.keys(skuToAsin).length;
+        for (const k of Object.keys(skuToAsin)) delete skuToAsin[k];
+        console.warn(`[smartSync] stored map assigns more SKUs to an ASIN than Amazon does — ` +
+          `discarding all ${_before} stored mapping(s) and rebuilding from the fresh page`);
+      }
+
       // POISONED-MAP REPAIR (July 2026): stored skuToAsin was previously trusted
       // without question, and reconstruction only ran for SKUs that had NO entry.
       // So any wrong mapping written by the old buggy matcher (single-dim
