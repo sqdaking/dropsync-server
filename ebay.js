@@ -10473,6 +10473,7 @@ module.exports = async (req, res) => {
       // Reusable bulk applier — returns { ok:Set(sku), failed:[entries] }
       // SKUs whose stored aspects eBay now rejects, and the aspect names it
       // named. Repaired once per sync, then the writes are retried.
+      let _aspectMismatch = false;   // a 25013 group/item disagreement was seen
       const _aspect25129 = new Set();
       const _aspect25129Names = new Set();
 
@@ -10486,7 +10487,12 @@ module.exports = async (req, res) => {
         // Months"), not aspect names — useful for the log, but the repair snaps
         // every aspect with a known value set rather than trying to guess which
         // aspect holds them.
-        console.log(`[smartSync] 25129 repair: attempting ${skus.length} variant(s) — eBay refused value(s): ${[..._aspect25129Names].join(', ') || 'unnamed'}`);
+        console.log(`[smartSync] aspect repair: attempting ${skus.length} variant(s) — ` +
+          (_aspect25129Names.size
+            ? `eBay refused value(s): ${[..._aspect25129Names].join(', ')}`
+            : (_aspectMismatch
+                ? 'group and item variation specifics disagree (25013) — reconciling from the group'
+                : 'reason unnamed')));
         let categoryId = null;
         try {
           const anyOffer = offerMap[skus[0]]?.offerId;
@@ -10975,11 +10981,22 @@ module.exports = async (req, res) => {
               // this category. Nothing about the price is wrong — the listing
               // simply cannot be revised until its aspects are repaired, so
               // every sync fails until we fix them.
-              if ((resp.errors || []).some(e => e.errorId === 25129)) {
+              // 25013 needs the same repair as 25129 and was never getting it.
+              // "Variation Specifics provided does not match with the variation
+              // specifics of the variations on the item" means the group's
+              // values and the items' values have drifted apart — precisely what
+              // _repairAspects reconciles. Because the repair only ran on 25129,
+              // these listings failed identically on every sync with no attempt
+              // to fix them.
+              if ((resp.errors || []).some(e => e.errorId === 25129 || e.errorId === 25013)) {
                 _aspect25129.add(_u.sku);
+                // 25129 names the offending value ("custom values for Size");
+                // 25013 names nothing — it reports a group/item mismatch, which
+                // the repair reconciles from the group's own values.
                 for (const m of String(_emsg).matchAll(/custom values for ([^.".]+)/gi)) {
                   _aspect25129Names.add(m[1].trim());
                 }
+                if ((resp.errors || []).some(e => e.errorId === 25013)) _aspectMismatch = true;
               }
               console.warn(`[smartSync] ${label} ✗ ${(_u.sku||'').slice(-20)} ${_sc}: ${_emsg}`);
               failBySku.add(_u.sku);
