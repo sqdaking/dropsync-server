@@ -27,8 +27,14 @@ const STDOUT_CAP = parseInt(process.env.LOG_STDOUT_PER_SEC) || 200; // keep unde
 
 // Per-variant / high-frequency lines. At LOG_LEVEL=info these stay in the live
 // tail but don't get shipped to Railway — this is the bulk of the volume.
+// PRICE_TRACE=on promotes the per-variant lines to Railway's stdout. They are
+// the only place you can see which ASIN each SKU was priced from, which is what
+// every "all variants share one price" investigation needs — and hunting for it
+// in the live tail while a sync is running is impractical.
+const PRICE_TRACE = String(process.env.PRICE_TRACE || 'off').toLowerCase() === 'on';
+
 const NOISY = [
-  /\[smartSync\] \S+ asin=/,          // one line per variant
+  ...(PRICE_TRACE ? [] : [/\[smartSync\] \S+ asin=/]),   // one line per variant
   /→ ORPHAN qty=0/,
   /→ mapping corrected but no price/,
   /\[prefetchAsin\]/,
