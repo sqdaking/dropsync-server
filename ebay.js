@@ -10404,6 +10404,7 @@ module.exports = async (req, res) => {
         if (!categoryId) { console.warn('[smartSync] 25129 repair: no categoryId, skipping'); return 0; }
 
         let allowedBy = {};
+        const _variationalAspects = new Set();
         try {
           // Report what this call actually did. It was failing silently and
           // returning 0, which looked identical to "nothing needed fixing" —
@@ -10428,9 +10429,20 @@ module.exports = async (req, res) => {
             // refuse. Those aspects were never the problem.
             const mode = a.aspectConstraint?.aspectMode;
             const closed = mode === 'SELECTION_ONLY';
-            allowedBy[String(a.localizedAspectName).toLowerCase()] =
-              closed ? (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean)
-                     : [];     // free text: nothing to snap to
+            const vals = (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
+            const key = String(a.localizedAspectName).toLowerCase();
+            // FREE TEXT IS NOT FREE FOR VARIATIONS.
+            // The taxonomy reports Size as FREE_TEXT, yet the Inventory API
+            // refuses custom Size values on variation listings — 247 failures
+            // in one run said exactly that. eBay enforces the category's value
+            // set for aspects used as variation dimensions regardless of the
+            // mode it advertises.
+            //
+            // So keep the suggested values for aspects that CAN vary, and treat
+            // genuinely free-text aspects (Brand, Material) as unconstrained.
+            const variational = a.aspectConstraint?.aspectEnabledForVariations === true;
+            allowedBy[key] = (closed || variational) ? vals : [];
+            if (!closed && variational && vals.length) _variationalAspects.add(key);
           }
           console.log(`[smartSync] 25129 repair: category ${categoryId} defines ${Object.keys(allowedBy).length} aspect(s)`);
         } catch (e) {
@@ -10452,6 +10464,16 @@ module.exports = async (req, res) => {
         // Map both sides onto a canonical token instead, so direction stops
         // mattering.
         const SIZE_CANON = [
+          // Values taken from the real catalogue: 1X/2X/4X plus the long forms
+          // Amazon uses ("5X-Large", "6X-Large Big Tall"). Age and numeric sizes
+          // (2T, 5-6 Years, 20, 50) deliberately have no entry — there is no
+          // lettered equivalent, and inventing one would mis-size a garment.
+          ['xl',  ['1x','1xlarge','1x-large']],
+          ['2xl', ['2x','2xlarge','2x-large']],
+          ['3xl', ['3x','3xlarge','3x-large']],
+          ['4xl', ['4x','4xlarge','4x-large']],
+          ['5xl', ['5x','5xlarge','5x-large']],
+          ['6xl', ['6x','6xlarge','6x-large','6xlargebigtall']],
           ['3xs', ['3xs','xxxsmall','xxxs','triple x small']],
           ['2xs', ['2xs','xxsmall','xxs','double x small']],
           ['xs',  ['xs','xsmall','extra small','x small']],
