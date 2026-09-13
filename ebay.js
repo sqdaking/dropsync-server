@@ -3634,14 +3634,31 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
     // FIX: when color is a single-value skipped dim, scraper sets size as primary.
     // Try sVal as primary key, or swap primary/secondary.
     if (sVal) {
+      // "sVal|" collapses every pVal onto one price in the same way as "pVal|"
+      // above — correct only when the scraper made size the primary dimension
+      // AND there is genuinely nothing else varying. Require that the listing
+      // has no second dimension before trusting it.
       const swapped = `${sVal}|`;
-      if (comboAsin[swapped] || comboPrices[swapped]) return swapped;
+      const _noSecondDim = !pVal;
+      if (_noSecondDim && (comboAsin[swapped] || comboPrices[swapped])) return swapped;
       const swappedFull = `${sVal}|${pVal}`;
       if (comboAsin[swappedFull] || comboPrices[swappedFull]) return swappedFull;
     }
-    // FIX: try pVal-only key (single-dim listing where sVal is empty)
-    const pvOnly = `${pVal}|`;
-    if (comboAsin[pvOnly] || comboPrices[pvOnly]) return pvOnly;
+    // pVal-only key — ONLY when this variant genuinely has no second dimension.
+    //
+    // This is why every colour of the same size showed one price. On a
+    // colour × size listing, a variant like (White, 39in) whose exact combo was
+    // missing fell through to the key "White|" — and so did (Black, 39in),
+    // (Grey, 39in) and every other colour, all landing on the same price. The
+    // fallback exists for single-dimension listings where sVal is empty; with a
+    // real sVal present it is not a fallback, it is a wrong answer.
+    //
+    // Each ASIN has its own price. If the exact combination is not known, the
+    // honest result is no price — the caller turns that into qty 0.
+    if (!sVal) {
+      const pvOnly = `${pVal}|`;
+      if (comboAsin[pvOnly] || comboPrices[pvOnly]) return pvOnly;
+    }
     // FIX: fuzzy pVal match only for single-dim listings (sVal is empty)
     // NEVER fuzzy match when sVal is present — that would map phantom combos to wrong ASINs
     if (!sVal) {
