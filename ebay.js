@@ -10052,6 +10052,19 @@ module.exports = async (req, res) => {
         const _corrections = Object.keys(skuToAsin).filter(
           s => _storedSkuToAsin[s] && skuToAsin[s] && _storedSkuToAsin[s] !== skuToAsin[s]);
         for (const s2 of _corrections) _correctedSkus.add(s2);
+        // PERSIST THE CORRECTION.
+        // Without this the repair is thrown away at the end of every sync: the
+        // stored map stays poisoned, the next cycle re-derives it from scratch,
+        // and a listing can be "corrected" indefinitely without ever improving.
+        // Writing it back is what makes the fix stick.
+        if (_corrections.length && _cachePool && _canReconFromDta) {
+          _cachePool.query(
+            `UPDATE relay_state SET skutoasin = $2::jsonb, updated_at = NOW()
+              WHERE ebay_sku = $1`,
+            [normSku, JSON.stringify(skuToAsin)]
+          ).then(() => console.log(`[smartSync] saved ${_corrections.length} corrected mapping(s) — the stored map is no longer poisoned`))
+           .catch(e => console.warn('[smartSync] could not persist corrected mappings:', e.message));
+        }
         if (_corrections.length) {
           console.log(`[smartSync] CORRECTED ${_corrections.length} stored mappings: ` +
             _corrections.slice(0, 6).map(s =>
@@ -10505,7 +10518,18 @@ module.exports = async (req, res) => {
           for (const [sku, a] of Object.entries(skuToAsin)) {
             if (a && offerMap[sku]) (_useCount[a] = _useCount[a] || []).push(sku);
           }
-          const _dupZero = String(process.env.DUP_ASIN_ZERO || 'off').toLowerCase() === 'on';
+          // ZERO THE WHOLE UNVERIFIED GROUP, NOT "ALL BUT THE FIRST".
+          //
+          // The audit on a 100/300/500/1000 listing showed four SKUs on one
+          // ASIN, all at qty 3 — the 1000-count selling at the 100-count's
+          // price. Leaving them buyable is the one outcome that costs money, so
+          // this defaults to ON now.
+          //
+          // It zeroes EVERY member of an unverified group rather than keeping
+          // one: the survivor used to be whichever SKU came first, which is
+          // arbitrary and just as likely to be the mis-mapped one. When Amazon's
+          // own map confirms the duplicate, nothing is zeroed at all.
+          const _dupZero = String(process.env.DUP_ASIN_ZERO || 'on').toLowerCase() === 'on';
           let _unverified = 0;
           for (const [asin, skus] of Object.entries(_useCount)) {
             if (skus.length < 2) continue;
@@ -10529,7 +10553,7 @@ module.exports = async (req, res) => {
               `${allowed} combo(s) — ${skus.map(x => x.slice(-16)).join(', ')}` +
               `${_dupZero ? ' → zeroing all but the first' : ' (left as they are; fix is in the SKU→ASIN mapping)'}`);
             if (_dupZero) {
-              for (const sku of skus.slice(1)) {
+              for (const sku of skus) {
                 const u = updates.find(x => x.sku === sku);
                 if (u) { u.availableQuantity = 0; }
                 else updates.push({ sku, availableQuantity: 0,
