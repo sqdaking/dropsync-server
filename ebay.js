@@ -8940,6 +8940,18 @@ module.exports = async (req, res) => {
     if (action === 'auditListing') {
       const auditSku = String(req.query.sku || body.ebaySku || '').trim();
       if (!auditSku) return res.status(400).json({ error: 'pass ?sku=DS-…' });
+      // EBAY_API and the auth headers are built per-handler elsewhere in this
+      // file; this block sits outside those scopes, so build them here rather
+      // than referencing names that do not exist at this point.
+      const EBAY_API = getEbayUrls().EBAY_API;
+      const _tok = body.access_token || req.headers?.authorization?.replace(/^Bearer\s+/i, '');
+      if (!_tok) return res.status(400).json({ error: 'access_token required' });
+      const auth = {
+        'Authorization': `Bearer ${_tok}`,
+        'Content-Type': 'application/json',
+        'Content-Language': 'en-US',
+        'Accept-Language': 'en-US',
+      };
       const norm = auditSku.replace(/-[A-Z0-9]{5}$/i, '') || auditSku;
       try {
         const st = await _cachePool.query(
