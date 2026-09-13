@@ -10330,6 +10330,47 @@ module.exports = async (req, res) => {
         if (_zeroedUnmapped > 0) {
           console.log(`[smartSync] ${_zeroedUnmapped} variant(s) had no resolvable ASIN or price on a page that loaded → qty 0`);
         }
+        // ── ONE ASIN PER VARIANT, UNLESS AMAZON SAYS OTHERWISE ───────────────
+        // Every variant must be priced from its OWN ASIN. When several SKUs end
+        // up pointing at the same ASIN they all inherit one price — which is
+        // exactly the "each ASIN has its own price" problem.
+        //
+        // Duplicates are not always wrong: Amazon's dimensionToAsinMap does map
+        // several combos to one ASIN (a colour offered in a single size). So the
+        // FRESH map is the arbiter — if it confirms the duplicate, keep it; if
+        // it does not, the mapping is a guess and the variant goes to qty 0
+        // rather than selling at another variant's price.
+        {
+          const _freshDup = {};                     // asin → combos Amazon itself maps to it
+          for (const a of Object.values(dta || {})) {
+            if (a) _freshDup[a] = (_freshDup[a] || 0) + 1;
+          }
+          const _useCount = {};
+          for (const [sku, a] of Object.entries(skuToAsin)) {
+            if (a && offerMap[sku]) (_useCount[a] = _useCount[a] || []).push(sku);
+          }
+          let _unverified = 0;
+          for (const [asin, skus] of Object.entries(_useCount)) {
+            if (skus.length < 2) continue;
+            const allowed = _freshDup[asin] || 0;   // how many Amazon combos share it
+            if (skus.length <= allowed) continue;   // Amazon confirms the duplicate
+            // Keep the first, refuse the rest: we cannot tell which SKU the ASIN
+            // truly belongs to, and a wrong price is worse than no sale.
+            for (const sku of skus.slice(1)) {
+              const u = updates.find(x => x.sku === sku);
+              if (u) { u.availableQuantity = 0; }
+              else updates.push({ sku, availableQuantity: 0,
+                                  price: parseFloat(offerMap[sku]?.currentPrice) || undefined });
+              _unverified++;
+            }
+            console.warn(`[smartSync] ${skus.length} SKUs share ASIN ${asin} but Amazon maps it to ${allowed} combo(s) — ` +
+              `zeroing ${skus.length - 1}: ${skus.slice(1).map(x => x.slice(-16)).join(', ')}`);
+          }
+          if (_unverified) {
+            console.warn(`[smartSync] ${_unverified} variant(s) set to qty 0 — their ASIN is shared and unverified, so no price can be trusted`);
+          }
+        }
+
         const _anyPriced = updates.some(u => u.availableQuantity > 0);
         // THE PAGE LOADED AND NOTHING MATCHED.
         // The browser tells us whether it actually read the Amazon page. If it
