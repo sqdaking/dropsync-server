@@ -2662,21 +2662,23 @@ async function _scrapeAmazonProductImpl(inputUrl, preloadedHtml = null, clientAs
     //   <span data-asin="ASIN"...>$X.XX with N percent savings</span>
     // This is server-rendered and available without any extra fetches.
     // Also catches the "priceToPay" label pattern: "$X.XX with N percent savings"
-    const swatchAsinPrice = {}; // ASIN → price from HTML swatch accessibility labels
-    // Pattern: "data-asin=ASIN ... $X.XX with N percent savings" (server-rendered, no extra fetches)
-    const _swatchRe1 = /data-asin="([A-Z0-9]{10})"[\s\S]{0,800}?\$([\d.]+)\s+with\s+\d+\s*percent\s+savings/g;
-    for (const m of html.matchAll(_swatchRe1)) {
-      const p = parseFloat(m[2]);
-      if (p > 0 && p < 10000 && !swatchAsinPrice[m[1]]) swatchAsinPrice[m[1]] = p;
-    }
-    // Pattern 2: savings label appears before data-asin in DOM
-    const _swatchRe2 = /\$([\d.]+)\s+with\s+\d+\s*percent\s+savings[\s\S]{0,500}?data-asin="([A-Z0-9]{10})"/g;
-    for (const m of html.matchAll(_swatchRe2)) {
-      const p = parseFloat(m[1]);
-      if (p > 0 && p < 10000 && !swatchAsinPrice[m[2]]) swatchAsinPrice[m[2]] = p;
-    }
-    if (Object.keys(swatchAsinPrice).length)
-      console.log('[scraper] swatch prices: ' + Object.keys(swatchAsinPrice).length + ' ASINs from HTML');
+    // ── SWATCH PRICES: REMOVED ─────────────────────────────────────────────
+    // This pre-filled asinPrice for EVERY ASIN before the browser's real data
+    // was applied, and it was wrong twice over:
+    //
+    //  1. It paired an ASIN with any "$X with N percent savings" within 800
+    //     characters of it. That is proximity, not a mapping — on a variation
+    //     page one savings label sits near many swatch ASINs, so the same price
+    //     was handed to variant after variant. This is the "every ASIN gets the
+    //     same price" behaviour, produced server-side.
+    //  2. "$X with N percent savings" is the Subscribe & Save / coupon price,
+    //     which a buyer cannot get on a one-time purchase — the same bug fixed
+    //     in the browser extractor long ago.
+    //
+    // The identical patterns were removed from the browser's bulk extractor;
+    // this server copy survived and kept doing the damage. Prices now come only
+    // from per-ASIN data, where the price belongs to the ASIN it was read from.
+    const swatchAsinPrice = {};
 
     // baseInStock: what the main page currently shows for the selected variant
     const bbMain = (html.match(/id="availability"[\s\S]{0,3000}/)?.[0] || '')
