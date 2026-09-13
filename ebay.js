@@ -10366,9 +10366,6 @@ module.exports = async (req, res) => {
         // a verified price goes to zero, always. Accurate, and more brittle —
         // one bad fetch cycle empties the listing until the next good one.
         const _strictZero = String(process.env.STRICT_UNPRICED_ZERO || 'off').toLowerCase() === 'on';
-        if (_zeroedUnmapped > 0) {
-          console.log(`[smartSync] ${_zeroedUnmapped} variant(s) had no resolvable ASIN or price on a page that loaded → qty 0`);
-        }
         // ── ONE ASIN PER VARIANT, UNLESS AMAZON SAYS OTHERWISE ───────────────
         // Every variant must be priced from its OWN ASIN. When several SKUs end
         // up pointing at the same ASIN they all inherit one price — which is
@@ -11123,6 +11120,9 @@ module.exports = async (req, res) => {
           if (r1.failed.length) console.warn(`[smartSync] PHASE 1: ${r1.failed.length} zeroing calls failed — those variants may still be buyable`);
         } else {
           console.log(`[smartSync] PHASE 1 — nothing to zero (all variants already 0 or being set to 0)`);
+        }
+        if (_zeroedUnmapped > 0) {
+          console.log(`[smartSync] ${_zeroedUnmapped} variant(s) had no resolvable ASIN or price on a page that loaded → qty 0`);
         }
         if (_leftAlone.length > 0) {
           console.warn(`[smartSync] PHASE 1 left ${_leftAlone.length} variant(s) UNTOUCHED (still buyable) because ` +
