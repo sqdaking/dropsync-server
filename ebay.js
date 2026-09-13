@@ -8977,8 +8977,17 @@ module.exports = async (req, res) => {
           for (const row of cr.rows) {
             let d = row.data;
             if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = {}; } }
-            cached[row.asin] = { cost: d?.price ?? null, inStock: d?.inStock ?? null,
-                                 ageHours: Math.round(row.age_h * 10) / 10 };
+            // The sync prices from Amazon price PLUS shipping — shipping is part
+            // of what the item costs you. Reporting the bare price made every
+            // row look like a mismatch by a constant ~$1.23, which is the
+            // shipping, not an error.
+            cached[row.asin] = {
+              cost: d?.price ?? null,
+              ship: d?.shipping ?? 0,
+              landed: (d?.price ?? null) === null ? null : (d.price + (d.shipping || 0)),
+              inStock: d?.inStock ?? null,
+              ageHours: Math.round(row.age_h * 10) / 10,
+            };
           }
         }
         // Same arithmetic the sync uses, so "expected" and "live" are comparable.
@@ -9010,12 +9019,14 @@ module.exports = async (req, res) => {
         return res.json({
           listing: auditSku,
           variants: Object.entries(map).map(([sku, asin]) => {
-            const c = cached[asin]?.cost ?? null;
+            const c = cached[asin]?.landed ?? null;   // price + shipping, as the sync uses
             const exp = expected(c);
             const live = parseFloat(offers[sku]?.price ?? 0) || null;
             return {
               sku: sku.slice(-28), asin,
-              serverCost: c,
+              amazonPrice: cached[asin]?.cost ?? null,
+              shipping: cached[asin]?.ship ?? null,
+              serverCost: c,                       // what the markup is applied to
               cacheAgeH: cached[asin]?.ageHours ?? null,
               expectedPrice: exp ? +exp.toFixed(2) : null,
               ebayPrice: offers[sku]?.price ?? null,
@@ -10225,7 +10236,7 @@ module.exports = async (req, res) => {
           if (!asin) continue;
           const parts = String(idx).split('_');
           const dims = {};
-          _dimKeys.forEach((k, ki) => {
+          _authDimKeys.forEach((k, ki) => {
             const arr = vv2[k] || [];
             const val = arr[parseInt(parts[ki] ?? parts[0]) || 0];
             if (val) dims[_dimKeyOf(k)] = _canonVal(val);
@@ -10260,7 +10271,7 @@ module.exports = async (req, res) => {
         }
         if (_exactDimMatches || _dimAmbiguous) {
           console.log(`[smartSync] dimension match: ${_exactDimMatches} SKU(s) mapped by exact ` +
-            `${_dimKeys.map(_dimKeyOf).join(' + ')} agreement` +
+            `${_authDimKeys.map(_dimKeyOf).join(' + ')} agreement` +
             (_dimAmbiguous ? `, ${_dimAmbiguous} ambiguous (left unmapped → qty 0)` : ''));
         }
       }
