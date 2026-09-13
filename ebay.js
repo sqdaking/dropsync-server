@@ -8963,6 +8963,28 @@ module.exports = async (req, res) => {
         let combos = stored.comboasin || {};
         if (typeof combos === 'string') { try { combos = JSON.parse(combos); } catch (e) { combos = {}; } }
 
+        // What the SERVER holds for each ASIN. This is the number the sync
+        // actually prices from, and until now it was only visible in a log line
+        // that is suppressed by default — which is why every round of this has
+        // needed another diagnostic instead of just answering the question.
+        const cached = {};
+        const asinList = [...new Set(Object.values(map).filter(Boolean))];
+        if (asinList.length) {
+          const cr = await _cachePool.query(
+            `SELECT asin, data, fetched_at,
+                    EXTRACT(EPOCH FROM (NOW() - fetched_at))/3600 AS age_h
+               FROM asin_cache WHERE asin = ANY($1)`, [asinList]);
+          for (const row of cr.rows) {
+            let d = row.data;
+            if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = {}; } }
+            cached[row.asin] = { cost: d?.price ?? null, inStock: d?.inStock ?? null,
+                                 ageHours: Math.round(row.age_h * 10) / 10 };
+          }
+        }
+        // Same arithmetic the sync uses, so "expected" and "live" are comparable.
+        const _mk = parseFloat(body.markup ?? 35), _h = parseFloat(body.handling ?? 4), _fee = 13.35;
+        const expected = c => (c > 0 ? ((c * (1 + _mk / 100) + _h) / (1 - _fee / 100)) : null);
+
         // Live eBay prices for the same SKUs
         const offers = {};
         for (const sku of Object.keys(map)) {
@@ -8987,11 +9009,20 @@ module.exports = async (req, res) => {
 
         return res.json({
           listing: auditSku,
-          variants: Object.entries(map).map(([sku, asin]) => ({
-            sku: sku.slice(-28), asin,
-            ebayPrice: offers[sku]?.price ?? null,
-            qty: offers[sku]?.qty ?? null,
-          })),
+          variants: Object.entries(map).map(([sku, asin]) => {
+            const c = cached[asin]?.cost ?? null;
+            const exp = expected(c);
+            const live = parseFloat(offers[sku]?.price ?? 0) || null;
+            return {
+              sku: sku.slice(-28), asin,
+              serverCost: c,
+              cacheAgeH: cached[asin]?.ageHours ?? null,
+              expectedPrice: exp ? +exp.toFixed(2) : null,
+              ebayPrice: offers[sku]?.price ?? null,
+              qty: offers[sku]?.qty ?? null,
+              matches: (exp && live) ? (Math.abs(exp - live) < 0.05 ? 'yes' : 'NO') : '—',
+            };
+          }),
           sharedAsins:  sharedAsins.map(([asin, skus])  => ({ asin,  skus: skus.map(s => s.slice(-24)) })),
           sharedPrices: sharedPrices.map(([price, skus]) => ({ price, skus: skus.map(s => s.slice(-24)) })),
           comboKeys: Object.keys(combos).slice(0, 12),
@@ -10151,6 +10182,89 @@ module.exports = async (req, res) => {
       // Size) whenever the compound lookup missed, then OVERWROTE the correct
       // reconstruction match — smearing one size-ASIN's price across every
       // color ("14 corrected" in the logs = 14 smeared).
+      // ── AUTHORITATIVE MATCH: DIMENSION NAME + VALUE ───────────────────────
+      //
+      // Amazon varies products by whatever it likes — colour, size, fit type,
+      // pattern, style, scent, count, length, flavour, or three of them at
+      // once. Every slug-based approach has to guess how those values were
+      // concatenated into a SKU, and guessing is what produced every mapping
+      // bug in this file: prefix collisions (SET_OF_2 inside SET_OF_24), order
+      // permutations, single-value fallbacks matching every variant.
+      //
+      // There is no need to guess. Amazon tells us each ASIN's dimension VALUES,
+      // and eBay tells us each SKU's aspect VALUES. Match them by name and
+      // value and the answer is exact, whatever the dimensions happen to be and
+      // however many there are.
+      //
+      // A SKU is only assigned when exactly ONE ASIN agrees on every dimension.
+      // Ambiguity means no assignment, which means qty 0 — never a guess.
+      if (Object.keys(skuAspects).length > 0 && _canReconFromDta && Object.keys(vv2).length) {
+        // Amazon's dimension names and eBay's aspect names describe the same
+        // thing with different spellings: color_name / Color, size_name / Size,
+        // fit_type / Fit Type, number_of_items / Number of Items.
+        // Amazon writes fit_type, eBay writes "Fit Type"; Amazon writes
+        // color_name, eBay writes "Color". Strip the trailing name/type word
+        // AFTER normalising separators, or the two spellings never meet.
+        const _canonDim = n => String(n).toLowerCase()
+          .replace(/[_\s]+/g, ' ').trim()
+          .replace(/\s+(name|type)$/, '')
+          .replace(/^colour$/, 'color');
+        // Some eBay aspects are near-synonyms of Amazon's dimension names.
+        const _DIM_ALIAS = {
+          'number of items': 'item count', 'items per pack': 'item count',
+          'pack size': 'item count', 'count': 'item count', 'number of pieces': 'item count',
+          'fit': 'fit', 'shoe size': 'size', 'clothing size': 'size',
+          'scent': 'scent', 'flavour': 'flavor',
+        };
+        const _dimKeyOf = n => { const c = _canonDim(n); return _DIM_ALIAS[c] || c; };
+        const _canonVal = v => String(v).toLowerCase().replace(/[^a-z0-9]/g,'');
+
+        // asin → { canonical dim name: canonical value }
+        const _asinDims = {};
+        for (const [idx, asin] of Object.entries(dta)) {
+          if (!asin) continue;
+          const parts = String(idx).split('_');
+          const dims = {};
+          _dimKeys.forEach((k, ki) => {
+            const arr = vv2[k] || [];
+            const val = arr[parseInt(parts[ki] ?? parts[0]) || 0];
+            if (val) dims[_dimKeyOf(k)] = _canonVal(val);
+          });
+          if (Object.keys(dims).length) _asinDims[asin] = dims;
+        }
+
+        let _exactDimMatches = 0, _dimAmbiguous = 0;
+        for (const sku of Object.keys(offerMap)) {
+          const aspects = skuAspects[sku];
+          if (!aspects) continue;
+          // eBay aspects, canonicalised the same way. Extra aspects (Brand,
+          // Material, MPN) simply never appear in any ASIN's dimension set, so
+          // they are ignored rather than polluting the match.
+          const skuDims = {};
+          for (const [name, vals] of Object.entries(aspects)) {
+            const v = Array.isArray(vals) ? vals[0] : vals;
+            if (v) skuDims[_dimKeyOf(name)] = _canonVal(v);
+          }
+          const hits = [];
+          for (const [asin, dims] of Object.entries(_asinDims)) {
+            const names = Object.keys(dims);
+            // every dimension Amazon varies by must be present and equal
+            if (names.every(n => skuDims[n] !== undefined && skuDims[n] === dims[n])) hits.push(asin);
+          }
+          if (hits.length === 1) {
+            if (skuToAsin[sku] !== hits[0]) _exactDimMatches++;
+            skuToAsin[sku] = hits[0];
+          } else if (hits.length > 1) {
+            _dimAmbiguous++;
+          }
+        }
+        if (_exactDimMatches || _dimAmbiguous) {
+          console.log(`[smartSync] dimension match: ${_exactDimMatches} SKU(s) mapped by exact ` +
+            `${_dimKeys.map(_dimKeyOf).join(' + ')} agreement` +
+            (_dimAmbiguous ? `, ${_dimAmbiguous} ambiguous (left unmapped → qty 0)` : ''));
+        }
+      }
+
       if (Object.keys(skuAspects).length > 0 && _reqCompoundMap) {
         const _slug = _reqSlugFn;
         const _cMap = _reqCompoundMap;
