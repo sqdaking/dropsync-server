@@ -671,7 +671,7 @@ function calcPrice(cost, markup) {
   return Math.ceil(((c + handling) * (1 + m / 100) / (1 - ebayFee) + 0.30) * 100) / 100;
 }
 
-console.log('[dropsync] build 2026-09-01.2 (Shopify yields to eBay)');
+console.log('[dropsync] build 2026-09-02.1 (dogs page = qty 0, no hold)');
 
 // ── SHOPIFY (Morocco store) ──────────────────────────────────────────────────
 // Shares the Amazon side with eBay and NOTHING else. In particular it goes
@@ -2241,6 +2241,7 @@ async function prefetchAsinPrices(mainHtml, opts) {
 }
 
 async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
+  let _dogCount = 0;   // ASINs Amazon reports as gone this run
   if (!mainHtml) return {};
 
   // Extension returned full data — use it directly, no per-ASIN fetches needed
@@ -2497,11 +2498,30 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
       await Promise.all(batch.map(async asin => {
         try {
           const url = `https://www.amazon.com/dp/${asin}?th=1&psc=1`;
-          let html = null;
+          // Counts dogs pages for the summary below.
+          // (declared once per prefetch run — see _dogCount init above)
+          // Call the extension directly so the REASON survives. The helper
+          // returns HTML only, which discarded the one fact that matters here:
+          // whether Amazon answered "this product is gone" or we simply never
+          // reached it.
+          let html = null, _res = null;
           try {
-            const extHtml = await _fetchAmazonViaExtension(url);
-            if (extHtml && !isBlocked(extHtml)) html = extHtml;
+            _res = await window.dsExt?.fetchAmazon(url);
+            if (_res?.ok && _res.html && !isBlocked(_res.html)) html = _res.html;
           } catch(e) {}
+
+          // AMAZON SAYS THE PRODUCT IS GONE.
+          // A dogs page is an answer: this ASIN no longer resolves — a retired
+          // variant, a region-restricted item. Record it as "no price" so the
+          // variant goes to qty 0, instead of leaving it live on a stale price
+          // while we retry a page that will never come back. Normal catalogue
+          // churn, and it must not slow the run down.
+          if (_res && _res.dogPage) {
+            result[asin] = { price: 0, inStock: false, dogPage: true };
+            _dogCount++;
+            return;              // inside batch.map(async …) — not a loop body
+          }
+
           if (html) {
             const data = _browserExtractAsinData(html, asin);
             if (data) result[asin] = data;
@@ -2533,6 +2553,9 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   // reuse look like a failure — the other 67 are deliberately never fetched.
   const _scope = (Array.isArray(_opts.pinned) && _opts.pinned.length)
     ? _opts.pinned : uniqueAsins;
+  if (_dogCount > 0) {
+    console.log(`[prefetchAsin] ${_dogCount} ASIN(s) returned a "page not found" from Amazon → qty 0 (product gone, not a block)`);
+  }
   const _covered = _scope.filter(a => result[a]).length;
   const _missing = _scope.filter(a => !result[a] && !(_opts.skipFresh || []).includes(a));
   console.log(`[prefetchAsin] done: ${_covered + _skippedFresh}/${_scope.length} tracked ASINs have data ` +
