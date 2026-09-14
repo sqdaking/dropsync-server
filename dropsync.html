@@ -4643,6 +4643,7 @@ function renderProducts() {
       <div id="bulk-toolbar-top" style="display:none;padding:10px 16px;border-bottom:1px solid var(--border);background:rgba(99,102,241,.08);flex;align-items:center;gap:10px">
         <span id="bulk-count-top" style="font-size:12px;color:var(--text3);font-weight:600"></span>
         <button class="btn btn-primary btn-sm" onclick="smartSyncSelected()">🔄 Sync Selected</button>
+        <button class="btn btn-sm" onclick="auditSelected()" title="Check each variant: its ASIN, Amazon cost and the price live on eBay">🔍 Audit prices</button>
         <button class="btn btn-sm" style="background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.4);color:#4ade80;font-weight:600" onclick="bulkFixAndRevise()">🔧 Fix & Revise Selected</button>
         <button class="btn btn-sm" style="background:rgba(99,102,241,.2);border:1px solid rgba(99,102,241,.4);color:#818cf8;font-weight:600" onclick="bulkSetMarkupPrompt()">🏷 Set Markup</button>
         <button class="btn btn-sm" style="background:var(--red);color:#fff;border:none" onclick="bulkDelete()">🗑 Delete Selected</button>
@@ -4663,6 +4664,7 @@ function renderProducts() {
       <div id="bulk-toolbar" style="display:none;padding:10px 16px;border-top:1px solid var(--border);background:rgba(99,102,241,.08);display:flex;align-items:center;gap:10px">
         <span id="bulk-count" style="font-size:12px;color:var(--text3);font-weight:600"></span>
         <button class="btn btn-primary btn-sm" onclick="smartSyncSelected()">🔄 Sync Selected</button>
+        <button class="btn btn-sm" onclick="auditSelected()" title="Check each variant: its ASIN, Amazon cost and the price live on eBay">🔍 Audit prices</button>
         <button class="btn btn-sm" style="background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.4);color:#4ade80;font-weight:600" onclick="bulkFixAndRevise()">🔧 Fix & Revise Selected</button>
         <button class="btn btn-sm" style="background:rgba(99,102,241,.2);border:1px solid rgba(99,102,241,.4);color:#818cf8;font-weight:600" onclick="bulkSetMarkupPrompt()">🏷 Set Markup</button>
         <button class="btn btn-sm" style="background:var(--red);color:#fff;border:none" onclick="bulkDelete()">🗑 Delete Selected</button>
@@ -7924,6 +7926,95 @@ function showConfirmModal(title, bodyHtml, confirmLabel='Confirm', cancelLabel='
     overlay.onclick = e => { if (e.target === overlay) { overlay.remove(); resolve(false); } };
   });
 }
+
+// ── PRICE AUDIT ──────────────────────────────────────────────────────────────
+// Answers "is this listing priced correctly?" in one click, instead of the
+// console archaeology this used to take. For each variant it shows the ASIN it
+// is mapped to, what Amazon costs, what that implies, and what is actually live
+// on eBay — and names the fault when they disagree.
+async function auditSelected() {
+  const ids = (S._selectedIds instanceof Set) ? [...S._selectedIds] : [];
+  const picked = ids.length
+    ? (S.products || []).filter(p => ids.includes(p.id) && p.status === 'listed')
+    : [];
+  if (!picked.length) { toast('Select one listing first', 'warn'); return; }
+  if (picked.length > 1) { toast('Audit checks one listing at a time', 'warn'); return; }
+  const p = picked[0];
+
+  toast('Auditing ' + (p.title || p.ebaySku || '').slice(0, 40) + '…', 'info', 3000);
+  try {
+    const d = await fetch(S.serverUrl + '/api/ebay?action=auditListing&sku=' + encodeURIComponent(p.ebaySku), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ access_token: S.token, markup: amzMarkup(p), handling: amzHandling(p) }),
+    }).then(r => r.json());
+    if (d.error) { toast('Audit failed: ' + d.error, 'error', 6000); return; }
+    window.__audit = d;
+    showAuditModal(p, d);
+  } catch (e) {
+    toast('Audit failed: ' + e.message, 'error', 6000);
+  }
+}
+
+function showAuditModal(p, d) {
+  const rows = (d.variants || []).map(v => {
+    // Colour only where it means something: a mismatch, or an unpriced variant.
+    const bad  = v.matches === 'NO';
+    const none = v.serverCost === null;
+    return `<tr style="border-bottom:1px solid var(--border)${bad ? ';background:rgba(255,80,80,.08)' : ''}">
+      <td style="padding:5px 7px;font-family:monospace;font-size:11px">${v.sku}</td>
+      <td style="padding:5px 7px;font-family:monospace;font-size:11px">${v.asin || '—'}</td>
+      <td style="padding:5px 7px;text-align:right">${v.amazonPrice != null ? '$' + v.amazonPrice : '<span style="color:var(--text3)">no price</span>'}</td>
+      <td style="padding:5px 7px;text-align:right;color:var(--text3)">${v.shipping ? '+$' + v.shipping : ''}</td>
+      <td style="padding:5px 7px;text-align:right">${v.expectedPrice != null ? '$' + v.expectedPrice : '—'}</td>
+      <td style="padding:5px 7px;text-align:right;font-weight:600">${v.ebayPrice != null ? '$' + v.ebayPrice : '—'}</td>
+      <td style="padding:5px 7px;text-align:center">${v.qty ?? '—'}</td>
+      <td style="padding:5px 7px;text-align:center">${bad ? '⚠️' : (none ? '·' : '✓')}</td>
+    </tr>`;
+  }).join('');
+
+  const shared = (d.sharedAsins || []).length;
+  const banner = shared
+    ? `<div style="background:rgba(255,80,80,.12);border:1px solid var(--red);border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:12.5px">
+         <b>${shared} ASIN(s) shared by several variants.</b> Those variants can only ever show one price —
+         the SKU→ASIN mapping is wrong, not the price.
+       </div>`
+    : `<div style="background:rgba(80,200,120,.10);border:1px solid var(--border);border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:12.5px">
+         Every variant has its own ASIN.
+       </div>`;
+
+  const el = document.createElement('div');
+  el.className = 'modal-overlay';
+  el.innerHTML = `
+    <div class="modal" style="max-width:860px;width:94vw">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <h3 style="margin:0;flex:1;font-size:15px">Price audit — ${(p.title || '').slice(0, 60)}</h3>
+        <button onclick="this.closest('.modal-overlay').remove()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--text3)">✕</button>
+      </div>
+      <div style="font-size:11.5px;color:var(--text3);margin-bottom:8px">${d.verdict || ''}</div>
+      ${banner}
+      <div style="max-height:56vh;overflow:auto;border:1px solid var(--border);border-radius:8px">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="position:sticky;top:0;background:var(--bg2)">
+            <th style="padding:6px 7px;text-align:left">SKU</th>
+            <th style="padding:6px 7px;text-align:left">ASIN</th>
+            <th style="padding:6px 7px;text-align:right">Amazon</th>
+            <th style="padding:6px 7px;text-align:right">Ship</th>
+            <th style="padding:6px 7px;text-align:right">Expected</th>
+            <th style="padding:6px 7px;text-align:right">Live on eBay</th>
+            <th style="padding:6px 7px;text-align:center">Qty</th>
+            <th style="padding:6px 7px;text-align:center"></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn btn-sm" onclick="navigator.clipboard.writeText(JSON.stringify(window.__audit.variants,null,1)).then(()=>toast('Copied','success',2000))">Copy as text</button>
+        <button class="btn btn-sm" onclick="this.closest('.modal-overlay').remove()">Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+}
+window.auditSelected = auditSelected;
 
 async function smartSyncSelected() {
   // Selected products live in S._selectedIds (a Set) — not on a stale CSS class.
