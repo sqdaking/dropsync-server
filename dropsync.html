@@ -2377,7 +2377,16 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
   // fetch every variant regardless.
   let _freeOos = 0;
   try {
-    const H = (S.useParentOos === false) ? '' : (mainHtml || '');
+    // EVERY ASIN GETS ITS OWN FETCH — including ones the parent page calls
+    // out of stock. Those flags skipped the fetch entirely, so a listing with
+    // 25 tracked variants might only fetch 14 of them, and any variant Amazon
+    // had since restocked stayed at qty 0 until the flag changed. Opting out of
+    // a fetch is still a decision made from the parent page, which is the thing
+    // that has been wrong all along.
+    //
+    // S.useParentOos = true restores the shortcut if the fetch cost matters
+    // more than catching restocks.
+    const H = (S.useParentOos === true) ? (mainHtml || '') : '';
     for (const m of H.matchAll(/"defaultAsin"\s*:\s*"([A-Z0-9]{10})"[\s\S]{0,200}?"dimensionValueState"\s*:\s*"([A-Z_]+)"/g)) {
       const [, asin, state] = m;
       if (state !== 'AVAILABLE' && !result[asin] && uniqueAsins.includes(asin)) {
@@ -9479,7 +9488,26 @@ async function smartSyncProduct(p, _opts) {
         {
           const _seen = Object.values(_clientAsinData || {}).find(d => d && d.shipTo);
           if (_seen && S.requireUsDestination !== false) {
-            const _isUs = US_DEST_RE.test(_seen.shipTo) && !SHOPIFY_DEST_RE.test(_seen.shipTo);
+            // "Update location", "Select delivery location" or an empty slot
+            // means Amazon has NO location set for this session — not that it is
+            // quoting a foreign one. Signed-out amazon.com defaults to US
+            // pricing in that state, so refusing here blocked the entire
+            // catalogue over a session that was fine.
+            //
+            // Unknown is not the same as wrong: proceed, and nudge the location
+            // setter so the next cycle has it pinned explicitly.
+            const _unknownLoc = /update location|select .*location|choose .*location|deliver to\s*$/i
+              .test(_seen.shipTo) || !_seen.shipTo.trim();
+            if (_unknownLoc) {
+              if (!_locationFixTried && window.dsExt?.setAmazonLocation) {
+                _locationFixTried = true;
+                const zip = S.amazonUsZip || '10001';
+                console.log(`[smartSync] Amazon has no delivery location set — pinning US ${zip} for future cycles`);
+                window.dsExt.setAmazonLocation({ zip }).catch(() => {});
+              }
+            }
+            const _isUs = _unknownLoc
+              || (US_DEST_RE.test(_seen.shipTo) && !SHOPIFY_DEST_RE.test(_seen.shipTo));
             if (!_isUs) {
               // Fix it rather than just complain. Amazon geolocates by IP, so a
               // Moroccan connection keeps defaulting the session to Morocco —
