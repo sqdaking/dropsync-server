@@ -9662,6 +9662,11 @@ module.exports = async (req, res) => {
       if (!_dimOrder.length && Array.isArray(body.fallbackVariations) && body.fallbackVariations.length > 0) {
         _dimOrder = body.fallbackVariations.map(v => String(v.name||'').toLowerCase().replace(/\s+/g, '_')).filter(Boolean);
       }
+      // Mappings this cycle can prove from Amazon's own data. Anything not in
+      // here was inferred from how a SKU string looks.
+      const _authoritative = new Set();
+      const _strictMapping = String(process.env.STRICT_MAPPING || 'on').toLowerCase() !== 'off';
+
       const _authDimKeys = (_dimOrder.length ? _dimOrder : Object.keys(vv2))
         .filter(k => Array.isArray(vv2[k]) && vv2[k].length > 0);
       // Multi-dimension listing (e.g. color + size)? On these, matching a SKU
@@ -9970,6 +9975,7 @@ module.exports = async (req, res) => {
           for (const sku of Object.keys(offerMap)) {
             const truth = _exactSkuMap[sku];
             if (!truth) continue;                       // no exact evidence
+            _authoritative.add(sku);
             if (skuToAsin[sku] && skuToAsin[sku] !== truth) {
               _wrong.push(`${sku.slice(-22)} ${skuToAsin[sku]}→${truth}`);
               skuToAsin[sku] = truth;
@@ -10034,6 +10040,7 @@ module.exports = async (req, res) => {
           // Handles hashed/truncated SKUs with zero ambiguity.
           if (_exactSkuMap[sku]) {
             skuToAsin[sku] = _exactSkuMap[sku];
+            _authoritative.add(sku);            // regenerated from Amazon's own combo
             _reconHits++; _exactHits++;
             continue;
           }
@@ -10115,6 +10122,27 @@ module.exports = async (req, res) => {
           }
         }
 
+        // ── DROP INFERRED MAPPINGS ───────────────────────────────────────────
+        // Only mappings Amazon's own data can prove survive. An inferred one is
+        // how a variant ends up priced from another variant's ASIN, and that
+        // costs real money; an unmapped variant just sits at qty 0 until the
+        // next cycle can place it.
+        //
+        // Only applied when we HAVE fresh Amazon data — with a blocked page
+        // nothing could be proven and the whole listing would go unbuyable.
+        if (_strictMapping && _canReconFromDta) {
+          const _dropped = [];
+          for (const sku of Object.keys(skuToAsin)) {
+            if (!_authoritative.has(sku)) { _dropped.push(sku); delete skuToAsin[sku]; }
+          }
+          if (_dropped.length) {
+            console.warn(`[smartSync] strict mapping: dropped ${_dropped.length} inferred mapping(s) — ` +
+              `only Amazon-confirmed ASINs are priced; these go qty 0: ` +
+              _dropped.slice(0, 5).map(x => x.slice(-18)).join(', ') + (_dropped.length > 5 ? '…' : ''));
+          }
+          console.log(`[smartSync] strict mapping: ${_authoritative.size}/${Object.keys(offerMap).length} variant(s) confirmed by Amazon`);
+        }
+
         // Show exactly what the fresh map changed vs what was stored — this is
         // how you confirm a poisoned listing has actually been repaired.
         const _corrections = Object.keys(skuToAsin).filter(
@@ -10193,6 +10221,25 @@ module.exports = async (req, res) => {
       // Size) whenever the compound lookup missed, then OVERWROTE the correct
       // reconstruction match — smearing one size-ASIN's price across every
       // color ("14 corrected" in the logs = 14 smeared).
+      // ── STRICT MAPPING ────────────────────────────────────────────────────
+      // Two sources are allowed to decide which ASIN a SKU is:
+      //
+      //   1. the SKU regenerated from Amazon's own combination (exact match)
+      //   2. dimension name + value agreement with Amazon's variant map
+      //
+      // Both are copies of what Amazon published. Everything else in this file
+      // — compound slug permutations, primary-only keys, single-value
+      // fallbacks, fuzzy suffix matching — INFERS a mapping from how a SKU
+      // string looks, and every one of them has produced a variant priced from
+      // another variant's ASIN. A wrong price is a real loss; an unpriced
+      // variant is a missed sale. They are not the same size of mistake.
+      //
+      // So under strict mapping the inferred sources are not consulted at all.
+      // A SKU that neither authoritative source can place stays unmapped, which
+      // means qty 0 until Amazon's data can place it.
+      //
+      // STRICT_MAPPING=off restores the old inference chain.
+
       // ── AUTHORITATIVE MATCH: DIMENSION NAME + VALUE ───────────────────────
       //
       // Amazon varies products by whatever it likes — colour, size, fit type,
@@ -10265,6 +10312,7 @@ module.exports = async (req, res) => {
           if (hits.length === 1) {
             if (skuToAsin[sku] !== hits[0]) _exactDimMatches++;
             skuToAsin[sku] = hits[0];
+            _authoritative.add(sku);            // Amazon's dimensions agree
           } else if (hits.length > 1) {
             _dimAmbiguous++;
           }
@@ -10276,7 +10324,7 @@ module.exports = async (req, res) => {
         }
       }
 
-      if (Object.keys(skuAspects).length > 0 && _reqCompoundMap) {
+      if (!_strictMapping && Object.keys(skuAspects).length > 0 && _reqCompoundMap) {
         const _slug = _reqSlugFn;
         const _cMap = _reqCompoundMap;
         const _sMap = _reqSingleMap || {};
