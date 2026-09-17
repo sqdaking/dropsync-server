@@ -9683,6 +9683,15 @@ async function smartSyncProduct(p, _opts) {
     if (d && d.success !== false && !d.skipped) {
       p.lastSyncedAt = new Date().toISOString();
       p.lastSynced = p.lastSyncedAt;
+      // The "⏰ revise due" badge is rendered from p.lastSynced, so updating the
+      // value is not enough — the row has to be redrawn or it keeps showing the
+      // old state until something else happens to trigger a render.
+      // Only when the listings table is actually on screen — checking for the
+      // element is reliable, whereas the tab-state variable this first used
+      // does not exist.
+      try {
+        if (document.getElementById('prod-list') && typeof renderProducts === 'function') renderProducts();
+      } catch (e) {}
     }
     markDirty(p.id); save();
 
