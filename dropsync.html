@@ -2084,13 +2084,18 @@ function _browserExtractAsinData(html, expectedAsin) {
     /free\s+prime\s+delivery/i.test(section)
   );
   if (!isFree) {
+    // Amazon writes the delivery charge several ways, and the list was missing
+    // the commonest: "$5.99 delivery Thursday, 11 September". Only "$X shipping"
+    // was matched, so most paid-delivery items came back as free — the charge is
+    // part of what the item costs you, so missing it under-prices the listing.
     const shipPats = [
       /"deliveryPrice"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
       /"shippingCost"\s*:\s*\{"amount"\s*:\s*([\d.]+)/,
+      /"shippingCharge"\s*:\s*([\d.]+)/,
       /\+\s*\$([\d,]+\.?\d*)\s+(?:shipping|delivery)/i,
-      /\$([\d,]+\.?\d*)\s+shipping/i,
-      /shipping[:\s]+\$([\d,]+\.?\d*)/i,
-      /Delivery:\s*\$([\d,]+\.?\d*)/i,
+      /\$([\d,]+\.?\d*)\s+(?:shipping|delivery)\b/i,     // "$5.99 delivery Thursday"
+      /(?:shipping|delivery)[:\s]+\$([\d,]+\.?\d*)/i,      // "Delivery: $5.99"
+      /\$([\d,]+\.?\d*)\s+to\s+ship/i,
     ];
     for (const p of shipPats) {
       const m = (section || html).match(p);
