@@ -2616,10 +2616,20 @@ async function _legacyPrefetchAsinPrices(mainHtml, _rotOpts) {
     (_scope.length !== uniqueAsins.length ? `; ${uniqueAsins.length - _scope.length} parent variants not tracked` : '') +
     `)`);
   if (_missing.length > 0) {
-    // These are FETCH failures (blocked, timed out, no HTML). They say nothing
-    // about the product, so they are left for the next cycle rather than
-    // zeroed — zeroing on a bad fetch cycle would wipe live inventory.
-    console.warn(`[prefetchAsin] ${_missing.length} tracked ASIN(s) could not be FETCHED (blocked/failed) — left untouched, retried next cycle: ${_missing.slice(0,10).join(', ')}`);
+    // NO PRICE MEANS NO SALE.
+    // These ASINs could not be fetched, so we do not know what they cost. They
+    // were previously left alone on the theory that a transient block should
+    // not disturb live inventory — but "left alone" means the variant keeps
+    // selling at whatever price it had, which is exactly the unverified state
+    // that has been costing money.
+    //
+    // They are marked unpriced, which makes them qty 0. The whole-listing
+    // safeguard still applies on the server: if NOTHING could be fetched the
+    // listing is left untouched, so a total outage cannot empty a catalogue.
+    for (const a of _missing) {
+      if (!result[a]) result[a] = { price: 0, inStock: false, fetchFailed: true };
+    }
+    console.warn(`[prefetchAsin] ${_missing.length} tracked ASIN(s) could not be FETCHED — set qty 0 (no verified price), retried next cycle: ${_missing.slice(0,10).join(', ')}`);
   }
   const _noPrice = _scope.filter(a => result[a]?.noPrice).length;
   if (_noPrice > 0) {
@@ -4647,6 +4657,7 @@ function renderProducts() {
             <option value="price_low" ${_listedSort==='price_low'?'selected':''}>💰 Price ↑</option>
             <option value="synced" ${_listedSort==='synced'?'selected':''}>🔄 Sync Due</option>
           </select>
+          <button class="btn btn-sm" onclick="auditSelected()" title="Tick one listing, then check every variant: its ASIN, Amazon cost, and the price live on eBay">🔍 Audit prices</button>
           <input class="input" id="prod-search" placeholder="Search…" style="width:140px;font-size:12px" oninput="filterProducts()">
           <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text3);cursor:pointer;white-space:nowrap">
             <input type="checkbox" id="chk-select-all" onchange="toggleSelectAll(this.checked)" style="width:14px;height:14px;accent-color:var(--accent)">
