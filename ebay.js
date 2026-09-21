@@ -7363,10 +7363,18 @@ module.exports = async (req, res) => {
       // in this file does. (The acct() helper lives in other modules, not here,
       // which is why this threw "acct is not defined".)
       const acctId = await _resolveEbayAccountId(body.access_token, body.accountId || req.query.account);
-      const out = { account: acctId };
+      // TWO BUCKETS. The tab's product loader calls /api/products without an
+      // account, so the server files and serves those rows under "default" —
+      // while the token resolves to the real account name. Purging only the
+      // resolved account deleted nothing the tab could see, which is why the
+      // listings kept reappearing. A full wipe clears both.
+      const accounts = body.everything === true
+        ? [...new Set([acctId, 'default', ...(Array.isArray(body.accounts) ? body.accounts : [])])]
+        : [acctId];
+      const out = { accounts };
       try {
         const r1 = await _cachePool.query(
-          `DELETE FROM relay_state WHERE account_id = $1`, [acctId]);
+          `DELETE FROM relay_state WHERE account_id = ANY($1)`, [accounts]);
         out.relayState = r1.rowCount;
 
         if (body.keepProducts !== true) {
@@ -7374,8 +7382,8 @@ module.exports = async (req, res) => {
           // clean slate. The default only removes listed rows, so drafts you
           // may still want are not swept away by accident.
           const r2 = body.everything === true
-            ? await _cachePool.query(`DELETE FROM products WHERE account_id = $1`, [acctId])
-            : await _cachePool.query(`DELETE FROM products WHERE account_id = $1 AND status = 'listed'`, [acctId]);
+            ? await _cachePool.query(`DELETE FROM products WHERE account_id = ANY($1)`, [accounts])
+            : await _cachePool.query(`DELETE FROM products WHERE account_id = ANY($1) AND status = 'listed'`, [accounts]);
           out.products = r2.rowCount;
           out.scope = body.everything === true ? 'all statuses' : 'listed only';
         } else out.products = 'kept';
