@@ -7283,14 +7283,15 @@ module.exports = async (req, res) => {
     //
     // DESTRUCTIVE and not reversible, so it requires confirm:"DELETE" in the
     // body rather than a bare call, and it reports what it removed.
-    // ── WIPE EBAY INVENTORY RECORDS ────────────────────────────────────────
-    // Ending a listing does not delete its inventory item, offer or item group.
-    // Those survive on eBay carrying the old images, aspects and prices, count
-    // toward your inventory, and a push that ever reuses a SKU inherits them.
-    // A genuinely fresh re-import needs them gone.
+    // ── WIPE EBAY INVENTORY RECORDS (BATCHED) ──────────────────────────────
+    // Ending a listing does not delete its inventory item, offer or group, so
+    // those survive on eBay carrying old images and prices.
     //
-    // Only DropSync's own SKUs (DS-…) are touched. Dry run unless
-    // confirm:"DELETE" is passed.
+    // Batched because doing the whole inventory in one request ran past
+    // Railway's gateway timeout (502 "upstream error"). Each call handles one
+    // page of up to 100 SKUs and returns nextOffset; the caller loops. Only
+    // DropSync SKUs (DS-…) are touched, and nothing is deleted without
+    // confirm:"DELETE".
     if (action === 'wipe_ebay_inventory') {
       const EBAY_API = getEbayUrls().EBAY_API;
       const _tok = body.access_token;
@@ -7298,56 +7299,54 @@ module.exports = async (req, res) => {
       const auth = { 'Authorization': `Bearer ${_tok}`, 'Content-Type': 'application/json',
                      'Content-Language': 'en-US', 'Accept-Language': 'en-US' };
       const live = String(body.confirm) === 'DELETE';
-      const out = { mode: live ? 'DELETE' : 'dry run', items: 0, offers: 0, groups: 0, failed: 0, sample: [] };
+      // When deleting, always read page 0: deleted items drop out of the list,
+      // so advancing the offset would skip the ones that shifted into place.
+      const offset = Math.max(0, parseInt(body.offset) || 0);
+      const out = { mode: live ? 'DELETE' : 'dry run', offset, seen: 0, dsSkus: 0,
+                    offers: 0, items: 0, groups: 0, failed: 0 };
       try {
-        // 1. collect every DS- inventory item
-        const skus = [];
-        for (let offset = 0; offset < 50000; offset += 100) {
-          const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?limit=100&offset=${offset}`, { headers: auth });
-          if (!r.ok) break;
-          const d = await r.json().catch(() => ({}));
-          const batch = (d.inventoryItems || []).map(x => x.sku).filter(x => /^DS-/i.test(x));
-          skus.push(...batch);
-          if (!d.inventoryItems || d.inventoryItems.length < 100) break;
-          await sleep(150);
-        }
-        out.items = skus.length;
-        out.sample = skus.slice(0, 5);
-        const groups = new Set(skus.map(x => x.replace(/-[^-]+$/, '')).filter(g => /^DS-\d+-[A-Z0-9]+$/i.test(g)));
-        out.groups = groups.size;
-        if (!live) {
-          return res.json({ success: true, ...out,
-            note: 'Nothing deleted. Pass confirm:"DELETE" to remove these offers, items and groups.' });
-        }
+        const r = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?limit=100&offset=${offset}`, { headers: auth });
+        if (!r.ok) return res.status(502).json({ error: `eBay inventory list HTTP ${r.status}`, ...out });
+        const d = await r.json().catch(() => ({}));
+        const page = d.inventoryItems || [];
+        out.seen = page.length;
+        out.total = d.total ?? null;
+        const skus = page.map(x => x.sku).filter(x => /^DS-/i.test(x));
+        out.dsSkus = skus.length;
+        out.sample = skus.slice(0, 3);
 
-        // 2. offers first — an item with a live offer cannot be deleted
-        for (const sku of skus) {
-          const r = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth });
-          const d = r.ok ? await r.json().catch(() => ({})) : {};
-          for (const o of (d.offers || [])) {
-            const x = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${o.offerId}`, { method: 'DELETE', headers: auth });
-            if (x.ok || x.status === 204 || x.status === 404) out.offers++; else out.failed++;
-            await sleep(80);
+        if (live) {
+          for (const sku of skus) {
+            const or = await fetch(`${EBAY_API}/sell/inventory/v1/offer?sku=${encodeURIComponent(sku)}`, { headers: auth });
+            const od = or.ok ? await or.json().catch(() => ({})) : {};
+            for (const o of (od.offers || [])) {
+              const x = await fetch(`${EBAY_API}/sell/inventory/v1/offer/${o.offerId}`, { method: 'DELETE', headers: auth });
+              if (x.ok || x.status === 204 || x.status === 404) out.offers++; else out.failed++;
+            }
+          }
+          const groups = new Set(skus.map(x => x.replace(/-[^-]+$/, ''))
+                                     .filter(g => /^DS-\d+-[A-Z0-9]+$/i.test(g)));
+          for (const g of groups) {
+            const x = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(g)}`,
+              { method: 'DELETE', headers: auth }).catch(() => null);
+            if (x && (x.ok || x.status === 204 || x.status === 404)) out.groups++;
+          }
+          for (const sku of skus) {
+            const x = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`,
+              { method: 'DELETE', headers: auth });
+            if (x.ok || x.status === 204 || x.status === 404) out.items++; else out.failed++;
           }
         }
-        // 3. groups, then 4. items
-        for (const g of groups) {
-          await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(g)}`,
-            { method: 'DELETE', headers: auth }).catch(() => {});
-          await sleep(80);
-        }
-        let itemsDeleted = 0;
-        for (const sku of skus) {
-          const x = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(sku)}`,
-            { method: 'DELETE', headers: auth });
-          if (x.ok || x.status === 204 || x.status === 404) itemsDeleted++; else out.failed++;
-          await sleep(80);
-        }
-        out.itemsDeleted = itemsDeleted;
-        console.warn(`[wipe] eBay inventory: ${JSON.stringify(out)}`);
+        // Done when the page came back short, or when deleting found no DS SKUs
+        // left on the first page.
+        // Deleted items vanish from the list, so the next page starts sooner by
+        // exactly the number removed. Anything left on this page — non-DropSync
+        // inventory, or a delete that failed — stays, and is skipped past.
+        out.done = page.length < 100;
+        out.nextOffset = live ? offset + (page.length - out.items) : offset + page.length;
         return res.json({ success: true, ...out });
       } catch (e) {
-        return res.status(500).json({ error: e.message, partial: out });
+        return res.status(500).json({ error: e.message, ...out });
       }
     }
 
