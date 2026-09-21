@@ -7276,6 +7276,54 @@ module.exports = async (req, res) => {
     // Wipe stored SKU→ASIN maps so the next sync rebuilds them from a fresh
     // Amazon page. Use when a listing keeps re-pushing the same wrong price:
     //   {"ebaySku":"DS-...", "clearComboAsin":true}   or   {"all":true}
+    // ── PURGE A CATALOGUE ──────────────────────────────────────────────────
+    // For starting over: after ending every listing on eBay, the stored state
+    // describes listings that no longer exist. Leaving it behind means new
+    // pushes inherit old mappings, offer IDs and cached prices.
+    //
+    // DESTRUCTIVE and not reversible, so it requires confirm:"DELETE" in the
+    // body rather than a bare call, and it reports what it removed.
+    if (action === 'purge_listings') {
+      if (String(body.confirm) !== 'DELETE') {
+        return res.status(400).json({
+          error: 'pass confirm:"DELETE" — this removes stored listing state permanently',
+          willDelete: ['relay_state (SKU→ASIN maps, offer IDs, sync history)',
+                       'products rows marked listed (optional: keepProducts:true to keep them)',
+                       'asin_cache (optional: keepPrices:true to keep fetched prices)'],
+        });
+      }
+      const acctId = acct(req);
+      const out = {};
+      try {
+        const r1 = await _cachePool.query(
+          `DELETE FROM relay_state WHERE account_id = $1`, [acctId]);
+        out.relayState = r1.rowCount;
+
+        if (body.keepProducts !== true) {
+          // everything:true removes drafts and blocked/ended rows too — a true
+          // clean slate. The default only removes listed rows, so drafts you
+          // may still want are not swept away by accident.
+          const r2 = body.everything === true
+            ? await _cachePool.query(`DELETE FROM products WHERE account_id = $1`, [acctId])
+            : await _cachePool.query(`DELETE FROM products WHERE account_id = $1 AND status = 'listed'`, [acctId]);
+          out.products = r2.rowCount;
+          out.scope = body.everything === true ? 'all statuses' : 'listed only';
+        } else out.products = 'kept';
+
+        // The price cache is shared across listings and costs a fetch to
+        // rebuild, so it is kept unless asked otherwise.
+        if (body.clearPrices === true || body.everything === true) {
+          const r3 = await _cachePool.query(`DELETE FROM asin_cache`);
+          out.asinCache = r3.rowCount;
+        } else out.asinCache = 'kept (pass clearPrices:true to clear)';
+
+        console.warn(`[purge] account ${acctId}: ${JSON.stringify(out)}`);
+        return res.json({ success: true, account: acctId, deleted: out });
+      } catch (e) {
+        return res.status(500).json({ error: e.message, partial: out });
+      }
+    }
+
     if (action === 'reset_variant_maps') {
       if (!_cachePool) return res.status(500).json({ error: 'DB not ready' });
       try {
