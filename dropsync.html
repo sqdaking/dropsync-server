@@ -5648,6 +5648,7 @@ Confirm?`);
   const btn = document.querySelector('[onclick="deleteAllListed()"]');
   const origHtml = btn?.innerHTML || '🗑 Delete All';
   let done = 0, errors = 0, stopped = false;
+  const _failedEnds = [];
   if (btn) {
     btn.disabled = false;
     btn.innerHTML = `⏹ Stop  0/${listed.length}`;
@@ -5658,24 +5659,42 @@ Confirm?`);
     if (stopped) break;
     if (btn) btn.innerHTML = `⏹ Stop  ${done}/${listed.length}`;
 
-    try {
-      // End the eBay listing first
-      if (p.ebaySku) {
-        await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
+    // END ON EBAY, AND ONLY FORGET THE LISTING IF EBAY CONFIRMS IT.
+    //
+    // This used to swallow every error and then delete the local record
+    // "regardless". Any listing eBay refused to end — a rate limit, a 25604, a
+    // bad SKU — stayed LIVE and selling, while DropSync lost the only record
+    // that could ever sync or end it. And because errors were swallowed, the
+    // counter stayed at zero and the toast reported success either way.
+    let ended = !p.ebaySku;          // nothing on eBay to end
+    let why = '';
+    if (p.ebaySku) {
+      try {
+        const r = await fetch(`${S.serverUrl}/api/ebay?action=endListing`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             access_token: token,
             ebaySku: normaliseGroupSku(p.ebaySku),
             ebayListingId: p.ebayListingId || '',
           }),
-        }).catch(() => {});
-      }
-    } catch(e) { errors++; }
+        });
+        const d = await r.json().catch(() => ({}));
+        // Already-ended counts as ended: the goal is "not live", not "we did it".
+        ended = r.ok && (d.success !== false ||
+                /already|not found|ended|no longer/i.test(String(d.error || '')));
+        if (!ended) why = d.error || `HTTP ${r.status}`;
+      } catch (e) { why = e.message; }
+    }
 
-    // Remove from DropSync regardless
-    S.products = (S.products||[]).filter(x => x.id !== p.id);
-    await deleteProductFromRailway(p.id);
-    done++;
+    if (ended) {
+      S.products = (S.products||[]).filter(x => x.id !== p.id);
+      await deleteProductFromRailway(p.id);
+      done++;
+    } else {
+      // Keep it, so it can be retried and is never silently orphaned live.
+      errors++;
+      _failedEnds.push({ sku: p.ebaySku, title: (p.title || '').slice(0, 50), why });
+    }
     await new Promise(r => setTimeout(r, 200)); // brief pause between eBay API calls
   }
 
@@ -5685,9 +5704,14 @@ Confirm?`);
     btn.innerHTML = origHtml;
     btn.onclick = () => deleteAllListed();
   }
+  if (_failedEnds.length) {
+    console.warn(`[deleteAll] ${_failedEnds.length} listing(s) could NOT be ended on eBay and were KEPT in DropSync:`);
+    console.table(_failedEnds);
+    window.__failedEnds = _failedEnds;
+  }
   const msg = stopped
-    ? `Stopped after ${done} products (${errors} errors)`
-    : `Deleted ${done} products + ended eBay listings${errors ? ` (${errors} errors)` : ''}`;
+    ? `Stopped after ${done} products (${errors} could not be ended — kept)`
+    : `Ended and removed ${done}` + (errors ? ` · ${errors} could not be ended on eBay — kept so they can be retried` : '');
   toast(`🗑 ${msg}`, errors ? 'warn' : 'success', 5000);
   addLog(errors ? 'warn' : 'info', 'Delete All done', msg, {});
 }
