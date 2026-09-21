@@ -7359,8 +7359,11 @@ module.exports = async (req, res) => {
                        'asin_cache (optional: keepPrices:true to keep fetched prices)'],
         });
       }
-      const acctId = acct(req);
-      const out = {};
+      // Resolve the account from the token — the same way every other handler
+      // in this file does. (The acct() helper lives in other modules, not here,
+      // which is why this threw "acct is not defined".)
+      const acctId = await _resolveEbayAccountId(body.access_token, body.accountId || req.query.account);
+      const out = { account: acctId };
       try {
         const r1 = await _cachePool.query(
           `DELETE FROM relay_state WHERE account_id = $1`, [acctId]);
