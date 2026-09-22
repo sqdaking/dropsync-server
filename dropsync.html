@@ -3194,6 +3194,20 @@ function bulkSaveState() {
   try { localStorage.setItem('ds_bulk', JSON.stringify({ usedAsins: [...BULK.usedAsins] })); } catch {}
 }
 
+// Forget every ASIN bulk import has seen. This history is deliberately separate
+// from the product list — it stops previously-imported items being offered
+// again — so purging the catalogue does not clear it, and a fresh start would
+// otherwise report thousands "already owned" with nothing in the catalogue.
+function resetUsedAsins() {
+  const n = BULK.usedAsins.size;
+  BULK.usedAsins = new Set();
+  try { localStorage.removeItem('ds_bulk'); } catch {}
+  console.log(`[bulk] cleared ${n} remembered ASIN(s) — bulk import will offer everything again`);
+  if (typeof toast === 'function') toast(`Cleared ${n} remembered ASINs`, 'success', 4000);
+  return n;
+}
+window.resetUsedAsins = resetUsedAsins;
+
 // Department config — labels, emojis, descriptions
 const BULK_DEPTS = [
   { id:'all',            label:'All Depts',         emoji:'🔀', desc:'Mix of all categories' },
@@ -4038,7 +4052,10 @@ async function bulkFetchDeals(dept) {
             // treats both as a fetch failure, leaving the listing live on old
             // prices. The second case is a real answer and must zero the
             // listing.
-            parentLoaded: _parentLoaded === true,
+            // In this path the page is held in _pageHtml — _parentLoaded is a
+            // local of smartSyncProduct and does not exist here, which is what
+            // threw "_parentLoaded is not defined" during import.
+            parentLoaded: !!(_pageHtml && _pageHtml.length > 5000),
           })
         });
         const sd = await safeJson(sr);
