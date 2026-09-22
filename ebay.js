@@ -6190,6 +6190,20 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
             (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
         }
         const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+        // eBay reports Size as FREE_TEXT yet still enforces the category's value
+        // list on VARIATION listings — which is why publish kept failing with
+        // "custom values refused for: Size" while nothing was ever snapped. The
+        // sync path already accounts for this; the push path did not, so the
+        // same listing failed on import and could only be fixed after the fact.
+        const _named2 = named.map(n => String(n).toLowerCase());
+        for (const a of (catAsp?.aspects || [])) {
+          const key = String(a.localizedAspectName).toLowerCase();
+          const variational = a.aspectConstraint?.aspectEnabledForVariations === true;
+          const vals = (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
+          // Only widen the aspects eBay actually complained about, so this
+          // cannot change behaviour for anything that was already working.
+          if (variational && vals.length && _named2.includes(key)) allowedBy[key] = vals;
+        }
         const snap = (obj) => {
           for (const [name, vals] of Object.entries(obj || {})) {
             // eBay names the offending VALUE, not the aspect: "no longer
