@@ -5957,11 +5957,29 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
             const _droppedSkus = variants.filter(v => !_matchingVariants.includes(v)).map(v => v.sku);
             console.log(`[push] 25013 filtering items: ${_matchingVariants.length}/${variants.length} variants match spec — dropping ${_droppedSkus.length} non-matching SKUs`);
             // Delete non-matching inventory items so eBay group is consistent
-            for (let _di = 0; _di < _droppedSkus.length; _di += 25) {
-              const _delBatch = _droppedSkus.slice(_di, _di+25);
-              await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item?sku=${_delBatch.map(encodeURIComponent).join(',')}`,
-                { method: 'DELETE', headers: auth }).catch(()=>{});
+            // eBay has NO batch form of this endpoint — deletion is
+            // DELETE /inventory_item/{sku}, one SKU at a time. The old call
+            // passed a comma-separated ?sku= query, which eBay ignores; the
+            // failure was swallowed by .catch(), the items stayed on eBay with
+            // values the group no longer lists, and every publish came back
+            // 25013 in a loop that could never end.
+            let _delOk = 0, _delFail = 0;
+            for (const _sku of _droppedSkus) {
+              const _r = await fetch(
+                `${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(_sku)}`,
+                { method: 'DELETE', headers: auth }).catch(() => null);
+              if (_r && (_r.ok || _r.status === 204 || _r.status === 404)) _delOk++;
+              else {
+                _delFail++;
+                if (_delFail <= 2) {
+                  const _b = _r ? await _r.text().catch(() => '') : 'request failed';
+                  console.warn(`[push] 25013: could not delete ${_sku.slice(-18)} — ${String(_b).slice(0, 120)}`);
+                }
+              }
+              await sleep(80);
             }
+            console.log(`[push] 25013: removed ${_delOk}/${_droppedSkus.length} non-matching inventory item(s)` +
+              (_delFail ? ` — ${_delFail} failed, publish will still be refused until they are gone` : ''));
             // Trim variants so _buildGroupBody() only includes matching SKUs
             variants.splice(0, variants.length, ..._matchingVariants);
           }
