@@ -6190,6 +6190,29 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
             (a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
         }
         const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+        // Local copy of the size canon the sync path uses — same rules, so a
+        // value maps identically whether it is fixed at push or at sync.
+        const _CANON = [
+          ['3xs',['3xs','xxxs','xxxsmall']], ['2xs',['2xs','xxs','xxsmall']],
+          ['xs',['xs','xsmall','extra small','x small']], ['s',['s','small']],
+          ['m',['m','medium','med']], ['l',['l','large']],
+          ['xl',['xl','xlarge','x large','extra large','1x','1xlarge','1x large']],
+          ['2xl',['2xl','xxl','xxlarge','2x','2xlarge','2x large','xx large']],
+          ['3xl',['3xl','xxxl','3x','3xlarge','3x large']],
+          ['4xl',['4xl','xxxxl','4x','4xlarge','4x large']],
+          ['5xl',['5xl','5x','5xlarge','5x large']],
+          ['6xl',['6xl','6x','6xlarge','6x large','6xlargebigtall']],
+        ];
+        const _canonOf = x => { const n = norm(x);
+          for (const [c, f] of _CANON) if (f.some(y => norm(y) === n)) return c; return null; };
+        const snapValue = (v, allowed) => {
+          if (allowed.includes(v)) return v;
+          const exact = allowed.find(a => norm(a) === norm(v));
+          if (exact) return exact;
+          const c = _canonOf(v);
+          if (c) { const hit = allowed.find(a => _canonOf(a) === c); if (hit) return hit; }
+          return null;      // no equivalent — caller abandons the mapping
+        };
         // eBay reports Size as FREE_TEXT yet still enforces the category's value
         // list on VARIATION listings — which is why publish kept failing with
         // "custom values refused for: Size" while nothing was ever snapped. The
@@ -6270,6 +6293,51 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         };
         snap(aspects);
         if (typeof groupAspects === 'object') snap(groupAspects);
+
+        // ── THE VALUES THAT ACTUALLY MATTER LIVE ON THE VARIANTS ─────────────
+        // On a variation listing Size is not in the shared aspects — each
+        // variant carries its own in v.dims, and variesBy lists the set. The
+        // diagnostic showed it plainly: we send [] for Size while the category
+        // offers 2XS…3XL. So the snapping above had nothing to work on and the
+        // publish retried unchanged, five times, with the same result.
+        //
+        // Map each variant's value onto the category's list, and keep variesBy
+        // in step. If two variants would collapse onto the same value the map
+        // is abandoned — a duplicate variation is worse than a failed publish.
+        for (const n of named) {
+          const key = String(n).toLowerCase();
+          const allowed = allowedBy[key];
+          if (!allowed || !allowed.length) continue;
+          const specName = (variesBy?.specifications || [])
+            .map(sp => sp.name).find(sp => String(sp).toLowerCase() === key);
+          if (!specName) continue;
+
+          const current = [...new Set(variants.map(v => v.dims?.[specName]).filter(Boolean))];
+          const mapped = {};
+          for (const val of current) {
+            const to = snapValue(val, allowed, specName);
+            if (to) mapped[val] = to;
+          }
+          const targets = Object.values(mapped);
+          if (Object.keys(mapped).length !== current.length ||
+              new Set(targets).size !== targets.length) {
+            console.warn(`[push] 25129 — cannot map ${specName} ${JSON.stringify(current.slice(0,6))} ` +
+              `onto ${JSON.stringify(allowed.slice(0,8))} without losing or merging values; leaving as is`);
+            continue;
+          }
+          if (current.every(v => mapped[v] === v)) continue;   // already correct
+
+          for (const v of variants) {
+            const cur = v.dims?.[specName];
+            if (cur && mapped[cur]) v.dims[specName] = mapped[cur];
+          }
+          for (const sp of (variesBy?.specifications || [])) {
+            if (sp.name === specName) sp.values = (sp.values || []).map(x => mapped[x] || x);
+          }
+          snapped += current.length;
+          console.log(`[push] 25129 — ${specName}: ${current.slice(0,6).join('/')} → ` +
+            `${current.slice(0,6).map(x => mapped[x]).join('/')} (variants and variesBy updated)`);
+        }
       } catch (e) { console.warn('[push] 25129 lookup failed:', e.message); }
       if (snapped > 0) {
         console.log(`[push] 25129 — ${snapped} value(s) snapped to eBay's standard set; group will be re-PUT and publish retried`);
