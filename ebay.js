@@ -6195,6 +6195,21 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         // "custom values refused for: Size" while nothing was ever snapped. The
         // sync path already accounts for this; the push path did not, so the
         // same listing failed on import and could only be fixed after the fact.
+        // Report what the category actually offers for the aspect eBay named.
+        // Two very different situations look identical from outside: "we sent a
+        // value that is not on the list" and "the list is empty, so there is
+        // nothing to snap to". The first is fixable here; the second means the
+        // listing is in a category that does not accept these values at all.
+        for (const n of named) {
+          const k = String(n).toLowerCase();
+          const a = (catAsp?.aspects || []).find(x => String(x.localizedAspectName).toLowerCase() === k);
+          const vals = (a?.aspectValues || []).map(v => v.localizedValue);
+          const sending = aspects[n] || aspects[a?.localizedAspectName] || [];
+          console.warn(`[push] 25129 detail — category ${categoryId} aspect "${n}": ` +
+            `we send ${JSON.stringify(Array.isArray(sending) ? sending.slice(0, 6) : sending)}; ` +
+            `category offers ${vals.length ? JSON.stringify(vals.slice(0, 8)) : 'NO VALUES (free text per taxonomy)'}` +
+            `${a ? '' : ' — aspect not in this category at all'}`);
+        }
         const _named2 = named.map(n => String(n).toLowerCase());
         for (const a of (catAsp?.aspects || [])) {
           const key = String(a.localizedAspectName).toLowerCase();
