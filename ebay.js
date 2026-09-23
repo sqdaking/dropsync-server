@@ -6337,6 +6337,30 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
           snapped += current.length;
           console.log(`[push] 25129 — ${specName}: ${current.slice(0,6).join('/')} → ` +
             `${current.slice(0,6).map(x => mapped[x]).join('/')} (variants and variesBy updated)`);
+
+          // PUSH THE CORRECTED ITEMS BACK TO EBAY.
+          // Updating v.dims changes our copy only. Without rewriting the
+          // inventory items, eBay still holds the old values while the group
+          // now holds the new ones — which it rejects as 25013 "variation
+          // specifics do not match", in a loop that re-PUTs the group forever.
+          for (let bi = 0; bi < variants.length; bi += 25) {
+            const batch = variants.slice(bi, bi + 25);
+            await fetch(`${EBAY_API}/sell/inventory/v1/bulk_create_or_replace_inventory_item`, {
+              method: 'POST', headers: auth,
+              body: JSON.stringify({ requests: batch.map(v => ({
+                sku: v.sku,
+                inventoryItem: {
+                  condition: 'NEW',
+                  product: { title: listingTitle, imageUrls: [v.image].filter(Boolean),
+                             aspects: { ...groupAspects, ...v.dims } },
+                  availability: { shipToLocationAvailability: { quantity: parseInt(v.qty) || 0 } },
+                  pricingSummary: { price: { value: v.price, currency: 'USD' } },
+                },
+              })) }),
+            }).catch(e => console.warn('[push] 25129 item rewrite failed:', e.message));
+            if (bi + 25 < variants.length) await sleep(200);
+          }
+          console.log(`[push] 25129 — rewrote ${variants.length} inventory item(s) so items and group agree`);
         }
       } catch (e) { console.warn('[push] 25129 lookup failed:', e.message); }
       if (snapped > 0) {
