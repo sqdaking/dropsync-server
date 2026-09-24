@@ -5573,6 +5573,7 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
   // Group gallery = product.images (12 photos of default/main color)
   // eBay shows these in the main listing; color-switching images come from per-variant imageUrls
   let groupImageUrls = orderImages([...new Set(product.images || [])]).slice(0, 12);
+  let _usingCatalogImages = false;   // EPS imagery in use — never mix with Amazon URLs
   // Swap in eBay's licensed catalogue images when the product has a GTIN match.
   // Variation listings show the group image most prominently, so this is where
   // Amazon photography is most visible — and most reported.
@@ -5583,7 +5584,17 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         const _cat = await findCatalogProduct(access_token, _gtin);
         if (_cat?.imageUrls?.length) {
           groupImageUrls = _cat.imageUrls;
-          console.log(`[catalog] group images from eBay catalogue (ePID ${_cat.epid}) — no Amazon imagery used`);
+          // eBay refuses a listing that mixes its own hosted (EPS) pictures
+          // with self-hosted ones: "A mixture of Self Hosted and EPS pictures
+          // are not allowed". Taking the catalogue images for the group while
+          // each variant kept its Amazon URL produced exactly that, so every
+          // catalogue-matched listing failed with 25014.
+          //
+          // Once we use catalogue imagery it has to be catalogue imagery
+          // throughout — so the per-variant Amazon images are dropped.
+          _usingCatalogImages = true;
+          for (const v of variants) v.image = '';
+          console.log(`[catalog] group images from eBay catalogue (ePID ${_cat.epid}) — variant images cleared so nothing is mixed`);
         }
       } catch (e) {}
     }
