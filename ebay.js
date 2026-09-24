@@ -5906,36 +5906,28 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         // Inline normSpecName since it's out of scope here
         const _nsn = n => !n ? n : /color|colour/i.test(n) ? 'Color' : /^size$/i.test(n) ? 'Size' : n.replace('_name','').replace(/^\w/, c=>c.toUpperCase());
         if (colorGroup && exactPrimVals.length) {
-          const trimmed = exactPrimVals.map(v => String(v).slice(0,30).trim());
-          const fitted = []; let len = 0;
-          for (const v of trimmed) {
-            const add = (fitted.length ? 3 : 0) + v.length;
-            if (len + add > 65) break;
-            fitted.push(v); len += add;
-          }
+          // EVERY VALUE, NOT THE FIRST 65 CHARACTERS' WORTH.
+          //
+          // This budgeted the whole value LIST to 65 characters and stopped
+          // adding once it was full — so a listing with many colours kept only
+          // the first few, every variant using the rest counted as
+          // "non-matching", and they were deleted. eBay's 65-character limit is
+          // per value, not for the list, so each value is capped individually
+          // and all of them are kept.
+          const fitted = exactPrimVals.map(v => String(v).slice(0, 65).trim()).filter(Boolean);
           if (fitted.length) newSpecs.push({ name: _nsn(colorGroup.name), values: fitted });
         }
         if (otherGroup && exactSecVals.length) {
-          const trimmed2 = exactSecVals.map(v => String(v).slice(0,30).trim());
-          const fitted2 = []; let len2 = 0;
-          for (const v of trimmed2) {
-            const add = (fitted2.length ? 3 : 0) + v.length;
-            if (len2 + add > 65) break;
-            fitted2.push(v); len2 += add;
-          }
+          // Same here: cap each value, keep them all.
+          const fitted2 = exactSecVals.map(v => String(v).slice(0, 65).trim()).filter(Boolean);
           if (fitted2.length) newSpecs.push({ name: _nsn(otherGroup.name), values: fitted2 });
         }
         // Add extra dims (3rd, 4th, ...) from _extraDimNames
         const _extraDimNames25013 = product._extraDimNames || [];
         for (const _edn of _extraDimNames25013) {
           const _eVals = [...new Set(variants.map(v => v.dims?.[_edn]).filter(Boolean))];
-          const _eTrimmed = _eVals.map(v => String(v).slice(0,30).trim());
-          const _eFitted = []; let _eLen = 0;
-          for (const v of _eTrimmed) {
-            const add = (_eFitted.length ? 3 : 0) + v.length;
-            if (_eLen + add > 65) break;
-            _eFitted.push(v); _eLen += add;
-          }
+          // And for any third dimension.
+          const _eFitted = _eVals.map(v => String(v).slice(0, 65).trim()).filter(Boolean);
           if (_eFitted.length) newSpecs.push({ name: _nsn(_edn), values: _eFitted });
         }
 
@@ -5953,7 +5945,25 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
             : variants;
           // Trim variants array AND delete non-matching inventory items
           // _buildGroupBody() uses variants[] for variantSKUs — must match spec exactly
-          if (_matchingVariants.length < variants.length) {
+          // NEVER DELETE VARIANTS TO FIT A SPEC.
+          //
+          // This dropped every variant whose colour was not in the spec list —
+          // on a 21-variant listing it deleted 12 and still failed to publish.
+          // The spec is derived from OUR OWN variants a few lines above, so a
+          // mismatch means the spec was built wrongly, not that the variants
+          // are wrong. Deleting inventory to make the two agree destroys the
+          // listing and cannot fix the cause.
+          //
+          // The reconcile step that follows rebuilds the group's specs FROM the
+          // items, which is the correct direction and non-destructive.
+          //
+          // EBAY_25013_DELETE_VARIANTS=on restores the old behaviour.
+          const _mayDelete = String(process.env.EBAY_25013_DELETE_VARIANTS || 'off').toLowerCase() === 'on';
+          if (!_mayDelete && _matchingVariants.length < variants.length) {
+            console.warn(`[push] 25013: spec lists ${_allowedColors.size} colour(s) but ${variants.length - _matchingVariants.length} ` +
+              `variant(s) use others — rebuilding the spec from the variants instead of deleting them`);
+          }
+          if (_mayDelete && _matchingVariants.length < variants.length) {
             const _droppedSkus = variants.filter(v => !_matchingVariants.includes(v)).map(v => v.sku);
             console.log(`[push] 25013 filtering items: ${_matchingVariants.length}/${variants.length} variants match spec — dropping ${_droppedSkus.length} non-matching SKUs`);
             // Delete non-matching inventory items so eBay group is consistent
