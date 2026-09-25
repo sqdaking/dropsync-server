@@ -4063,8 +4063,48 @@ async function resolveCategory(token, product) {
     );
     if (r.ok) {
       const d = await r.json();
-      const first = d.categorySuggestions?.[0]?.category?.categoryId;
-      if (first) { console.log(`[category] taxonomy API -> ${first}`); return first; }
+      const suggestions = (d.categorySuggestions || [])
+        .map(c => c?.category?.categoryId).filter(Boolean).slice(0, 5);
+
+      // ── CHECK THE CATEGORY CAN HOLD THIS PRODUCT'S SIZES ──────────────────
+      // Taking the first suggestion blindly put numeric-waist jeans (26, 27,
+      // 30, 33) into a category whose Size aspect only accepts 3XS…2XL. No
+      // mapping from that is correct — a 26 waist is not "XS" — so publish
+      // failed with 25129 and no retry could ever fix it.
+      //
+      // eBay returns several suggestions; pick the first that actually accepts
+      // the sizes this product uses.
+      const sizeVals = [...new Set(
+        Object.values(product?.comboAsin || {}).length
+          ? Object.keys(product?.comboAsin || {}).map(k => String(k).split('|').pop())
+          : (product?.variations || []).flatMap(v => v.values || [])
+      )].map(v => String(v).trim()).filter(Boolean);
+
+      if (!sizeVals.length || suggestions.length <= 1) {
+        if (suggestions[0]) { console.log(`[category] taxonomy API -> ${suggestions[0]}`); return suggestions[0]; }
+      } else {
+        const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+        for (const cid of suggestions) {
+          try {
+            const ar = await fetch(
+              `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${cid}`,
+              { headers: { Authorization: `Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' } });
+            if (!ar.ok) continue;
+            const ad = await ar.json();
+            const sizeAspect = (ad.aspects || []).find(a => /^size$/i.test(a.localizedAspectName));
+            const allowed = (sizeAspect?.aspectValues || []).map(v => v.localizedValue);
+            // No closed list means free text — anything is accepted.
+            if (!allowed.length) { console.log(`[category] taxonomy API -> ${cid} (Size is free text here)`); return cid; }
+            const fits = sizeVals.every(v => allowed.some(a => norm(a) === norm(v)));
+            if (fits) { console.log(`[category] taxonomy API -> ${cid} (accepts ${sizeVals.slice(0,4).join('/')})`); return cid; }
+            console.log(`[category] ${cid} rejected: Size accepts ${allowed.slice(0,6).join('/')} but this product uses ${sizeVals.slice(0,4).join('/')}`);
+          } catch (e) {}
+        }
+        if (suggestions[0]) {
+          console.warn(`[category] no suggestion accepts these sizes — using ${suggestions[0]}; publish may fail on Size`);
+          return suggestions[0];
+        }
+      }
     }
   } catch (e) { console.warn('[category] taxonomy API error:', e.message); }
 
