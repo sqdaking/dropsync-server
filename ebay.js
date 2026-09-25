@@ -6050,7 +6050,25 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       //   (b) the SELLER ACCOUNT is under an active selling restriction —
       //       during a restriction every publish returns 25019, and no amount
       //       of re-sanitising will change that.
+      // 25019 gives no clue which word or rule it objected to, so print what we
+      // actually sent. With the account healthy, the cause is in this content —
+      // most often a term in the description carried over from Amazon.
       console.warn(`[push] 25019 — eBay refused to publish. Either a prohibited term in the title/description, OR the account is under an active selling restriction.`);
+      try {
+        const _t = String(listingTitle || '');
+        const _d = String(ebayDescription || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        console.warn(`[push] 25019 content — title (${_t.length} chars): ${_t}`);
+        console.warn(`[push] 25019 content — description (${_d.length} chars): ${_d.slice(0, 400)}`);
+        // Terms eBay commonly refuses in apparel listings, so the likely
+        // offender is named rather than left to a manual read-through.
+        const _suspect = [
+          'amazon', 'prime', 'ebay', 'paypal', 'authentic', 'guarantee', 'guaranteed',
+          'free shipping', 'best price', 'cheapest', 'wholesale', 'dropship',
+          'replica', 'inspired by', 'style of', 'like new', 'refurbished',
+          'contact us', 'email us', 'whatsapp', 'www.', 'http',
+        ].filter(w => new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(_t + ' ' + _d));
+        console.warn(`[push] 25019 suspect term(s): ${_suspect.length ? _suspect.join(', ') : 'none found — likely an account restriction or a category rule'}`);
+      } catch (e) {}
       console.warn(`[push] If your account is currently restricted, every push fails this way until it lifts — check https://www.ebay.com/sellerhelp/policy before editing the listing.`);
       return res.status(400).json({ error: 'eBay rejected listing: title or description contains banned words (VERO brand name or restricted term). Edit the listing and remove brand-specific terms.', errorId: 25019, unrecoverable: true });
     }
