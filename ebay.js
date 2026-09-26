@@ -4084,6 +4084,27 @@ async function resolveCategory(token, product) {
         if (suggestions[0]) { console.log(`[category] taxonomy API -> ${suggestions[0]}`); return suggestions[0]; }
       } else {
         const norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+        // A category that lists S/M/L DOES fit a product using Small/Medium/
+        // Large — the publish step maps between them. Comparing the words
+        // literally rejected every usable category and fell through to a worse
+        // one, so listings failed in a category that was never going to work.
+        // Judge by the same canonical sizes the mapper uses.
+        const CANON = [
+          ['3xs',['3xs','xxxs','xxxsmall']], ['2xs',['2xs','xxs','xxsmall']],
+          ['xs',['xs','xsmall','extrasmall','x small','extra small']],
+          ['s',['s','small']], ['m',['m','medium','med']], ['l',['l','large']],
+          ['xl',['xl','xlarge','x large','extra large','1x','1xlarge']],
+          ['2xl',['2xl','xxl','xxlarge','2x','xx large']],
+          ['3xl',['3xl','xxxl','3x']], ['4xl',['4xl','4x']],
+          ['5xl',['5xl','5x']], ['6xl',['6xl','6x']],
+        ];
+        const canonOf = x => { const n = norm(x);
+          for (const [c, f] of CANON) if (f.some(y => norm(y) === n)) return c; return null; };
+        const sameSize = (a, b) => {
+          if (norm(a) === norm(b)) return true;
+          const ca = canonOf(a), cb = canonOf(b);
+          return !!(ca && cb && ca === cb);
+        };
         for (const cid of suggestions) {
           try {
             const ar = await fetch(
@@ -4095,7 +4116,7 @@ async function resolveCategory(token, product) {
             const allowed = (sizeAspect?.aspectValues || []).map(v => v.localizedValue);
             // No closed list means free text — anything is accepted.
             if (!allowed.length) { console.log(`[category] taxonomy API -> ${cid} (Size is free text here)`); return cid; }
-            const fits = sizeVals.every(v => allowed.some(a => norm(a) === norm(v)));
+            const fits = sizeVals.every(v => allowed.some(a => sameSize(a, v)));
             if (fits) { console.log(`[category] taxonomy API -> ${cid} (accepts ${sizeVals.slice(0,4).join('/')})`); return cid; }
             console.log(`[category] ${cid} rejected: Size accepts ${allowed.slice(0,6).join('/')} but this product uses ${sizeVals.slice(0,4).join('/')}`);
           } catch (e) {}
