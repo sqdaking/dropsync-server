@@ -5699,6 +5699,61 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     secondaryVal: otherGroup  ? v.dims?.[otherGroup.name]  : null,
     dims:         v.dims || {},  // pass full dims so buildVariesBy can read extraDimNames
   }));
+  // ── SNAP VARIATION VALUES BEFORE PUBLISHING ─────────────────────────────
+  // eBay's own 25129 message says: "Use getItemAspectsForCategory to get the
+  // valid values." We were only doing that AFTER a failed publish, so every
+  // affected listing burned an attempt, created items with values eBay would
+  // reject, and then needed those items rewritten. Doing it up front means the
+  // first publish carries values the category already accepts.
+  //
+  // Same rules as the retry path: map only where every value has a distinct
+  // equivalent, and leave the dimension untouched otherwise — a merged or
+  // mis-sized variant is worse than one failed publish.
+  try {
+    const _ca = await fetch(
+      `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${categoryId}`,
+      { headers: auth }).then(r => r.ok ? r.json() : null);
+    const _norm = x => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const _CANON = [
+      ['3xs',['3xs','xxxs','xxxsmall']], ['2xs',['2xs','xxs','xxsmall']],
+      ['xs',['xs','xsmall','extrasmall','x small','extra small']],
+      ['s',['s','small']], ['m',['m','medium','med']], ['l',['l','large']],
+      ['xl',['xl','xlarge','x large','extra large','1x','1xlarge']],
+      ['2xl',['2xl','xxl','xxlarge','2x','xx large']],
+      ['3xl',['3xl','xxxl','3x','3x large']], ['4xl',['4xl','4x','4x large']],
+      ['5xl',['5xl','5x','5x large']], ['6xl',['6xl','6x','6x large']],
+    ];
+    const _canon = x => { const n = _norm(x);
+      for (const [c, f] of _CANON) if (f.some(y => _norm(y) === n)) return c; return null; };
+
+    for (const _a of (_ca?.aspects || [])) {
+      const _name = _a.localizedAspectName;
+      const _allowed = (_a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
+      if (!_allowed.length) continue;                       // free text: nothing to snap
+      // Only dimensions the variants actually use.
+      const _current = [...new Set(variants.map(v => v.dims?.[_name]).filter(Boolean))];
+      if (!_current.length) continue;
+
+      const _map = {};
+      for (const _v of _current) {
+        const _hit = _allowed.includes(_v) ? _v
+          : (_allowed.find(x => _norm(x) === _norm(_v))
+             || (_canon(_v) ? _allowed.find(x => _canon(x) === _canon(_v)) : null));
+        if (_hit) _map[_v] = _hit;
+      }
+      const _out = Object.values(_map);
+      if (Object.keys(_map).length !== _current.length || new Set(_out).size !== _out.length) continue;
+      if (_current.every(v => _map[v] === v)) continue;      // already valid
+
+      for (const v of variants) {
+        const _cur = v.dims?.[_name];
+        if (_cur && _map[_cur]) v.dims[_name] = _map[_cur];
+      }
+      console.log(`[push] ${_name} adjusted to the category's values: ` +
+        `${_current.slice(0,5).join('/')} → ${_current.slice(0,5).map(x => _map[x]).join('/')}`);
+    }
+  } catch (e) { console.warn('[push] pre-publish aspect check skipped:', e.message); }
+
   const variesBy = buildVariesBy(product, colorGroup, otherGroup, _capVariants);
 
   // Enforce strict spec/item consistency: only push variants whose color IS in the spec
