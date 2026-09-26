@@ -3930,11 +3930,44 @@ function buildVariants({ product, groupSku, applyMk, defaultQty, body }) {
       if (price > 0) return 1;
       return 2;
     };
-    variants = variants
+    // KEEP WHOLE COLOURS, NOT A SCATTER OF ODD SIZES.
+    //
+    // Taking the best 25 variants individually produced listings like
+    // "25 variants (25 colors x 3 sizes)" — 25 colours each offering one of
+    // three sizes. eBay treats that as incoherent and rejects the group, and a
+    // buyer picking a colour would find most sizes missing anyway.
+    //
+    // Group by the primary dimension (colour) and admit whole colours until the
+    // budget runs out, so every colour on the listing has all of its sizes.
+    const _primaryName = Object.keys(variants[0]?.dims || {})
+      .find(k => /colou?r/i.test(k)) || Object.keys(variants[0]?.dims || {})[0];
+
+    const _sorted = variants
       .map((v, i) => ({ v, i, s: _score(v) }))
-      .sort((a, b) => a.s - b.s || a.i - b.i)
-      .slice(0, _cap)
-      .map(x => x.v);
+      .sort((a, b) => a.s - b.s || a.i - b.i);
+
+    if (_primaryName) {
+      const _byColour = new Map();
+      for (const { v, s, i } of _sorted) {
+        const key = v.dims?.[_primaryName] ?? '';
+        if (!_byColour.has(key)) _byColour.set(key, { best: s, order: i, items: [] });
+        _byColour.get(key).items.push(v);
+      }
+      // Best colours first — one with in-stock variants beats one without.
+      const _groups = [..._byColour.entries()]
+        .sort((a, b) => a[1].best - b[1].best || a[1].order - b[1].order);
+      const _kept = [];
+      for (const [, g] of _groups) {
+        if (_kept.length + g.items.length > _cap) continue;   // would overflow: skip this colour
+        _kept.push(...g.items);
+      }
+      // A single colour larger than the whole budget: fall back to a flat trim.
+      variants = _kept.length ? _kept : _sorted.slice(0, _cap).map(x => x.v);
+      const _colours = new Set(variants.map(v => v.dims?.[_primaryName])).size;
+      console.log(`[buildVariants] kept ${_colours} complete ${_primaryName} group(s) — every one has all its sizes`);
+    } else {
+      variants = _sorted.slice(0, _cap).map(x => x.v);
+    }
     const _inStock = variants.filter(v => parseInt(v.availableQuantity ?? v.qty ?? 0) > 0).length;
     console.log(`[buildVariants] variant cap: ${_before} → ${variants.length} (${_inStock} in stock). ` +
       `Set body.maxVariants or MAX_PUSH_VARIANTS to change.`);
