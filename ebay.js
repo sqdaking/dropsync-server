@@ -5729,10 +5729,21 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     for (const _a of (_ca?.aspects || [])) {
       const _name = _a.localizedAspectName;
       const _allowed = (_a.aspectValues || []).map(v => v.localizedValue).filter(Boolean);
-      if (!_allowed.length) continue;                       // free text: nothing to snap
-      // Only dimensions the variants actually use.
-      const _current = [...new Set(variants.map(v => v.dims?.[_name]).filter(Boolean))];
+      // Match the dimension by name loosely: our dims are keyed "Size"/"Color"
+      // while the taxonomy may return "Size", "Size Type" or a localised label,
+      // and an exact-key lookup silently found nothing and skipped the snap.
+      const _dimKey = Object.keys(variants[0]?.dims || {})
+        .find(k => k.toLowerCase().replace(/[^a-z]/g, '') === String(_name).toLowerCase().replace(/[^a-z]/g, ''));
+      if (!_dimKey) continue;                                // not a dimension of this product
+      const _current = [...new Set(variants.map(v => v.dims?.[_dimKey]).filter(Boolean))];
       if (!_current.length) continue;
+      if (!_allowed.length) {
+        // Free text per the taxonomy — but eBay still enforces a list on some
+        // variation aspects, which is the 25129 we keep seeing. Say so, because
+        // "nothing happened" and "nothing could be done" look identical.
+        console.log(`[push] ${_name}: category lists no values (free text) — sending ${_current.slice(0,5).join('/')} as-is`);
+        continue;
+      }
 
       const _map = {};
       for (const _v of _current) {
@@ -5742,12 +5753,16 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
         if (_hit) _map[_v] = _hit;
       }
       const _out = Object.values(_map);
-      if (Object.keys(_map).length !== _current.length || new Set(_out).size !== _out.length) continue;
+      if (Object.keys(_map).length !== _current.length || new Set(_out).size !== _out.length) {
+        console.warn(`[push] ${_name}: cannot map ${_current.slice(0,5).join('/')} onto ` +
+          `${_allowed.slice(0,8).join('/')} without losing or merging values — sending as-is`);
+        continue;
+      }
       if (_current.every(v => _map[v] === v)) continue;      // already valid
 
       for (const v of variants) {
-        const _cur = v.dims?.[_name];
-        if (_cur && _map[_cur]) v.dims[_name] = _map[_cur];
+        const _cur = v.dims?.[_dimKey];
+        if (_cur && _map[_cur]) v.dims[_dimKey] = _map[_cur];
       }
       console.log(`[push] ${_name} adjusted to the category's values: ` +
         `${_current.slice(0,5).join('/')} → ${_current.slice(0,5).map(x => _map[x]).join('/')}`);
