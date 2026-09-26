@@ -4197,8 +4197,44 @@ async function resolveCategory(token, product) {
             console.log(`[category] ${cid} rejected: Size accepts ${allowed.slice(0,6).join('/')} but this product uses ${sizeVals.slice(0,4).join('/')}`);
           } catch (e) {}
         }
+        // ── ASK AGAIN FOR PLUS SIZES ─────────────────────────────────────────
+        // Sizes above XL live in eBay's plus-size categories, which the
+        // ordinary suggestions never return — so a 2XL/3XL product was landing
+        // in a category topping out at XL and failing on Size every time.
+        // Re-ask with the term eBay itself uses.
+        // Use the canonical sizes rather than a pattern: word boundaries do not
+        // work once separators are stripped ("XX-Large" → "xxlarge"), so the
+        // regex version silently never matched.
+        const _needsPlus = sizeVals.some(v => ['2xl','3xl','4xl','5xl','6xl'].includes(canonOf(v)))
+          || sizeVals.some(v => /plus/i.test(String(v)));
+        if (_needsPlus) {
+          try {
+            const pr = await fetch(
+              `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_category_suggestions?q=${encodeURIComponent(('plus size ' + title).slice(0, 80))}`,
+              { headers: { Authorization: `Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' } });
+            if (pr.ok) {
+              const pd = await pr.json();
+              const plusIds = (pd.categorySuggestions || [])
+                .map(c => c?.category?.categoryId).filter(Boolean).slice(0, 5);
+              for (const cid of plusIds) {
+                const ar = await fetch(
+                  `${EBAY_API}/commerce/taxonomy/v1/category_tree/0/get_item_aspects_for_category?category_id=${cid}`,
+                  { headers: { Authorization: `Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' } });
+                if (!ar.ok) continue;
+                const ad = await ar.json();
+                const sa = (ad.aspects || []).find(a => /^size$/i.test(a.localizedAspectName));
+                const allowed = (sa?.aspectValues || []).map(v => v.localizedValue);
+                if (!allowed.length) { console.log(`[category] plus-size search -> ${cid} (Size is free text here)`); return cid; }
+                if (sizeVals.every(v => allowed.some(a => sameSize(a, v)))) {
+                  console.log(`[category] plus-size search -> ${cid} (accepts ${sizeVals.slice(0,4).join('/')})`);
+                  return cid;
+                }
+              }
+            }
+          } catch (e) {}
+        }
         if (suggestions[0]) {
-          console.warn(`[category] no suggestion accepts these sizes — using ${suggestions[0]}; publish may fail on Size`);
+          console.warn(`[category] no suggestion accepts these sizes (${sizeVals.slice(0,5).join('/')}) — using ${suggestions[0]}; publish may fail on Size`);
           return suggestions[0];
         }
       }
