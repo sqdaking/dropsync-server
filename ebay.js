@@ -6089,9 +6089,49 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
     // Fix: re-PUT the group with exact values from the actual inventory items
     if (errId === 25013) {
       console.warn(`[push] 25013 specs mismatch — reconciling group specs with inventory items`);
-      // Collect exact dim values from all inventory items we created
-      const exactPrimVals = [...new Set(variants.map(v => v.dims?.[colorGroup?.name]).filter(Boolean))];
-      const exactSecVals  = otherGroup ? [...new Set(variants.map(v => v.dims?.[otherGroup?.name]).filter(Boolean))] : [];
+
+      // READ THE VALUES FROM EBAY, NOT FROM OUR COPY.
+      //
+      // This rebuilt the specs from our local `variants`, then eBay compared
+      // them against the items on ITS side — which can differ: leftovers from
+      // an earlier attempt, items whose rewrite failed, or SKUs the group still
+      // references. Whenever they differed the reconcile produced the same
+      // specs again and the publish failed identically, which is the loop in
+      // the log: reconcile → re-PUT → mismatch, repeating until attempts ran out.
+      //
+      // The group on eBay is the authority for what is actually in the listing,
+      // so read its members and take the values from them.
+      let _liveDims = null;
+      try {
+        const _gr = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item_group/${encodeURIComponent(groupSku)}`, { headers: auth });
+        if (_gr.ok) {
+          const _g = await _gr.json();
+          const _skus = (_g.variantSKUs || []).slice(0, 120);
+          const _prim = new Set(), _sec = new Set();
+          for (const _sku of _skus) {
+            const _ir = await fetch(`${EBAY_API}/sell/inventory/v1/inventory_item/${encodeURIComponent(_sku)}`, { headers: auth });
+            if (!_ir.ok) continue;
+            const _it = await _ir.json();
+            const _asp = _it.product?.aspects || {};
+            const _pv = colorGroup ? _asp[colorGroup.name] : null;
+            const _sv = otherGroup ? _asp[otherGroup.name] : null;
+            if (_pv) _prim.add(Array.isArray(_pv) ? _pv[0] : _pv);
+            if (_sv) _sec.add(Array.isArray(_sv) ? _sv[0] : _sv);
+            await sleep(60);
+          }
+          if (_prim.size) {
+            _liveDims = { prim: [..._prim], sec: [..._sec] };
+            console.log(`[push] 25013: read ${_skus.length} item(s) from eBay — ` +
+              `${_prim.size} ${colorGroup?.name || 'primary'} value(s), ${_sec.size} ${otherGroup?.name || 'secondary'} value(s)`);
+          }
+        }
+      } catch (e) { console.warn('[push] 25013: could not read the group from eBay:', e.message); }
+
+      // Fall back to our own variants only if eBay could not be read.
+      const exactPrimVals = _liveDims ? _liveDims.prim
+        : [...new Set(variants.map(v => v.dims?.[colorGroup?.name]).filter(Boolean))];
+      const exactSecVals  = _liveDims ? _liveDims.sec
+        : (otherGroup ? [...new Set(variants.map(v => v.dims?.[otherGroup?.name]).filter(Boolean))] : []);
       if (exactPrimVals.length && variesBy?.specifications) {
         // Rebuild specs with exact values (no 65-char truncation for the list)
         const newSpecs = [];
