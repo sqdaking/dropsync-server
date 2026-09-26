@@ -3085,6 +3085,19 @@ async function _scrapeAmazonProductImpl(inputUrl, preloadedHtml = null, clientAs
       if (Object.keys(comboPrices).length === 0 && product._basePrice > 0) {
         product.price = product._basePrice;
         console.log(`[scraper] product.price=$${product._basePrice} (single-variant from buy-box)`);
+      } else if (Object.keys(comboPrices).length === 0 && asin && asinPrice[asin] > 0) {
+        // SINGLE-VARIANT: USE THE PRICE THE BROWSER ALREADY READ.
+        // The browser extracts the buy box from the page it fetched and sends it
+        // in clientAsinData — the log line "single-variant product … priced
+        // $29.99 from the parent page" is exactly that. Only the server's own
+        // _basePrice was consulted here, so when the server's parse came back
+        // empty the draft was created at $0.00 and could not be published,
+        // even though the correct price was already in hand.
+        //
+        // Single-variant only: a product with combos still follows the strict
+        // per-ASIN rules and never inherits a price.
+        product.price = asinPrice[asin];
+        console.log(`[scraper] product.price=$${asinPrice[asin]} (single-variant, from the browser's own fetch of ${asin})`);
       } else {
         product.price = 0;
         console.warn(`[scraper] product.price=0 (URL ASIN ${asin||'(none)'} not fetched, NO sibling-price fallback per safety rule — will publish unbuyable)`);
