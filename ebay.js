@@ -4190,6 +4190,30 @@ async function resolveCategory(token, product) {
             const ad = await ar.json();
             const sizeAspect = (ad.aspects || []).find(a => /^size$/i.test(a.localizedAspectName));
             const allowed = (sizeAspect?.aspectValues || []).map(v => v.localizedValue);
+
+            // COLOUR HAS TO FIT TOO.
+            // Amazon's colours are specific — "Deep Green", "Leopard", "Mint
+            // Green" — while some categories accept only eight basic ones. They
+            // cannot be merged, because two variants sharing "Black" collapse
+            // into one, so a listing with real colour names simply cannot
+            // publish in such a category. Categories where Colour is free text
+            // take them as they are.
+            const colourAspect = (ad.aspects || []).find(a => /^colou?r$/i.test(a.localizedAspectName));
+            const colourAllowed = (colourAspect?.aspectValues || []).map(v => v.localizedValue);
+            const colourVals = [...new Set((product?.variations || [])
+              .find(v => /colou?r/i.test(String(v?.name || v?.dimension || '')))?.values || [])]
+              .map(v => (v && typeof v === 'object') ? (v.value ?? v.name ?? '') : v)
+              .map(v => String(v).trim()).filter(Boolean);
+            if (colourAllowed.length && colourVals.length) {
+              const colourFits = colourVals.every(v =>
+                colourAllowed.some(a => norm(a) === norm(v)));
+              if (!colourFits) {
+                console.log(`[category] ${cid} rejected: Color accepts ${colourAllowed.slice(0,6).join('/')} ` +
+                  `but this product uses ${colourVals.slice(0,4).join('/')}`);
+                continue;
+              }
+            }
+
             // No closed list means free text — anything is accepted.
             if (!allowed.length) { console.log(`[category] taxonomy API -> ${cid} (Size is free text here)`); return cid; }
             const fits = sizeVals.every(v => allowed.some(a => sameSize(a, v)));
