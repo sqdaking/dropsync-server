@@ -4143,7 +4143,13 @@ async function resolveCategory(token, product) {
           : (Object.keys(product?.comboAsin || {}).length && _sizeDimIdx >= 0
               ? Object.keys(product.comboAsin).map(k => String(k).split('|')[_sizeDimIdx])
               : [])
-      )].map(v => String(v).trim()).filter(Boolean);
+      )].map(v => {
+        // variations[].values holds objects like { value: 'S' } — String() on
+        // those yields "[object Object]", which matched no category and caused
+        // every suggestion to be rejected.
+        if (v && typeof v === 'object') v = v.value ?? v.name ?? v.displayValue ?? '';
+        return String(v).trim();
+      }).filter(Boolean);
       if (!sizeVals.length) {
         // No identifiable Size dimension — nothing to validate against, so take
         // eBay's own first suggestion rather than second-guessing it.
