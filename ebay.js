@@ -3085,7 +3085,8 @@ async function _scrapeAmazonProductImpl(inputUrl, preloadedHtml = null, clientAs
       if (Object.keys(comboPrices).length === 0 && product._basePrice > 0) {
         product.price = product._basePrice;
         console.log(`[scraper] product.price=$${product._basePrice} (single-variant from buy-box)`);
-      } else if (Object.keys(comboPrices).length === 0 && asin && asinPrice[asin] > 0) {
+      } else if (Object.keys(comboPrices).length === 0 &&
+                 Object.values(asinPrice).filter(p => p > 0).length === 1) {
         // SINGLE-VARIANT: USE THE PRICE THE BROWSER ALREADY READ.
         // The browser extracts the buy box from the page it fetched and sends it
         // in clientAsinData — the log line "single-variant product … priced
@@ -3096,11 +3097,19 @@ async function _scrapeAmazonProductImpl(inputUrl, preloadedHtml = null, clientAs
         //
         // Single-variant only: a product with combos still follows the strict
         // per-ASIN rules and never inherits a price.
-        product.price = asinPrice[asin];
-        console.log(`[scraper] product.price=$${asinPrice[asin]} (single-variant, from the browser's own fetch of ${asin})`);
+        // Keyed by whatever ASIN the browser fetched, which is not always the
+        // ASIN parsed from the URL — a redirect, a canonical swap or a missing
+        // URL ASIN all break an exact-key lookup. With no combos there is
+        // exactly one price in play, so take it.
+        const _onlyAsin = Object.keys(asinPrice).find(a => asinPrice[a] > 0);
+        product.price = asinPrice[_onlyAsin];
+        console.log(`[scraper] product.price=$${product.price} (single-variant, from the browser's fetch of ${_onlyAsin})`);
       } else {
         product.price = 0;
-        console.warn(`[scraper] product.price=0 (URL ASIN ${asin||'(none)'} not fetched, NO sibling-price fallback per safety rule — will publish unbuyable)`);
+        console.warn(`[scraper] product.price=0 — URL ASIN ${asin || '(none)'}, ` +
+          `${Object.keys(comboPrices).length} combo price(s), ` +
+          `${Object.keys(asinPrice).length} ASIN price(s) [${Object.keys(asinPrice).slice(0,4).join(', ')}], ` +
+          `_basePrice=${product._basePrice || 0}. No sibling-price fallback per safety rule — will publish unbuyable.`);
         // Mark scrape as zero-variants — push handler will refuse to publish
         // a listing built from a fully-blocked scrape.
         product._zeroVariantsAfterCap = true;
