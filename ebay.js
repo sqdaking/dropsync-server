@@ -5035,7 +5035,15 @@ async function handlePush({ body, res, resolvePolicies, sanitizeTitle, ensureLoc
       if (_inStock[k] === false) return false;
       return true;
     });
-    if (_realCombos.length < 2) {
+    // A product with ONE combo is not an incomplete scrape — it is a
+    // single-variant product, and 1/1 priced is as complete as it gets. The
+    // guard below exists to stop a MULTI-variant product collapsing onto one
+    // guessed price, so it must only apply when Amazon actually offered more
+    // than one variant. Without this, every single-variant push was refused
+    // with "Scrape incomplete: 1/1 variants priced", which reads as a
+    // contradiction because it is one.
+    const _totalCombosAll = Object.keys(_combos).length;
+    if (_totalCombosAll >= 2 && _realCombos.length < 2) {
       // Product had variations on Amazon but scrape only got <2 priced combos.
       // Almost always this means per-ASIN fetches were blocked, and the single
       // priced combo is a random variant whose price doesn't represent the
