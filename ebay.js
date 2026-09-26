@@ -4074,11 +4074,26 @@ async function resolveCategory(token, product) {
       //
       // eBay returns several suggestions; pick the first that actually accepts
       // the sizes this product uses.
+      // ONLY THE SIZE DIMENSION.
+      // This previously collected values from EVERY dimension, so on a colour ×
+      // size product it tested "Black" and "Navy" against the Size list. Those
+      // never match, so correct categories were rejected — the same category
+      // was accepted for a size-only product and rejected for a colour × size
+      // one, which is exactly what the log showed.
+      const _sizeDimIdx = (product?.dimOrder || []).findIndex(d => /size/i.test(String(d)));
+      const _sizeVar = (product?.variations || []).find(v => /size/i.test(String(v?.name || v?.dimension || '')));
       const sizeVals = [...new Set(
-        Object.values(product?.comboAsin || {}).length
-          ? Object.keys(product?.comboAsin || {}).map(k => String(k).split('|').pop())
-          : (product?.variations || []).flatMap(v => v.values || [])
+        _sizeVar?.values?.length
+          ? _sizeVar.values
+          : (Object.keys(product?.comboAsin || {}).length && _sizeDimIdx >= 0
+              ? Object.keys(product.comboAsin).map(k => String(k).split('|')[_sizeDimIdx])
+              : [])
       )].map(v => String(v).trim()).filter(Boolean);
+      if (!sizeVals.length) {
+        // No identifiable Size dimension — nothing to validate against, so take
+        // eBay's own first suggestion rather than second-guessing it.
+        if (suggestions[0]) { console.log(`[category] taxonomy API -> ${suggestions[0]} (no Size dimension to check)`); return suggestions[0]; }
+      }
 
       if (!sizeVals.length || suggestions.length <= 1) {
         if (suggestions[0]) { console.log(`[category] taxonomy API -> ${suggestions[0]}`); return suggestions[0]; }
